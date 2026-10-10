@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DSH 会话管理</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f6f9; --panel: #fff; --panel-2: #fafbfc; --hover: #f2f4f7;
+    --line: #e4e7ec; --line-strong: #d0d5dd; --text: #1a1f29; --muted: #667085;
+    --accent: #2563eb; --accent-hover: #1d4ed8; --accent-soft: #eef4ff;
+    --accent-ring: rgba(37,99,235,.28);
+    --danger: #d92d20; --danger-soft: #fef3f2;
+    --warn: #b54708; --warn-bg: #fffaeb; --warn-line: #fedf89;
+    --toast-bg: #101828; --toast-text: #fff;
+    --shadow-sm: 0 1px 2px rgba(16,24,40,.06);
+    --shadow-lg: 0 24px 60px rgba(16,24,40,.24);
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1014; --panel: #16191f; --panel-2: #1b1f27; --hover: #1f242d;
+      --line: #262b34; --line-strong: #363d49; --text: #e6e8ec; --muted: #98a2b3;
+      --accent: #5b8cff; --accent-hover: #7aa2ff; --accent-soft: #1a2440;
+      --accent-ring: rgba(91,140,255,.38);
+      --danger: #ff7b70; --danger-soft: #2b1a1a;
+      --warn: #f5b544; --warn-bg: #2a2113; --warn-line: #4a3a1a;
+      --toast-bg: #2b313b; --toast-text: #f2f4f7;
+      --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+      --shadow-lg: 0 24px 60px rgba(0,0,0,.6);
+    }
+  }
+  * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; display: flex; flex-direction: column; overflow: hidden;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent-ring); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--line-strong); border: 3px solid transparent;
+    border-radius: 6px; background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: var(--muted); background-clip: content-box; }
+  header {
+    flex: none; display: flex; align-items: center; gap: 12px;
+    padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  header h1 {
+    margin: 0; font-size: 15px; font-weight: 600; letter-spacing: .01em;
+    display: flex; align-items: center; gap: 9px; white-space: nowrap;
+  }
+  header h1::before {
+    content: ''; width: 9px; height: 9px; border-radius: 3px;
+    background: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring);
+  }
+  header .spacer { flex: 1; }
+  #rootLabel {
+    min-width: 0; max-width: 46vw; padding: 3px 9px; border-radius: 999px;
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .banner {
+    flex: none; margin: 0; padding: 10px 20px; font-size: 13px;
+    background: var(--warn-bg); border-bottom: 1px solid var(--warn-line); color: var(--warn);
+  }
+  .banner.hidden { display: none; }
+  /* 应用外壳：两栏各自滚动，避免整页滚动时左栏 70vh 的硬编码高度与右侧表头错位。 */
+  main { flex: 1 1 auto; min-height: 0; display: flex; gap: 16px; padding: 16px 20px; align-items: stretch; }
+  .col {
+    display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); box-shadow: var(--shadow-sm);
+  }
+  .col-left { width: 330px; flex: none; }
+  .col-right { flex: 1 1 auto; min-width: 0; }
+  .col h2 {
+    flex: none; margin: 0; padding: 12px 14px; display: flex; align-items: center; gap: 8px;
+    font-size: 13px; font-weight: 600; color: var(--muted);
+    background: var(--panel-2); border-bottom: 1px solid var(--line);
+  }
+  .col h2 .count { font-weight: 400; font-variant-numeric: tabular-nums; }
+  ul { flex: 1 1 auto; min-height: 0; overflow: auto; list-style: none; margin: 0; padding: 6px; }
+  li.dir {
+    position: relative; padding: 9px 10px 9px 13px; border-radius: 8px; cursor: pointer;
+    display: flex; flex-direction: column; gap: 3px; transition: background .12s ease;
+  }
+  li.dir:hover { background: var(--hover); }
+  li.dir.active { background: var(--accent-soft); }
+  li.dir.active::before {
+    content: ''; position: absolute; left: 4px; top: 50%; transform: translateY(-50%);
+    width: 3px; height: 58%; border-radius: 3px; background: var(--accent);
+  }
+  li.dir .p { font-weight: 500; overflow-wrap: anywhere; }
+  li.dir.active .p { color: var(--accent); }
+  li.dir .m { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .tag {
+    display: inline-block; vertical-align: 1px; margin-left: 5px; padding: 0 6px;
+    border: 1px solid var(--line-strong); border-radius: 999px;
+    color: var(--muted); font-size: 11px; font-weight: 400;
+  }
+  .toolbar {
+    flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    padding: 10px 12px; border-bottom: 1px solid var(--line);
+  }
+  #selInfo {
+    flex: 1 1 140px; min-width: 0; font-size: 13px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* #sessions 是表头的滚动容器，position:sticky 只有相对它才真正生效。 */
+  #sessions { flex: 1 1 auto; min-height: 0; overflow: auto; }
+  table { width: 100%; border-collapse: separate; border-spacing: 0; }
+  th, td { text-align: left; padding: 10px 12px; vertical-align: top; border-bottom: 1px solid var(--line); }
+  th {
+    position: sticky; top: 0; z-index: 2; white-space: nowrap;
+    background: var(--panel-2); color: var(--muted);
+    font-size: 12px; font-weight: 600; letter-spacing: .02em;
+  }
+  tbody tr { cursor: pointer; transition: background .12s ease; }
+  tbody tr:hover { background: var(--hover); }
+  tbody tr.sel { background: var(--accent-soft); }
+  tbody tr.sel td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+  tbody tr:last-child td { border-bottom: none; }
+  th:nth-child(2), td:nth-child(2) { width: 132px; }
+  th:nth-child(3), td:nth-child(3) { width: 128px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  th:nth-child(4), td:nth-child(4) { width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
+  th:nth-child(5), td:nth-child(5) { width: 88px; }
+  td.title .t { font-weight: 500; overflow-wrap: anywhere; }
+  td.title .f { margin-top: 3px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .mono { font-family: Consolas, "Cascadia Mono", ui-monospace, monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+  .empty {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100%; padding: 28px 16px; color: var(--muted); text-align: center;
+  }
+  button {
+    font: inherit; font-size: 13px; padding: 7px 14px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--line-strong); background: var(--panel); color: var(--text);
+    box-shadow: var(--shadow-sm);
+    transition: background .12s ease, border-color .12s ease, box-shadow .12s ease, transform .06s ease;
+  }
+  button:hover:not(:disabled) { background: var(--hover); }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring); }
+  button:disabled { opacity: .5; cursor: not-allowed; box-shadow: none; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+  button.danger { color: var(--danger); }
+  button.danger:hover:not(:disabled) { background: var(--danger-soft); border-color: var(--danger); }
+  dialog {
+    border: 1px solid var(--line); border-radius: 14px; padding: 0;
+    width: min(560px, 92vw); background: var(--panel); color: var(--text);
+    box-shadow: var(--shadow-lg);
+  }
+  dialog::backdrop { background: rgba(15,23,42,.42); }
+  dialog[open] { animation: dialog-in .16s ease-out; }
+  @keyframes dialog-in { from { opacity: 0; transform: translateY(-6px) scale(.985); } }
+  dialog form { margin: 0; }
+  dialog .body { padding: 20px 22px; }
+  dialog h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
+  dialog .sub { margin-bottom: 16px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  dialog label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 12px; }
+  dialog input[type=text] {
+    width: 100%; padding: 9px 11px; font: inherit; color: var(--text);
+    border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel-2);
+  }
+  dialog input[type=text]:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring); }
+  dialog input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--accent); }
+  dialog .hint { margin-top: 8px; color: var(--muted); font-size: 12px; }
+  dialog .foot {
+    display: flex; justify-content: flex-end; gap: 8px;
+    padding: 12px 22px; border-top: 1px solid var(--line); background: var(--panel-2);
+  }
+  .err { margin-top: 10px; color: var(--danger); font-size: 13px; white-space: pre-wrap; }
+  #toast {
+    position: fixed; left: 50%; bottom: 24px; z-index: 20; max-width: 80vw;
+    padding: 11px 18px; border-radius: 10px; font-size: 13px;
+    background: var(--toast-bg); color: var(--toast-text); box-shadow: var(--shadow-lg);
+    opacity: 0; transform: translate(-50%, 12px); pointer-events: none;
+    transition: opacity .18s ease, transform .18s ease;
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+  #toast.bad { background: var(--danger); color: #fff; }
+  @media (max-width: 900px) {
+    header { flex-wrap: wrap; gap: 8px 10px; padding: 10px 14px; }
+    #rootLabel { max-width: 100%; }
+    main { flex-direction: column; gap: 12px; padding: 12px 14px; }
+    .col-left { width: auto; max-height: 38vh; }
+    th:nth-child(5), td:nth-child(5) { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>DSH 会话管理</h1>
+  <span class="muted mono" id="rootLabel"></span>
+  <span class="spacer"></span>
+  <button id="refresh">刷新</button>
+  <button id="quit" class="danger">退出服务</button>
+</header>
+<div class="banner hidden" id="banner"></div>
+
+<main>
+  <section class="col col-left">
+    <h2>目录 <span class="count" id="dirCount"></span></h2>
+    <ul id="dirs"></ul>
+  </section>
+
+  <section class="col col-right">
+    <h2>会话 <span class="count" id="sessCount"></span></h2>
+    <div class="toolbar">
+      <button id="moveBtn" class="primary" disabled>移动到…</button>
+      <button id="deleteBtn" class="danger" disabled>删除</button>
+      <span class="muted" id="selInfo">未选中会话</span>
+    </div>
+    <div id="sessions"></div>
+  </section>
+</main>
+
+<dialog id="moveDlg">
+  <form method="dialog">
+    <div class="body">
+      <h3>移动会话</h3>
+      <div class="sub" id="moveSub"></div>
+      <label for="movePath">目标目录（绝对路径）</label>
+      <input type="text" id="movePath" spellcheck="false" placeholder="例如 D:\projects\my-app">
+      <div class="hint" id="moveHint">目录不存在时可勾选下方选项自动创建。</div>
+      <label style="margin-top:12px; display:flex; gap:8px; align-items:center; color:var(--text);">
+        <input type="checkbox" id="moveCreate"> 目标目录不存在时创建它
+      </label>
+      <div class="err" id="moveErr"></div>
+    </div>
+    <div class="foot">
+      <button value="cancel">取消</button>
+      <button id="moveOk" class="primary" value="ok">移动</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast"></div>
+
+<script>
+'use strict'
+let state = { projects: [], selectedDir: null, selectedSession: null, running: false }
+
+const $ = (id) => document.getElementById(id)
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+const fmtBytes = (b) => b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(1) + ' KB' : b < 1073741824 ? (b / 1048576).toFixed(1) + ' MB' : (b / 1073741824).toFixed(2) + ' GB'
+const fmtTime = (ms) => {
+  if (typeof ms !== 'number' || !isFinite(ms) || ms <= 0) return '(未知)'
+  const d = new Date(ms); const p = (v) => String(v).padStart(2, '0')
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
+}
+const oneLine = (t, n) => { if (typeof t !== 'string') return ''; const c = t.replace(/\s+/g, ' ').trim(); return c.length <= n ? c : c.slice(0, n) + '…' }
+
+function toast(msg, bad) {
+  const el = $('toast'); el.textContent = msg; el.className = 'show' + (bad ? ' bad' : '')
+  clearTimeout(toast._t); toast._t = setTimeout(() => { el.className = '' }, bad ? 5200 : 2600)
+}
+
+async function api(path, options) {
+  const res = await fetch(path, options)
+  const text = await res.text()
+  let data
+  try { data = JSON.parse(text) } catch { throw new Error('服务返回了非 JSON 内容：' + text.slice(0, 200)) }
+  if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status))
+  return data
+}
+
+function renderBanner() {
+  const el = $('banner')
+  if (!state.running) { el.className = 'banner hidden'; return }
+  el.className = 'banner'
+  el.textContent = '⚠ DSH 正在运行：为避免破坏正在写入的日志，移动操作已被禁用。请先退出 DSH（关闭其窗口 / 结束进程），再点「刷新」。'
+}
+
+function renderDirs() {
+  $('dirCount').textContent = '(' + state.projects.length + ')'
+  const ul = $('dirs')
+  if (state.projects.length === 0) { ul.innerHTML = '<li class="empty">没有工作区目录</li>'; return }
+  ul.innerHTML = state.projects.map((p, i) => {
+    const active = state.selectedDir === i ? ' active' : ''
+    return '<li class="dir' + active + '" data-i="' + i + '">'
+      + '<span class="p">' + esc(p.displayPath) + (p.exact ? '' : ' <span class="tag">推测</span>') + '</span>'
+      + '<span class="m">' + p.sessionCount + ' 个会话 · ' + fmtTime(p.newest) + '</span>'
+      + '</li>'
+  }).join('')
+  for (const li of ul.querySelectorAll('li.dir')) {
+    li.onclick = () => { state.selectedDir = Number(li.dataset.i); state.selectedSession = null; renderDirs(); renderSessions() }
+  }
+}
+
+function renderSessions() {
+  const box = $('sessions')
+  const project = state.projects[state.selectedDir]
+  if (project === undefined) { box.innerHTML = '<div class="empty">请先在左侧选择一个目录</div>'; $('sessCount').textContent = ''; updateButtons(); return }
+  $('sessCount').textContent = '(' + project.sessions.length + ')'
+  if (project.sessions.length === 0) { box.innerHTML = '<div class="empty">该目录下没有会话</div>'; updateButtons(); return }
+
+  const rows = project.sessions.map((s, i) => {
+    const sel = state.selectedSession === i ? ' class="sel"' : ''
+    const label = s.title !== undefined && s.title !== '' ? s.title : (oneLine(s.firstUserText, 60) || '(空会话，无标题)')
+    const sub = s.title !== undefined && s.title !== '' && s.firstUserText ? oneLine(s.firstUserText, 90) : ''
+    return '<tr' + sel + ' data-i="' + i + '">'
+      + '<td class="title"><div class="t">' + esc(label) + '</div>' + (sub ? '<div class="f">' + esc(sub) + '</div>' : '') + '</td>'
+      + '<td class="muted mono">' + esc(s.agentPreset || '-') + '</td>'
+      + '<td class="muted">' + fmtTime(s.lastTime) + '</td>'
+      + '<td class="muted">' + fmtBytes(s.size) + '</td>'
+      + '<td class="muted mono">' + esc(String(s.id).replace(/^session-/, '').slice(0, 8)) + '</td>'
+      + '</tr>'
+  }).join('')
+  box.innerHTML = '<table><thead><tr><th>标题 / 首条消息</th><th>预设</th><th>最近写入</th><th>大小</th><th>ID</th></tr></thead><tbody>' + rows + '</tbody></table>'
+  for (const tr of box.querySelectorAll('tbody tr')) {
+    tr.onclick = () => { state.selectedSession = Number(tr.dataset.i); renderSessions() }
+  }
+  updateButtons()
+}
+
+function currentSession() {
+  const project = state.projects[state.selectedDir]
+  if (project === undefined || state.selectedSession === null) return undefined
+  return project.sessions[state.selectedSession]
+}
+
+function updateButtons() {
+  const s = currentSession()
+  const blocked = state.running
+  $('moveBtn').disabled = s === undefined || blocked
+  $('deleteBtn').disabled = s === undefined || blocked
+  $('selInfo').textContent = s === undefined
+    ? '未选中会话'
+    : (blocked ? '已选中 1 个会话（DSH 运行中，操作已禁用）' : '已选中：' + (s.title || oneLine(s.firstUserText, 40) || s.id))
+}
+
+async function load(keepSelection) {
+  const data = await api('/api/list')
+  state.projects = data.projects
+  state.running = data.running
+  if (!keepSelection) { state.selectedDir = state.projects.length > 0 ? 0 : null; state.selectedSession = null }
+  else if (state.selectedDir !== null && state.selectedDir >= state.projects.length) { state.selectedDir = state.projects.length > 0 ? 0 : null; state.selectedSession = null }
+  $('rootLabel').textContent = data.root
+  renderBanner(); renderDirs(); renderSessions()
+}
+
+$('refresh').onclick = () => load(true).then(() => toast('已刷新')).catch((e) => toast(e.message, true))
+
+$('quit').onclick = async () => {
+  if (!confirm('退出后此页面将无法继续操作，确定吗？')) return
+  try { await api('/api/quit', { method: 'POST' }) } catch {}
+  document.body.innerHTML = '<div class="empty" style="padding:60px">服务已退出，可以关闭此页面。</div>'
+}
+
+$('deleteBtn').onclick = async () => {
+  const s = currentSession(); if (s === undefined) return
+  const label = s.title || oneLine(s.firstUserText, 40) || s.id
+  if (!confirm('将永久删除会话：\n' + label + '\n（' + fmtBytes(s.size) + '）\n\n此操作不可恢复，确定吗？')) return
+  try {
+    await api('/api/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dir: state.selectedDir, session: s.id }) })
+    toast('已删除会话')
+    await load(true)
+  } catch (e) { toast(e.message, true) }
+}
+
+$('moveBtn').onclick = () => {
+  const s = currentSession(); if (s === undefined) return
+  $('moveSub').textContent = (s.title || oneLine(s.firstUserText, 50) || s.id) + '  ·  当前：' + (s.cwd || '(未知)')
+  $('movePath').value = ''
+  $('moveCreate').checked = false
+  $('moveErr').textContent = ''
+  $('moveDlg').showModal()
+  setTimeout(() => $('movePath').focus(), 30)
+}
+
+$('moveDlg').addEventListener('close', async () => {
+  if ($('moveDlg').returnValue !== 'ok') return
+  const s = currentSession(); if (s === undefined) return
+  const target = $('movePath').value.trim()
+  if (target === '') { toast('请填写目标目录', true); return }
+  $('moveErr').textContent = ''
+  try {
+    const r = await api('/api/move', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dir: state.selectedDir, session: s.id, target: target, create: $('moveCreate').checked }),
+    })
+    toast('已移动到 ' + r.to)
+    await load(true)
+  } catch (e) { toast(e.message, true) }
+})
+
+load(false).catch((e) => { $('sessions').innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>' })
+</script>
+</body>
+</html>

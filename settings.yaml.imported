@@ -1,0 +1,63 @@
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      tc2api:
+        displayName: tc2api
+        apiKeyEnv: TC2API_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:7863/v1
+        models:
+          - id: space-bunny
+            name: space-bunny
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              medium: medium
+              xhigh: xhigh
+              high: high
+              max: max
+          - id: global:deepseek-v4.1-flash
+            name: global:deepseek-v4.1-flash
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+      cline:
+        displayName: cline
+        apiKeyEnv: CLINE_API_KEY
+        api: openai-completions
+        baseURL: https://api.cline.bot/api/v1/
+        models:
+          - id: deepseek/deepseek-4.1-falsh
+            name: deepseek/deepseek-4.1-falsh
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+            contextWindow: 1000000
+      gcli2api:
+        displayName: gcli2api
+        apiKeyEnv: GCLI2API_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:7861/antigravity/v1
+        defaultContextWindow: 1000000
+        models:
+          - id: gemini-3.8-flash-high
+            name: gemini-3.8-flash-high
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+          - id: claude-sonnet-4-6
+            name: claude-sonnet-4-6
