@@ -77,7 +77,7 @@
       **3.4 Verifying your own change is not a probe.** Run the narrowest check that covers the edit: the `typecheck` tool after a rename or type change, and a direct assertion in the existing tests for any predicate or contract you changed (§5.4), run through the `test` tool. `test` takes no arguments and runs the whole suite, so call it only when your change touches something the tests cover; don't use it for casual sanity checks or broad regression sweeps unless asked. Assertions about CSS classes or conditional branches must be checked against the build output (`dist/`) with a targeted `grep`, because source-level matches lie under macros, minifiers and tree-shaking; if `dist/` is missing or stale, report the assertion as unverified.
 
       **3.5 Environment.**
-      - You have no shell. Work only through the provided tools, and never write out command-line steps as if you could run them. A step only the user can perform (restart, rebuild, moving or deleting files) is listed in the report (§11) instead.
+      - You have no shell. Work only through the provided tools, and never write out command-line steps as if you could run them. A step no tool can perform (restarting, rebuilding, moving a file) is listed in the report (§11) instead.
       - Verify API availability, option names and version constraints against the project itself (`package.json`, lockfile, installed type definitions, config files), never from memory.
 
       ## 4. Defects: root cause first
@@ -325,7 +325,7 @@
 
       ### 8.6 Cleanliness after any refactor
 
-      In every file you modified, remove unused imports, dead code, unused variables and obsolete type declarations that the refactor left behind. Update or delete comments the refactor made false. For renames: replace the bare identifier everywhere, not just at the declaration (matching `export interface OldName {` updates only the declaration); update every `import` and re-export path; then `grep` for zero residual references to the old name (ignoring comments) and finish with the `typecheck` tool. File moves or deletions your tools can't perform go in the report.
+      In every file you modified, remove unused imports, dead code, unused variables and obsolete type declarations that the refactor left behind. Update or delete comments the refactor made false. For renames: replace the bare identifier everywhere, not just at the declaration (matching `export interface OldName {` updates only the declaration); update every `import` and re-export path; then `grep` for zero residual references to the old name (ignoring comments) and finish with the `typecheck` tool. A file move your tools can't perform goes in the report.
 
       ## 9. Honest reporting
 
@@ -399,12 +399,14 @@
 - id: tool-skill
   name: '@deepseek-ai/dsh-tool-skill'
 
-# ── 检查与提交工具 ────────────────────────────────────────────────────────
+# ── 检查、执行与提交工具 ──────────────────────────────────────────────────
 
-# 以下三个是本预设专属的本地插件（源文件在本预设目录），共同特点：
+# 以下五个是本预设专属的本地插件（源文件在本预设目录），共同特点：
 # - 自带子进程执行，不经宿主 `shell` 接缝：走沙箱会向工作区根目录申请写权限，
-#   授权失败则工具不可用，而这些工具零参数、无法提权重试（详见各插件文件头注释）。
-# - 安全性由「命令写死 + 零参数 + cwd 取自会话」保证，没有可注入的入口。
+#   授权失败则工具不可用（详见各插件文件头注释）。
+# - 安全性由「命令写死 + cwd 取自会话」保证：typecheck / test / git_commit 零参数，
+#   没有可注入的入口；node / delete 是本组唯一带参数的，参数只当路径用，
+#   且必须落在会话工作区之内（绝对路径与 `..` 穿越一律拒绝）。
 # - 只注册模型侧工具、不发布服务，因此不需要领域。
 
 # typecheck：在会话工作区根目录运行 `tsc --noEmit --pretty false`，返回诊断与退出码。
@@ -420,6 +422,17 @@
 # 把所有更改（含新建文件）提交到当前分支，返回 git 输出与退出码。提交信息写死在插件里。
 - id: tool-git-commit
   name: './git-commit.js'
+
+# node：以项目根目录为基准解析 paths（逗号分隔的相对路径），把每个路径下的所有
+# .js 脚本按顺序逐个用 node 执行，返回各脚本的输出与退出码；遇到第一个失败即停止。
+# 路径可以是文件或目录，目录递归取 .js（跳过 node_modules 与隐藏目录）。
+- id: tool-node
+  name: './node.js'
+
+# delete：以项目根目录为基准解析 paths（逗号分隔的相对路径）并逐个删除；
+# 是文件就删文件，是目录就删整棵目录树。删除不可撤销，遇到第一个失败即停止。
+- id: tool-delete
+  name: './delete.js'
 
 # ── 目标（Goals）：人类命令与模型侧工具 ───────────────────────────────────
 
