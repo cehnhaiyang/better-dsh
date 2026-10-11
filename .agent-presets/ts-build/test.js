@@ -195,7 +195,7 @@ module.exports = {
     tools.register({
       name: TOOL_NAME,
       description:
-        '对当前项目运行测试，相当于在项目的 test 目录下执行 npm run test。直接调用即可看到测试结果。',
+        'Run the project test suite: run `npm run test` in the `test` subdirectory and return its output.',
       // 零参数：模型没有任何可注入的入口，这是本工具的设计前提。
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       output: {

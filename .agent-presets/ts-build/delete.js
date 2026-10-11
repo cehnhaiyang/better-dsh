@@ -165,15 +165,15 @@ module.exports = {
     tools.register({
       name: TOOL_NAME,
       description:
-        '删除当前项目里的文件或目录。参数是以项目根目录为基准的相对路径，多个用英文逗号分隔；'
-        + '路径是文件就删该文件，是目录就删整棵目录树。按顺序逐个删除，遇到第一个失败即停止。'
-        + '删除不可撤销，直接调用即可看到实际删掉了哪些路径。',
+        'Delete files or directories in the project. `paths` is a comma-separated list of paths relative to the'
+        + ' project root; a file is removed, a directory is removed with its whole tree. Paths are deleted in'
+        + ' order, stopping at the first failure. Deletion is irreversible.',
       parameters: {
         type: 'object',
         properties: {
           paths: {
             type: 'string',
-            description: '以项目根目录为基准的相对路径，多个用英文逗号分隔，例如 tmp/a.js,dist'
+            description: 'Comma-separated paths relative to the project root, e.g. tmp/a.js,dist'
           }
         },
         required: ['paths'],

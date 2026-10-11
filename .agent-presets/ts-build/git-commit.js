@@ -203,7 +203,8 @@ module.exports = {
     tools.register({
       name: TOOL_NAME,
       description:
-        '提交当前项目的所有更改：相当于在项目根目录依次执行 git add -A 和 git commit -m。提交信息固定，不需要也不能传入参数。直接调用即可看到 git 的输出。',
+        'Commit every project change: run `git add -A`, then `git commit -m <fixed message>` at the project root,'
+        + ' and return git output.',
       // 零参数：模型没有任何可注入的入口，这是本工具的设计前提。
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       output: {

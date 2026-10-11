@@ -315,15 +315,15 @@ module.exports = {
     tools.register({
       name: TOOL_NAME,
       description:
-        '运行当前项目里的 JavaScript 脚本。参数是以项目根目录为基准的相对路径，多个用英文逗号分隔；'
-        + '路径可以是 .js 文件，也可以是目录（递归取其下所有 .js 文件，跳过 node_modules 与隐藏目录）。'
-        + '按顺序逐个用 node 执行，遇到第一个失败即停止。直接调用即可看到每个脚本的输出与退出码。',
+        'Run JavaScript files with node. `paths` is a comma-separated list of paths relative to the project root;'
+        + ' each may be a .js file or a directory, and a directory contributes every .js file beneath it'
+        + ' (node_modules and dot-directories are skipped). Scripts run in order, stopping at the first failure.',
       parameters: {
         type: 'object',
         properties: {
           paths: {
             type: 'string',
-            description: '以项目根目录为基准的相对路径，多个用英文逗号分隔，例如 scripts/build.js,src'
+            description: 'Comma-separated paths relative to the project root, e.g. scripts/build.js,src'
           }
         },
         required: ['paths'],

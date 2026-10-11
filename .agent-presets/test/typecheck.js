@@ -229,7 +229,8 @@ module.exports = {
         tools.register({
             name: TOOL_NAME,
             description:
-                '对当前项目运行TypeScript类型检查，相当于在项目根目录执行 tsc --noEmit。直接调用即可看到编译器报告的语法与类型错误。',
+                'Type-check the project: run `tsc --noEmit --pretty false` at the project root and return the'
+                + " compiler's syntax and type errors.",
             // 零参数：模型没有任何可注入的入口，这是本工具的设计前提。
             parameters: { type: 'object', properties: {}, additionalProperties: false },
             output: {
