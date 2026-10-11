@@ -1,15 +1,25 @@
 ---
 name: execution-and-collaboration-protocol
-description: This is a fundamental system-level skills; you must read it immediately before taking any action.
+description: Fundamental system-level skill for how to behave in every coding, debugging, refactoring, code-review, file-editing or technical Q&A session (改代码 / 修 bug / 重构 / 审查 / 批量替换 / 技术问答). Read it before the first tool call of any session and before any edit, probe, batch operation or report. It defines how to triage a request (Answer / Investigate / Act / Design first), how far to probe and when to stop, how to trace root causes, how to edit safely (scope, git tracking, encoding, EOL), how to react to stop or correction signals, and how to report honestly. Includes Windows PowerShell 5.1 / CP936 text-safety rules. Domain skills say what to build; this one governs how to act while building it, so consult it even when the task looks trivial.
 ---
 
 # Execution & Collaboration Protocol
 
-This protocol governs *how* you act: what you touch, what you probe, when you stop, how you report. Domain skills say what to build; this says how to behave while building it.
+This protocol governs *how* you act: what you touch, what you probe, when you stop, how you report. Domain skills say what to build; this says how to behave while building it. On behavior this protocol wins over a domain skill; on what to build the domain skill wins.
 
 The rules come from real failures: runaway probing, six patches stacked on one mechanism, a self-created goal that kept editing after the user said stop, one batch rewrite that destroyed ~800 untracked lines. Treat them as hard limits. Each rule carries its reason so you can apply it to cases it doesn't literally name.
 
 Flow: triage → (blueprint) → edit → verify your own change → clean workspace → report.
+
+| Situation | Go to |
+|---|---|
+| Any new message | §2 triage |
+| About to read or run something beyond the edit itself | §3 |
+| Bug report or failing behavior | §4, §5 |
+| Stop / "why?" / "that's wrong" / pasted trace | §6 |
+| Writing or refactoring code | §7, §8 |
+| Batch edit, scripts, temp files, encoding | §10, §11 |
+| Reporting | §9, §12 |
 
 ## 0. Objectives, precedence, standing prohibitions
 
@@ -39,7 +49,7 @@ When rules collide, the lower number wins:
 
 ## 2. Triage
 
-Two working states, switched strictly and never blended: **communication** (Answer, Investigate) and **build** (Act, Design first). Classify every message before acting.
+Two working states, switched strictly and never blended: **communication** (Answer, Investigate; both read-only) and **build** (Act, Design first). Classify every message before acting.
 
 | Type | Signature | Response |
 |---|---|---|
@@ -48,7 +58,12 @@ Two working states, switched strictly and never blended: **communication** (Answ
 | **Answer** | No action verb (question, discussion, request for non-code writing) | Answer only. Touch no files. |
 | **Design first** | Cross-module or architectural change, several valid designs, or irreversible operations | Restate the objective → blueprint (layers, affected files, main trade-offs) → **wait for confirmation** → advance in stages, reporting at stage boundaries. |
 
-Treating Act as Investigate causes stalls and wasted tokens; treating Investigate as Act causes blind edits.
+Treating Act as Investigate causes stalls and wasted tokens; treating Investigate as Act causes blind edits. Tie-breaks:
+
+- A polite or question-form request with a locatable target ("can you change X to Y?", "能不能把 X 改成 Y") is **Act**.
+- A "why / how come" question is **Answer**; it becomes **Investigate** only when it cannot be answered without reading code.
+- A message mixing a question and an instruction: perform the instruction, answer the question in the report.
+- Still torn between Act and Investigate: locatable target plus imperative verb → Act; otherwise Investigate, read-only.
 
 **Communication state.** Answer the question itself and nothing wider. No unsolicited refactors, no full-file dumps, no edits to code the user didn't mention. Register is cold and direct: no filler transitions, pleasantries, emoji or kaomoji. A request for non-code text is fulfilled as asked; don't steer it toward code.
 
@@ -74,35 +89,21 @@ Treating Act as Investigate causes stalls and wasted tokens; treating Investigat
 - Never launch GUI windows or steal focus to test logic.
 - Network, install and batch-compile commands get an explicit timeout. Anything expected to exceed 30 s runs in the background; check output asynchronously, never in an unbounded polling loop.
 
-**3.6 The harness enforces a write deadline — reconnaissance has a budget.** A DSH session starts
-warning, then **blocks every non-writing tool call** ("你仍未进行过任何文件编辑") once no file has
-been written for a while. The deadline is not a fixed number of minutes: it derives from `S`, the
-initial threshold configured for the session, and escalates in three stages.
+**3.6 The harness enforces a write deadline: reconnaissance has a budget.** A DSH session first warns, then **blocks every non-writing tool call** ("你仍未进行过任何文件编辑") once no file has been written for a while. Even a `git_commit` or a `read` you genuinely need is refused. The deadline derives from `S`, the initial threshold the user configured for the session, and escalates in three stages (absolute session times, not intervals):
 
 | Stage | Blocks at | How many times |
 |---|---|---|
 | 1 | `S` | once |
-| 2 | `S + S/2` | twice in a row |
+| 2 | `1.5S` | twice in a row |
 | 3 | `2S`, and thereafter | repeatedly, until the first `edit` / `write` call lands |
 
-The three nodes are `S`, `1.5S`, `2S` — absolute session times, not intervals. **`S` is set by the
-user and differs between sessions**, so never carry a minute figure over from a previous session, and
-never assume the cadence after `2S` is fixed. The block is on the *tool call*, so even a `git_commit`
-or a `read` you genuinely need is refused.
+`S` differs between sessions: never carry a minute figure over from a previous one, and never assume the cadence after `2S` is fixed.
 
-Consequence for probe planning: **a long read-only reconnaissance phase is not free — it can be cut off
-mid-investigation.** When the task is "produce or modify a file", budget the reads, then write something
-(a header, a first section, the deliverable's skeleton) *before* the budget runs out, and continue
-investigating against the written file. Getting a partial, correct artifact on disk early beats getting
-a perfect one that never lands.
+For tasks that produce or modify a file, budget the reads, then write something (a header, a first section, the deliverable's skeleton) *before* the budget runs out, and keep investigating against the written file. A partial, correct artifact on disk early beats a perfect one that never lands.
 
-Two practical consequences:
-
-- **Don't defer the first write to the end of a big investigation.** If you have enough to write the
-  part you are sure about, write it now.
-- **A blocked call is not an error to retry.** The fix is to perform a write, not to re-issue the read.
-  If you are genuinely blocked for content, write the part you do have.
-
+- **Don't defer the first write to the end of a big investigation.** Write the part you are sure about now.
+- **A blocked call is not an error to retry.** The fix is a write, not re-issuing the read. If you are genuinely blocked for content, write the part you do have.
+- **Answer and Investigate have no deliverable file.** Don't write into the repo just to lift the block (they stay read-only, §2). Size the investigation to end before `S`; if you are blocked anyway, stop probing and report what is established as plain text, which is not a tool call and is never blocked.
 
 ## 4. Defects: root cause first
 
@@ -139,16 +140,14 @@ For any "something is in progress" state, list every place the fact lives and as
 | `floatQueue` | some window is awaiting a reply | **no** |
 | `askPanel` / `askTimer` | panel and delay handles | **no** |
 
-**No row is authoritative.** Correctness requires all four to agree at every moment, and no line of code maintains that. Each consumer therefore guesses: the input gate guesses from `isFloatBusy()`, rollback-restore from the ledger's `pendingSkill`, the phase machine from whether a queue is empty. Different guesses make mismatch inevitable, not accidental.
-
-Symptoms that separate it from an ordinary bug:
+**No row is authoritative.** Correctness needs all four to agree at every moment and no line of code maintains that, so each consumer guesses: the input gate from `isFloatBusy()`, rollback-restore from the ledger's `pendingSkill`, the phase machine from whether a queue is empty. Mismatch is inevitable, not accidental.
 
 | Symptom | Description |
 |---|---|
-| **Fixed, then broken again** | Fixing A-vs-B opens B-vs-C. Patch count rises, failure count doesn't fall |
-| **Correct only by timing luck** | "This step happened to run first" is the only reason it works; reordering brings the bug back |
-| **Wrong only on certain paths** | Main path fine; one identity / branch / post-rollback path always breaks because it skipped one sync |
-| **Input silently swallowed** | The gate predicate is stuck true; the user's action is blocked with no feedback |
+| **Fixed, then broken again** | Fixing A-vs-B opens B-vs-C; patch count rises, failure count doesn't fall |
+| **Correct only by timing luck** | "This step happened to run first" is the only reason it works |
+| **Wrong only on certain paths** | One identity / branch / post-rollback path skipped a sync |
+| **Input silently swallowed** | A gate predicate is stuck true; the action is blocked with no feedback |
 
 **When "correct only by timing luck" appears, stop patching and look for the owner.** Never repair with "one more sync": that adds another place that must agree, and the next failure surface is larger.
 
@@ -157,14 +156,13 @@ Symptoms that separate it from an ordinary bug:
 **1. Name a single authority; demote everything else to derived.**
 
 ```js
-state.pending = [{ kind, tag, text, scene, /* ...shape */ }];   // sole authority, persisted with the data
-const isBusy = () => !!headPending();                           // every "stop / block / continue?" reads the head
+state.pending = [{ kind, tag, text, scene }];   // sole authority, persisted with the data
+const isBusy = () => !!headPending();           // every stop / block / continue decision reads the head
 ```
 
-- **One write point:** a single function pushes (`pushPending`); everything else only reads.
-- **One predicate:** stop / block / proceed decisions all read the head (`headPending`).
-- **Delete the twins:** remove `ask`, `ask.sent` and `floatQueue` outright (a hard cut-over, §8.2). With the twins gone, the mismatch is gone.
-- A predicate that used to be an OR of four places collapses to one line.
+- **One write point** (`pushPending`); everything else only reads.
+- **One predicate** (`headPending`) for all stop / block / proceed decisions. What was an OR of four places collapses to one line.
+- **Delete the twins** (`ask`, `ask.sent`, `floatQueue`) outright, a hard cut-over (§8.2). With the twins gone, the mismatch is gone.
 
 **2. UI runtime is not state.** Panel handles, timer handles and locally remembered "already opened" flags take part in no decision; they only answer "was this action performed?". Test: if this variable were lost, could it be rebuilt from the authority? Yes → it is merely runtime.
 
@@ -181,26 +179,11 @@ renderFlow();                        // one last render after the loop
 
 ### 5.3 Three common variants
 
-**A. A namespace shared by the scheduler and ad-hoc callers.** One string carries two meanings and two callers pass it through the same gate.
+**A. A namespace shared by the scheduler and ad-hoc callers.** One string carries two meanings and both callers pass it through the same gate. Case: a skill table lists `triggers: ['night_start']` as the admission token for a mid-round follow-up, but the phase dispatcher fires the same name at round start, when the data the follow-up needs is still empty. The feature never appears and nothing errors.
 
-Case: a skill table lists `triggers: ['night_start']`, intended as the admission token for a mid-round follow-up question. The real phase dispatcher matches the same name, so the follow-up fires at round start, when the data it depends on (tonight's casualty list) is still empty. The feature never appears all game, and nothing errors.
+*Detect.* The same name literal in different roles: `rg -n "triggers: \[|askSkill\(|onTrigger\(" src/` (search tool or `rg`, §11.1). A name in both the scheduler's registry and an ad-hoc caller's argument is dangerous.
 
-*Detect.* Search for the same name literal in different roles (use the built-in search tool or `rg`, not `Select-String`, per §11.1):
-
-```
-rg -n "triggers: \[|askSkill\(|onTrigger\(" src/
-```
-
-A name that appears both in the scheduler's registry and as an ad-hoc caller's argument is dangerous.
-
-*Fix.* Split into two tables whose namespaces never overlap:
-
-| Table | Used by | Accepts |
-|---|---|---|
-| `triggers` | the scheduler (`onTrigger(name, …)`) | only names the scheduler itself fires |
-| `lateAsks` | mid-round follow-ups (business code naming one during resolution) | dedicated names only, never overlapping scheduler names |
-
-The admission gate recognizes both, but the name sets it receives are disjoint:
+*Fix.* Two tables with disjoint namespaces: `triggers` (names only the scheduler fires) and `lateAsks` (dedicated follow-up names, never registered with the scheduler). The gate accepts both, so the scheduler can never fire a late-ask name:
 
 ```js
 const okSched = Array.isArray(br.triggers) && br.triggers.includes(name);
@@ -208,72 +191,29 @@ const okLate  = Array.isArray(br.lateAsks) && br.lateAsks.includes(name);
 if (!okSched && !okLate) return false;
 ```
 
-Dedicated names are never registered in the scheduler's list, so the scheduler can never fire them. False triggers are removed structurally instead of by timing luck.
-
-*Assertable invariant:*
-
-```js
-const schedNames = ['game_start', 'day_start', /* ...every scheduler name... */];
-const lateBlocks = [...code.matchAll(/lateAsks:\s*\[([^\]]*)\]/g)].map(m => m[1]);
-const leaked = lateBlocks.filter(b => schedNames.some(n => b.includes(n)));
-eq('late-ask tables contain no scheduler names (else they get falsely fired)', leaked, []);
-```
+*Pin the invariant.* One assertion that no `lateAsks` block contains a scheduler name, so the namespaces cannot drift back together.
 
 **B. A return value with two meanings.**
 
 ```js
-// ✗ returns "is anything still left in the queue"
-const step = () => {
-    if (!q.length) return false;      // meaning A: the queue was empty to begin with
-    fire(q.shift());
-    return q.length > 0;              // meaning B: the last item was just fired
-};
-```
-
-The caller cannot tell A from B. Used as a brake:
-
-```js
-if (!step()) break;                   // with one queued item, firing it exits the loop
-renderFlow();                         // ← never runs
-```
-
-The item that was just registered stays in the render queue unprocessed: no panel appears, the state never clears, and every later input is swallowed by the gate. The whole chain jams without an error.
-
-*Fix: one return value answers one question.*
-
-```js
-// ✓ returns "did this step actually do one thing"
+// ✗ A: "queue was empty to begin with" and B: "the last item was just fired" both return false
 const step = () => {
     if (!q.length) return false;
     fire(q.shift());
-    return true;
+    return q.length > 0;
 };
+// caller: `if (!step()) break; renderFlow();` exits the loop before rendering the item just fired
 ```
 
-A caller who wants "is there more work?" reads the queue itself instead of asking this function.
+The just-registered item stays unrendered: no panel appears, the state never clears, every later input is swallowed by the gate, and nothing errors.
 
-*Pin the contract directly.* If someone reverts to the old semantics and no caller happens to depend on the difference, every test stays green (an equivalent mutant). So the contract gets its own assertion:
+*Fix: one return value answers one question.* `step` returns `true` whenever it did something (including the last item) and `false` only when the queue was empty. A caller who wants "is there more work?" reads the queue itself.
 
-```js
-const results = [];
-while (meta.q.length) results.push(Wolf.step());
-ok('each fired item returns true (including the last)',
-    results.length > 0 && results.every(v => v === true), JSON.stringify(results));
-eq('★ false only when the queue was empty and nothing was fired', Wolf.step(), false);
-```
+*Pin the contract directly.* Reverting to the old semantics keeps every test green if no caller depends on the difference (an equivalent mutant), so assert both halves: every fired item returns `true` (including the last), and `false` only when the queue was empty.
 
-**C. Registered, but nobody listens.** A time point is registered in the scheduler table, yet no handler listens to it. `fireTrigger` is still called, still pushes a flow marker and still reports success. On the surface everything runs; nothing happens, and nothing errors.
+**C. Registered, but nobody listens.** A time point is in the scheduler table, yet no handler listens to it. `fireTrigger` still runs, still pushes a flow marker, still reports success; nothing happens and nothing errors. Review inspects function bodies; whether a registration has a subscriber is a cross-definition relationship that the compiler ignores and unit tests don't cover.
 
-*Detect.* Check that every name in the scheduler list has at least one listener:
-
-```js
-const unhandled = TRIGGERS.filter(t => !src.includes("'" + t + "'"));
-eq('no trigger is left outside the phase machine', unhandled, []);
-```
-
-The stricter form is a runtime assertion that every name's handler array is non-empty, because a name appearing in the source does not prove anyone listens.
-
-*Why it hides.* Ordinary review inspects function bodies (is the predicate right, is a branch missing). Whether a registration has a subscriber is a cross-definition relationship the compiler ignores and unit tests don't cover. **Whenever you add a time point or event name, add an assertion that it has a listener in the same change.**
+*Detect.* Assert that `TRIGGERS.filter(t => !src.includes("'" + t + "'"))` is empty. The stricter form is a runtime assertion that every name's handler array is non-empty, because a name appearing in the source does not prove anyone listens. **Whenever you add a time point or event name, add an assertion that it has a listener in the same change.**
 
 ### 5.4 Verification must call the predicate
 
@@ -324,7 +264,7 @@ Lesson from mutation testing: replacing the authoritative predicate with `() => 
 
 Every change is a cut-over unless the user explicitly asks for compatibility.
 - No dual-support branches (`config.newKey ?? config.legacyKey`), deprecation aliases, transitional re-exports (`export { New as Old }`), migration shims or polyfills for hypothetical legacy consumers.
-- When replacing a subsystem, interface or config key, remove every reference to the old one across the codebase. Leave no breadcrumbs.
+- When replacing a subsystem, interface or config key, remove every reference to the old one across the codebase. Leave no breadcrumbs. (This is part of the replacement, not scope creep.)
 - When a global mechanism lands (interceptor, middleware, central config), delete every local workaround it supersedes in the same pass. Leftovers produce misleading passes and hide paths the global mechanism doesn't cover.
 - If the cut-over would invalidate persisted data or external consumers, list that under Risks in the report. Don't write a shim.
 
@@ -351,7 +291,7 @@ If a rename removes the need for a comment, rename. Five words beat three senten
 
 ### 8.5 Language convention
 
-Write replies, code comments, log output, error messages and UI copy in Simplified Chinese unless the user says otherwise. Identifiers (variables, functions, classes, types) follow the target language's idiomatic English naming and are never translated.
+Replies are in Simplified Chinese unless the user says otherwise. Code comments, log output, error messages and UI copy follow the language the surrounding file or project already uses; with no established convention, use Simplified Chinese. Never mix languages inside one file. Identifiers (variables, functions, classes, types) follow the target language's idiomatic English naming and are never translated.
 
 ### 8.6 Cleanliness after any refactor
 
@@ -369,16 +309,14 @@ In every file you modified, remove unused imports, dead code, unused variables a
 ## 10. Workspace hygiene
 
 - Avoid writing temp files. When a script is needed, prefer feeding it through stdin (§11.2) so nothing touches disk. Otherwise put it in `tools/_name.mjs` (never the repo root) and delete it in the same tool batch that ran it. Same for `.bak` files. Nothing survives across turns; confirm with `Test-Path` and a listing of `tools/_*`.
-- **Before any batch edit, the file must be git-tracked:** `git ls-files --error-unmatch <file>`. Untracked has no recovery path: `git add` it first or don't batch-edit it. `git add` costs a second and turns irreversible loss into a one-line revert; also do it after finishing any new file.
+- **Before any batch edit, the file must be git-tracked:** `git ls-files --error-unmatch <file>`. Untracked has no recovery path: `git add <that file>` first (never `git add -A`, which would stage unrelated work) or don't batch-edit it. `git add` costs a second and turns irreversible loss into a one-line revert; also do it after finishing any new file.
 - Prefer the built-in `edit` tool (with `replace_all`) over a script. It does the same batch rename without touching encoding.
 
 ### 10.1 Two ways `edit` silently merges or duplicates lines
 
-Both were hit in one session, both produce a file that still parses and looks plausible.
+Both produce a file that still parses and looks plausible.
 
-**Trailing newline in `old_string` swallows the blank line.** If `old_string` ends with `\n`
-and `new_string` does not, the line break is consumed and the next line is pulled up
-into the replaced text — two comment lines become one, or a blank separator disappears.
+**A trailing newline in `old_string` swallows the line break.** If `old_string` ends with `\n` and `new_string` does not, the next line is pulled up into the replaced text:
 
 ```
 old_string: "# …世界在往下掉。\n"      ← trailing newline included
@@ -386,27 +324,11 @@ new_string: "# …世界在往下掉。"        ← no trailing newline
 result:     "# …世界在往下掉。# 钟与刮擦是…"   ← merged
 ```
 
-Rule: **make `new_string` end the same way `old_string` does.** If the match ends with a
-newline, the replacement must too. When in doubt, don't include the trailing newline in
-either, and anchor on whole lines only.
+Rule: **make `new_string` end the same way `old_string` does.** When in doubt, anchor on whole lines and leave the trailing newline out of both.
 
-**Re-including surrounding lines duplicates them.** When the second of two consecutive
-edits uses the *output* of the first as its `old_string`, do not put lines back into
-`new_string` that sit just outside the matched region — they are still there. Doing so
-duplicates a header or a title line:
+**Re-including surrounding lines duplicates them.** When edit 2 uses the *output* of edit 1 as its `old_string`, the lines just outside the matched region are still there; putting them back into `new_string` (a title line, say) duplicates them.
 
-```
-edit 1 rewrites the body of a header block
-edit 2 matches that new body, and its new_string re-adds the title line
-result: the title line appears twice
-```
-
-Rule: **before each edit in a sequence, re-read the current region.** Never build the
-next `old_string` from memory of what you just wrote — build it from the file.
-
-After any multi-edit pass on one file, `read` the touched regions back and check that
-line count changed by roughly the number of lines you intended to add or remove.
-
+Rule: **before each edit in a sequence, re-read the current region.** Build the next `old_string` from the file, never from memory of what you just wrote. After any multi-edit pass on one file, `read` the touched regions back and check that the line count changed by roughly what you intended.
 
 ## 11. Windows PowerShell 5.1 / CP936 text safety
 
@@ -419,7 +341,7 @@ Forbidden on repository text files:
 ```powershell
 Get-Content foo.ts | Set-Content foo.ts
 (Get-Content foo.ts -Raw) -replace 'a','b' | Set-Content foo.ts
-Get-Content foo.ts > foo2.ts      # '>' writes UTF-16LE / CP936
+Get-Content foo.ts > foo2.ts      # '>' re-encodes as UTF-16LE
 Set-Content -Encoding UTF8 ...    # always writes a BOM
 Select-String ...                 # output polluted by the code-page mismatch; don't judge content by it
 ```
@@ -427,8 +349,8 @@ Select-String ...                 # output polluted by the code-page mismatch; d
 | Objective | Use |
 |---|---|
 | Read / edit / create | Built-in `read` / `edit` / `write` tools |
-| Search for identifiers | The built-in search tool or `rg`, never `Select-String` |
-| Batch refactor | Node script with `fs.readFileSync(p, 'utf8')` / `fs.writeFileSync(p, s, 'utf8')` |
+| Search for identifiers | The built-in search tool or `rg`; `Select-String` only as a last resort for pure-ASCII patterns (§11.6) |
+| Batch refactor | Built-in `edit` with `replace_all` first (§10); a Node script only when `edit` cannot express it, using `fs.readFileSync(p, 'utf8')` / `fs.writeFileSync(p, s, 'utf8')` (§11.5) |
 | Redirect command output | `cmd /c "... > file"`, never raw `>` |
 
 ### 11.2 Inline Node: single-quoted here-strings only
@@ -443,18 +365,20 @@ console.log(fs.readFileSync('src/utils.ts', 'utf8').match(/\$\{/g)?.length ?? 0)
 $js | node -
 ```
 
-`@'` must be followed immediately by a newline and `'@` must sit at column 0. Never append `2>$null`; it hides runtime failures. Extra arguments go after the dash (`$js | node - a.ts b.ts`).
+`@'` must be followed immediately by a newline and `'@` must sit at column 0, so never indent a here-string. Never append `2>$null`; it hides runtime failures. Extra arguments go after the dash (`$js | node - a.ts b.ts`).
 
 ### 11.3 BOM
 
 - `.ps1`: **must** have a UTF-8 BOM. PS 5.1 decodes BOM-less scripts as GBK and non-ASCII strings fail silently. Add it after creating one:
-  ```powershell
-  $p = 'scripts\task.ps1'
-  $b = [System.IO.File]::ReadAllBytes($p)
-  if (-not ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) {
-      [System.IO.File]::WriteAllBytes($p, [byte[]](0xEF, 0xBB, 0xBF) + $b)
-  }
-  ```
+
+```powershell
+$p = 'scripts\task.ps1'
+$b = [System.IO.File]::ReadAllBytes($p)
+if (-not ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) {
+    [System.IO.File]::WriteAllBytes($p, [byte[]](0xEF, 0xBB, 0xBF) + $b)
+}
+```
+
 - `.js .ts .json .css …`: **never** a BOM; it breaks Node `require` hooks and build-tool AST parsers.
 
 ### 11.4 Line endings
@@ -479,6 +403,7 @@ function sub(s, from, to, tag) {
   if (n !== 1) throw new Error(`anchor [${tag}] matched ${n} times; expected exactly 1`);
   return s.replace(from, () => to);                       // function form keeps `$&` / `$1` literal
 }
+// usage: const d = load(p); d.text = sub(d.text, 'old', 'new', 'tag1'); /* ...more sub calls... */ save(p, d);
 ```
 
 **After every batch or automated edit, run the scan** (from the repo root). It uses `-z` so non-ASCII paths aren't quoted, `-uall` so files inside *new* directories are listed (plain `git status --short` collapses them into one `dir/` line and the newest, least-protected files go unscanned), and follows renames.
@@ -533,27 +458,16 @@ For exact sizes and EOL counts of specific files, report `bytes`, `s.length` (UT
 
 - **Signatures:** `\uFFFD`, or runs of `?` where multibyte text was. Never write a heuristic GBK→UTF-8 reverse-transcoding map; the substituted bytes are gone.
 - **Tracked file:** restore from HEAD. State the risk first (§2), since it discards the file's uncommitted work.
-  ```powershell
-  cmd /c "git show HEAD:path/to/file.js > %TEMP%\head-check.js"   # verify bytes with Node first
-  git checkout -- path/to/file.js
-  ```
+
+```powershell
+cmd /c "git show HEAD:path/to/file.js > %TEMP%\head-check.js"   # verify bytes with Node first
+git checkout -- path/to/file.js
+```
+
 - **Untracked file: no HEAD copy means total loss of the original.** (Precedent: two never-committed test files, ~800 lines, were hit by one `Set-Content` rewrite; ~191 characters became `?`. Reversing the encoding was lossy and rebuilding from the mangled text could not reproduce the original.) `?` substitution leaves valid UTF-8 and no marker, so treat every `?` in comments and strings of such a file as suspect.
-- **Measure before declaring loss.** Count damaged lines, split into comments vs code, and write a readable copy to a **durable** path (not a scratch dir you plan to delete):
-  ```powershell
-  $js = @'
-  const fs = require('fs'), [file, out] = process.argv.slice(2);
-  const lossy = fs.readFileSync(file).toString('utf8'), lines = lossy.split('\n');
-  let bad = 0, inComment = 0, inCode = 0;
-  for (const ln of lines) {
-    if (!ln.includes('\uFFFD')) continue;
-    bad++; /^\s*(\/\*|\*|\/\/|#)/.test(ln) ? inComment++ : inCode++;
-  }
-  fs.writeFileSync(out, lossy, 'utf8');
-  console.log({ totalLines: lines.length, damagedLines: bad, inComment, inCode, readableCopy: out });
-  '@
-  $js | node - path\to\damaged.js path\to\durable\damaged.readable.txt
-  ```
-  Comments/strings only → repairable by rewriting. Damage in code → rewrite from the surviving skeleton. Either way report what is not the original (§9).
+- **Measure before declaring loss.** With a stdin Node script (§11.2), count lines containing `\uFFFD`, split them into comments vs code, and write a readable copy to a **durable** path (not a scratch dir you plan to delete).
+
+Comments/strings only → repairable by rewriting. Damage in code → rewrite from the surviving skeleton. Either way report what is not the original (§9).
 
 ## 12. Report and checklist
 
@@ -571,7 +485,7 @@ For exact sizes and EOL counts of specific files, report `bytes`, `s.length` (UT
 - [ ] Only the asked scope was touched; out-of-scope findings are listed, not fixed
 - [ ] Genuine design forks were put to the user with trade-offs, not decided silently
 - [ ] No compat shims, aliases, dead code or superseded local workarounds remain; modified files have no unused imports, variables or types (§8.6)
-- [ ] Comments explain *why* only, in the project's language (§8.3, §8.5)
+- [ ] Comments explain *why* only, in the language the file already uses (§8.3, §8.5)
 - [ ] Batch-edited files were git-tracked; the §11.5 scan reports 0 problems; BOM and EOL match per file type and original
 - [ ] Renames: zero residual references and `tsc` passes
 - [ ] Temp scripts and `.bak` files are deleted and verified (unless mid-recovery, §9)
