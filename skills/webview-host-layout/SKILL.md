@@ -1,107 +1,107 @@
 ---
 name: webview-host-layout
-description: 在渲染层页面里承载 Electron webview 时的布局与交互硬约束。含 OOPIF 吞掉指针事件导致拖拽"失焦"的正确修法（全视口遮罩 + blur 兜底）、webview 父链一旦变动就重载页面因此只能改宽度不能改结构、常驻边栏与全屏面板该用 flex 兄弟还是 fixed 覆盖、z-index 排序、动态宽度必须用容器查询而非视口断点、CSS 关键帧动画会压住工具类、prefers-reduced-motion 块的书写位置与特异性陷阱、以及何时该把多个组件文件合并成一个。要在 webview 周围加交互、调整含 webview 的面板布局/宽度/开合/全屏、或合并拆分浏览器面板组件文件时读。
+description: Hard layout and interaction constraints when hosting an Electron webview inside a renderer page. Covers the correct fix for OOPIF swallowing pointer events so a drag "loses focus" (a full-viewport overlay plus a blur fallback), that changing the webview's parent chain reloads the page so only the width may change and never the structure, whether a persistent sidebar and a fullscreen panel should be flex siblings or fixed overlays, z-index ordering, that a dynamic width requires container queries rather than viewport breakpoints, that CSS keyframe animations override utility classes, where the prefers-reduced-motion block must be written and its specificity trap, and when several component files should be merged into one. Read when adding interaction around a webview, when adjusting a panel layout/width/open-close/fullscreen that contains a webview, or when merging or splitting browser panel component files.
 ---
 
-# webview 宿主页面的布局与交互
+# Layout and Interaction for a webview Host Page
 
-**核心事实：`<webview>` 不是普通 DOM 元素，是 Chromium 的跨进程 OOPIF。**
+**Core fact: `<webview>` is not an ordinary DOM element; it is a Chromium cross-process OOPIF.**
 
-官方文档原文：
+From the official documentation:
 
 > You can not add keyboard, mouse, and scroll event listeners to `webview`
 
-- 主进程侧的约束（模块边界、`webRequest`、属性语义）见 `electron-main-constraints`
-- 审查 React 状态与死代码的方法见 `react-state-and-identity-audit`
-- HLS 与流媒体下载见 `hls-and-media-download`
+- For main-process-side constraints (module boundaries, `webRequest`, attribute semantics) see `electron-main-constraints`
+- For how to audit React state and dead code see `react-state-and-identity-audit`
+- For HLS and streaming downloads see `hls-and-media-download`
 
 ---
 
-## 一、指针交互：跨 webview 边界必须盖遮罩
+## 1. Pointer interaction: crossing a webview boundary requires an overlay
 
-### 症状：拖动侧边栏「失焦」
+### Symptom: dragging the sidebar "loses focus"
 
-鼠标从拖拽手柄往左偏一点点，拖动当场失效；挪回来又能接着拖。
-表现为「幅度稍大就失焦」，几乎无法改变宽度。
+The moment the mouse strays a little to the left of the drag handle, the drag dies; move it back and dragging resumes.
+It presents as "it loses focus as soon as the movement gets slightly large", making the width nearly impossible to change.
 
-**三个错误归因**（都会先被想到，都不对）：「失焦」、闭包过期、
-或配置变化导致 `onMouseDown` 被换成新函数。
+**Three wrong attributions** (all thought of first, all wrong): "lost focus", a stale closure,
+or a configuration change swapping `onMouseDown` for a new function.
 
-**真正原因**：`window.addEventListener('mousemove')` **收不到指针落在 webview 上之后的移动**。
-手柄贴在边栏左边缘，鼠标往左一偏就压到 webview 上，
-`mousemove` 不再冒泡到宿主页面的 `window`。
-**监听器本身没坏，是事件根本送不到。**
+**The real cause**: `window.addEventListener('mousemove')` **receives no movement once the pointer lands on the webview**.
+The handle sits on the sidebar's left edge, so a slight move left puts the mouse over the webview and
+`mousemove` no longer bubbles to the host page's `window`.
+**The listener is not broken; the event simply never arrives.**
 
-**修法**：拖动期间盖一层全视口透明遮罩，让指针始终落在宿主页面里。
+**Fix**: during the drag, cover the viewport with a transparent overlay so the pointer always stays inside the host page.
 
 ```tsx
 {resizing && <div className="fixed inset-0 z-[60] cursor-col-resize" />}
 ```
 
-### 配套：拖到窗口外松手，遮罩会撤不掉
+### Companion issue: releasing outside the window leaves the overlay stuck
 
-拖出窗口时 `mouseup` 收不到 → `resizing` 一直挂着、遮罩不撤 →
-**整个页面再也点不动**。必须同时监听 `blur` 收尾：
+Dragging outside the window means `mouseup` never arrives -> `resizing` stays set and the overlay never comes off ->
+**the entire page becomes unclickable**. A `blur` listener must clean up as well:
 
 ```tsx
 const onCancel = () => onUp();
 window.addEventListener('blur', onCancel);
-// 清理时一并 removeEventListener
+// remove it in the cleanup too
 ```
 
-**判据**：任何**跨 webview 边界**的指针交互都要有遮罩 ——
-拖拽调宽、框选、拖放、悬浮预览。不要指望「鼠标大概不会移出去」。
-**遮罩还必须有兜底撤除路径**，否则一次异常就会锁死整个界面。
+**Criterion**: every pointer interaction that **crosses a webview boundary** needs an overlay —
+drag-to-resize, marquee selection, drag and drop, hover previews. Do not count on "the mouse probably will not leave".
+**The overlay must also have a fallback removal path**, otherwise one anomaly locks the whole interface.
 
 ---
 
-## 二、webview 的父链不许动
+## 2. The webview's parent chain must not change
 
-React 一旦在 `<webview>` 上卸载重挂，页面就**重新加载一次** ——
-登录态、滚动位置、SPA 路由、播放进度全丢。
+The moment React unmounts and remounts a `<webview>`, the page **reloads once** —
+login state, scroll position, SPA route and playback progress are all lost.
 
-| 场景 | 正确做法 | 错误做法 |
+| Scenario | Correct | Wrong |
 |---|---|---|
-| 边栏开合 | 只改容器**宽度**，DOM 结构不动 | 把 webview 包进条件渲染的容器 |
-| 标签页切换 | 全部常驻，用 `invisible` / `z-0` 切可见性 | `{active && <webview/>}` |
+| Sidebar open/close | change only the container **width**, not the DOM structure | wrap the webview in a conditionally rendered container |
+| Tab switching | keep all of them mounted, toggle visibility with `invisible` / `z-0` | `{active && <webview/>}` |
 
-**推论**：边栏必须是 webview 容器的**兄弟节点**，不能包一层。
-包了的话，边栏收起时那一层的宽度 / 存在性一变，React 就可能重建子树。
+**Corollary**: the sidebar must be a **sibling** of the webview container, never a wrapper around it.
+If wrapped, then when the sidebar collapses that layer's width or existence changes and React may rebuild the subtree.
 
-> **布局可以变，树结构不能变。**
+> **Layout may change; the tree structure must not.**
 
-**同族**：收起边栏时若内容被**卸载**（提前 `return`），
-对话滚动位置与输入草稿会丢。要保留状态就得让内容始终挂载、只用 `hidden` 藏。
+**Same family**: if collapsing the sidebar **unmounts** the content (an early `return`),
+the conversation scroll position and the input draft are lost. To preserve state, keep the content mounted and hide it with `hidden` only.
 
 ---
 
-## 三、面板容器的两种定位
+## 3. Two ways to position a panel container
 
-| 需求 | 定位方式 | 为什么 |
+| Need | Positioning | Why |
 |---|---|---|
-| 常驻边栏（开合挤压内容） | flex 兄弟 + `style={{ width }}` | 宽度变化只挤压左栏，webview 父链不动 |
-| 全屏 / 覆盖层 | `fixed inset-0` | 父容器只有面板那一条的高度，撑不满视口 |
+| Persistent sidebar (open/close squeezes the content) | flex sibling + `style={{ width }}` | a width change only squeezes the left column; the webview's parent chain does not move |
+| Fullscreen / overlay | `fixed inset-0` | the parent container is only as tall as that panel row and cannot fill the viewport |
 
-**z-index 参考排序**：
+**Reference z-index ordering**:
 
 ```
-悬浮球 z-[70]   ← 全局最高，不该被任何面板盖住
-拖动遮罩 z-[60]
-全屏面板 z-40
-webview 容器 z-10
+floating ball z-[70]   <- globally highest, must not be covered by any panel
+drag overlay  z-[60]
+fullscreen panel z-40
+webview container z-10
 ```
 
-### 全屏要不要实心：看它是不是「对照工具」
+### Whether fullscreen should be opaque: is it a "comparison tool"?
 
-Agent 全屏用半透明 + 背景模糊而**不是**实心，理由：
-用户全屏是为了看大图、读长文，**仍需看到底下的页面**来判断 Agent 改得对不对。
-实心背景会把它变回一个隔绝的黑箱 —— 那正是把它从悬浮球搬进浏览器面板时要避免的。
+The Agent fullscreen uses translucency plus background blur rather than a solid fill, for this reason:
+the user goes fullscreen to view a large image or read a long text, and **still needs to see the page underneath** to judge whether the Agent changed it correctly.
+A solid background turns it back into an isolated black box — exactly what moving it out of the floating ball into the browser panel was meant to avoid.
 
-**判据**：全屏的目的若包含「与背后的东西对照」，就不要实心。
+**Criterion**: if the purpose of fullscreen includes "comparing against what is behind it", do not make it opaque.
 
-### 收起与全屏的标记不能互相残留
+### The collapsed and fullscreen flags must not leak into each other
 
-收起边栏时**必须一并清掉全屏标记**，否则下次展开会突然铺满整屏。
+Collapsing the sidebar **must clear the fullscreen flag too**, otherwise the next expand suddenly fills the screen.
 
 ```tsx
 onClick={() => persist({ ...prefs, open: false, fullscreen: false })}
@@ -109,12 +109,12 @@ onClick={() => persist({ ...prefs, open: false, fullscreen: false })}
 
 ---
 
-## 四、动态宽度用容器查询，不要视口断点
+## 4. Dynamic width uses container queries, not viewport breakpoints
 
-边栏宽度可拖（典型范围 320–720）。用 `sm:` / `lg:` 是**错的度量**：
+The sidebar width is draggable (typically 320-720). Using `sm:` / `lg:` is **the wrong measure**:
 
-> 1440px 的窗口里，拖到 320 的边栏只有 320px 可用，
-> 而 `lg:`（1024px）会判定为「宽」，把两个输入框硬挤成并排。
+> In a 1440px window, a sidebar dragged to 320 has only 320px available,
+> yet `lg:` (1024px) judges it "wide" and forces two inputs side by side.
 
 ```css
 .aside-panel { container-type: inline-size; container-name: asidepanel; }
@@ -126,150 +126,149 @@ onClick={() => persist({ ...prefs, open: false, fullscreen: false })}
 }
 ```
 
-**只要容器的宽度不由视口决定，就用容器查询。**
-同一个坑很容易在同一个项目里踩两次（播放器底栏的可用宽度 = 视口 − 侧栏宽，也是这一类）。
+**Whenever a container's width is not determined by the viewport, use a container query.**
+The same pitfall is easily hit twice in one project (the player's bottom bar has available width = viewport - sidebar width, which is the same class).
 
-⚠️ 全局 `index.css` 通常是**无层级** CSS，而 Tailwind v4 的 utilities 在 `@layer utilities`。
-按级联层规则，无层级样式**无条件胜过**任何层级样式 ——
-所以容器查询里**绝不能写「默认值还原」**（如 `display: revert`），
-那会把元素上的 Tailwind `flex` / `inline-flex` 一并顶掉。
-只写收窄时需要的 `display: none`，未命中查询时元素自然保留自己的类。
+Note: a global `index.css` is usually **unlayered** CSS, while Tailwind v4's utilities live in `@layer utilities`.
+By the cascade-layer rules, unlayered styles **beat any layered style unconditionally** —
+so a container query must **never write a "restore the default" value** (such as `display: revert`),
+because that would knock out the element's Tailwind `flex` / `inline-flex` as well.
+Write only the `display: none` needed when narrowing; when the query does not match, the element naturally keeps its own class.
 
 ---
 
-## 五、CSS 动画会压住工具类（同一个「无层级」根因）
+## 5. CSS animations override utility classes (the same "unlayered" root cause)
 
-**静默失效**：悬浮球的呼吸光晕写了 `opacity-45 group-hover:opacity-85`，
-但 hover **从来没有生效过**。原因：关键帧里同时补间了 `opacity`。
+**Silent failure**: the floating ball's breathing glow declared `opacity-45 group-hover:opacity-85`,
+yet hover **never took effect**. The reason: the keyframes also tweened `opacity`.
 
 ```css
-/* ✗ 关键帧里带 opacity */
+/* bad: keyframes carry opacity */
 @keyframes orb-breath {
     0%, 100% { transform: scale(1);    opacity: 0.55; }
     50%      { transform: scale(1.15); opacity: 0.95; }
 }
 ```
 
-**CSS 动画的优先级高于普通声明。** CSS Animations 规范原文：
+**CSS animations take precedence over normal declarations.** From the CSS Animations spec:
 
 > CSS Animations affect computed property values. This effect happens by adding a
 > specified value to the CSS cascade (at the level for CSS Animations) ...
 > **animations override all normal rules, but are overridden by !important rules.**
 
-所以关键帧里的 `opacity` 无条件赢过 `group-hover:opacity-85`
-（除非给它加 `!important` —— 但那是在跟级联打架，不如把关键帧写干净）。
+So `opacity` inside the keyframes beats `group-hover:opacity-85` unconditionally
+(unless you add `!important` — but that is fighting the cascade; better to write the keyframes cleanly).
 
-**修法**：关键帧只补间**一个**属性，其余交给工具类。
+**Fix**: the keyframes tween **one** property only; leave the rest to utility classes.
 
 ```css
 @keyframes orb-breath {
     0%, 100% { transform: scale(1); }
     50%      { transform: scale(1.15); }
 }
-/* 元素上：opacity-45 transition-opacity group-hover:opacity-85  ← 这下才生效 */
+/* on the element: opacity-45 transition-opacity group-hover:opacity-85  <- now it works */
 ```
 
-### 无限循环的装饰动画要能关掉
+### An infinite decorative animation must be switchable off
 
-| 坑 | 表现 | 修法 |
+| Pitfall | Symptom | Fix |
 |---|---|---|
-| 关键帧补间 `opacity` | hover 的透明度变化无反应 | 关键帧只留 `transform` |
-| 无限循环的装饰动画 | 界面永远在动，长时间挂着很烦 | 改**有限次**（`animation: ... 3`），或加 `prefers-reduced-motion` |
+| keyframes tween `opacity` | hover opacity changes do nothing | keep only `transform` in the keyframes |
+| an infinite decorative animation | the interface is always moving; annoying when left open a long time | make it **finite** (`animation: ... 3`), or add `prefers-reduced-motion` |
 
-**`prefers-reduced-motion` 的覆盖块必须放在动画声明之后。**
-选择器特异性相同时**后写的胜出**；那个块若在文件上方，
-覆盖的是后面才定义的规则 → **等于没写**。
+**The `prefers-reduced-motion` override block must come after the animation declarations.**
+When selector specificity is equal, **the later one wins**; if that block sits above them in the file,
+it overrides rules defined later -> **equivalent to not having written it**.
 
 ```css
 .animate-orb-sonar { animation: orb-sonar 2.4s ... infinite; }
 
-/* 必须在下面：写在上面会被上面的规则原样盖回去 */
+/* must be below: written above, the rules above override it right back */
 @media (prefers-reduced-motion: reduce) {
     .animate-orb-sonar, .animate-orb-breath, .animate-orb-badge { animation: none; }
 }
 ```
 
-> 一条线索：`prefers-reduced-motion` 块如果**只列了 `animate-in` / `animate-fade-in`**
-> 这类入场动效，而项目里还有循环动画，那多半是漏了 ——
-> **循环动画才是最该被关掉的一批。**
+> One clue: if the `prefers-reduced-motion` block lists **only entrance animations** like `animate-in` / `animate-fade-in`
+> while the project also has looping animations, it is almost certainly missing them —
+> **the looping animations are precisely the ones that most need turning off.**
 
-### ⚠️ 特异性陷阱：选择器写短了，整块覆盖就是空的
+### Specificity trap: write the selector too short and the whole block is empty
 
-块里只写 `.animate-in { animation: none; }`，而动画名其实挂在
-`.animate-in.fade-in`（特异性 0,2,0）上 ——
-裸 `.animate-in`（0,1,0）**根本盖不住**，整块规则一条都没生效。
+If the block writes only `.animate-in { animation: none; }` while the animation name actually hangs on
+`.animate-in.fade-in` (specificity 0,2,0), then bare `.animate-in` (0,1,0) **cannot override it at all**, and not one rule in the block takes effect.
 
-**规则**：写覆盖块之前，先看清**动画名到底声明在哪个选择器上**，
-逐字照抄那个选择器（必要时用复合选择器），不要凭名字想当然。
+**Rule**: before writing an override block, look at **which selector the animation name is actually declared on**,
+copy that selector verbatim (using a compound selector if needed), and do not assume from the name.
 
-同族：**Tailwind 的 `animate-ping` / `animate-bounce` 在 `@layer utilities` 里**，
-无层级的覆盖块能压过它们；但要**逐个列出具体类名**，不要指望一条通配规则。
+Same family: **Tailwind's `animate-ping` / `animate-bounce` live in `@layer utilities`**,
+so an unlayered override block can beat them; but **list the concrete class names one by one** rather than hoping for one wildcard rule.
 
-**该不该关的判断**：`animate-pulse` / `animate-spin` 这类**传达状态**的
-（加载中、LIVE）**故意保留** —— 关掉它们等于把信息藏起来。
-只关纯装饰的循环动画。
+**Whether it should be turned off**: state-carrying ones like `animate-pulse` / `animate-spin`
+(loading, LIVE) are **deliberately kept** — turning them off hides information.
+Turn off only the purely decorative looping animations.
 
 ---
 
-## 六、什么时候把多个组件文件合并成一个
+## 6. When to merge several component files into one
 
-**判据是生命周期是否耦合，不是行数。** 满足任一条即可合并：
+**The criterion is whether the lifecycles are coupled, not the line count.** Merging is justified if any one holds:
 
-| 判据 | 例子 |
+| Criterion | Example |
 |---|---|
-| 共享不可见的外部资源（webview / 同一 hook 实例） | Agent 面板 + 浏览器面板 |
-| 共享同一套生命周期或 keep-alive 策略 | 嗅探 + 磁力 + 设置三个浮层面板 |
+| They share an invisible external resource (a webview / the same hook instance) | the Agent panel + the browser panel |
+| They share one lifecycle or keep-alive policy | the sniffer + magnet + settings floating panels |
 
-**第一条**：Agent 只能通过 webview 干活（执行脚本、注入规则、读页面 URL），
-而 webview 的 `dom-ready` 广播、规则注入、脚本自动执行全挂在同一个浏览器 hook 上。
-**拆成两个目录后，一边改接口、另一边不知道，编译期毫无提示。**
+**The first**: the Agent can only work through the webview (executing scripts, injecting rules, reading the page URL),
+and the webview's `dom-ready` broadcast, rule injection and automatic script execution all hang off the same browser hook.
+**Split into two directories, one side changes the interface and the other does not know, with no compile-time warning whatsoever.**
 
-**第二条**：那三个浮层面板由**同一个 `visited` 集合**管着 ——
-打开过就常驻内存，切页 / 关球只用 `hidden` 藏，输入、滚动、已加载列表原样保留。
-**拆成多个文件后，改一次这个策略要同时动好几处，漏一处就是「切个页搜索条件没了」。**
+**The second**: those three floating panels are governed by **the same `visited` set** —
+once opened they stay in memory, and switching pages or closing the ball only hides them with `hidden`, preserving input, scroll and loaded lists as they were.
+**Split into several files, changing that policy once requires touching several places at once, and missing one means "switch a page and the search conditions are gone".**
 
-**反过来的判据**：如果两块内容**各有各的持久化与挂载策略**，
-即使它们在同一个面板里并排显示，也不该合并。
-「把相关的都放一起」不等于「把所有东西都放一起」。
+**The reverse criterion**: if two pieces of content **each have their own persistence and mounting policy**,
+they should not be merged even when displayed side by side in the same panel.
+"Put related things together" is not "put everything together".
 
-### 合并的操作顺序
+### The order of operations for merging
 
-1. **先读全部待合并文件**（不要边读边写）
-2. 写成一个新文件，**导出名保持不变**（调用方零改动）
-3. 删旧文件
-4. **同步改测试里硬编码的源码路径** —— 这类路径不在编译期检查范围内
+1. **Read every file to be merged first** (do not read and write alternately)
+2. Write one new file, **keeping the export names unchanged** (zero changes at call sites)
+3. Delete the old files
+4. **Update the source paths hard-coded in tests** — such paths are outside compile-time checking
 
-> 合并后静态自检套件里有读源码路径的地方需要跟着改，断言内容不用动。
-> **忘了改的表现是测试报「找不到文件」，不是编译错。**
+> After merging, places in the static self-check suite that read source paths need updating; the assertion contents do not.
+> **The symptom of forgetting is a test reporting "file not found", not a compile error.**
 
-### ⚠️ 同名文件与目录不能并存
+### A file and a directory of the same name cannot coexist
 
-`components/Panel.tsx` 与 `components/Panel/` 同时存在时，模块解析会有歧义。
-**所以合并必须把旧目录整个删掉**，不能留着当备份。
+When `components/Panel.tsx` and `components/Panel/` both exist, module resolution is ambiguous.
+**So a merge must delete the old directory entirely**; it cannot be kept as a backup.
 
-### 合并后要复查的「隐性契约」
+### "Implicit contracts" to re-check after merging
 
-合并本身是纯搬运，但搬运过程最容易丢的是**不成文的约定**。逐条核对：
+A merge is pure relocation, but what relocation most easily loses is **unwritten convention**. Check each:
 
-- [ ] **行尾**：新文件是 LF 还是 CRLF？原目录各文件是否一致？（见 `safe-source-file-editing`）
-- [ ] **导出面**：原来 `index.tsx` 末尾有没有 `export { X } from './X'` 这类再导出？
-      有的话**先确认零引用**再删
-- [ ] **模块级常量**：原文件里的 `const X = [...]` 搬到新文件后，
-      有没有和已有常量重名或语义重复？
-- [ ] **`useMemo` 的元素数组**：合并后如果多个面板由同一个父组件渲染，
-      元素数组要 memo，否则父组件每帧重渲染会带上全部子面板
-      （见 `react-state-and-identity-audit` 模式 G）
+- [ ] **Line endings**: is the new file LF or CRLF? Were the files in the old directory consistent? (see `safe-source-file-editing`)
+- [ ] **Export surface**: did the old `index.tsx` end with re-exports like `export { X } from './X'`?
+      If so, **confirm zero references before deleting them**
+- [ ] **Module-level constants**: after moving a `const X = [...]` from an old file into the new one,
+      does it collide by name or duplicate the meaning of an existing constant?
+- [ ] **`useMemo`'d element arrays**: if after merging several panels are rendered by one parent component,
+      the element array must be memoized, otherwise the parent re-rendering every frame drags all child panels with it
+      (see `react-state-and-identity-audit` pattern G)
 
 ---
 
-## 自查清单
+## Self-check list
 
-- [ ] 拖动 / 浮层交互有没有被 webview 吞掉的路径？要遮罩吗？遮罩有兜底撤除吗？
-- [ ] webview 的父链有没有变（是否只改了宽度 / 可见性）？
-- [ ] 收起 / 展开时内容是否被卸载（对话滚动位置、输入草稿会丢）？
-- [ ] 收起与全屏的标记有没有互相残留？
-- [ ] 动态宽度的断点用的是容器查询还是视口断点？
-- [ ] 容器查询里有没有写「默认值还原」（会被无层级规则顶掉工具类）？
-- [ ] 关键帧是不是只补间了一个属性？`prefers-reduced-motion` 块在动画声明之后吗？
-- [ ] 覆盖块的选择器特异性够不够（有没有写短了导致整块空转）？
-- [ ] 合并 / 改名后，测试里硬编码的源码路径改了吗？
+- [ ] Is there any drag / overlay interaction path swallowed by the webview? Does it need an overlay? Does the overlay have a fallback removal?
+- [ ] Did the webview's parent chain change (did you only change width / visibility)?
+- [ ] Is content unmounted on collapse / expand (losing conversation scroll position and input draft)?
+- [ ] Do the collapsed and fullscreen flags leak into each other?
+- [ ] Does the dynamic width use a container query or a viewport breakpoint?
+- [ ] Did the container query write a "restore the default" value (which unlayered rules would use to knock out utility classes)?
+- [ ] Do the keyframes tween only one property? Is the `prefers-reduced-motion` block after the animation declarations?
+- [ ] Is the override block's selector specificity sufficient (did you write it too short so the whole block idles)?
+- [ ] After merging / renaming, did you update the source paths hard-coded in tests?

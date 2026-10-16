@@ -1,161 +1,161 @@
 ---
 name: pluggable-provider-refactor
-description: 把"单站特化模块"重构为"通用引擎 + 可插拔 provider"的方法与判据。含特化藏在哪些名字里、通用编排与站点特化如何拆解归属、插口契约与注册表、跨站归一化（体积/时间/做种数/磁链编码）、未知值哨兵与比较器陷阱、单站失败不拖垮整体的容错、离线测试夹具、一个解析器服务多个站点、以及可替换的传输层。要把某个只支持单一数据源或站点的模块改成支持多源、或用户说"不要再对某个网站做特化，把网站作为插口接入通用引擎"时读。
+description: Method and criteria for refactoring a "single-site specialized module" into a "generic engine + pluggable providers". Covers where the specialization hides, how to split ownership between generic orchestration and site specialization, the socket contract and registry, cross-site normalization (size/time/seeders/magnet encoding), unknown-value sentinels and the comparator trap, fault tolerance so one site's failure does not sink the whole, offline test fixtures, one parser serving several sites, and a replaceable transport layer. Read when converting a module that supports only one data source or site into one that supports many, or when the user says "stop specializing for one website; make the website a socket plugged into a generic engine".
 ---
 
-# 单站特化 → 通用引擎 + 插口
+# Single-Site Specialization -> Generic Engine + Sockets
 
-**适用**：加数据源、消除站点特化、改多源聚合逻辑。
-**不适用**：纯 UI 改动、单站内部的小修。
+**Applies to**: adding a data source, removing site specialization, reworking multi-source aggregation.
+**Does not apply to**: pure UI changes, small fixes inside a single site.
 
-- 验证结论怎么才算可信见 `verification-discipline`
-- 命名规则见 `user-collaboration-preferences`
+- For when a verification conclusion counts as trustworthy see `verification-discipline`
+- For naming rules see `user-collaboration-preferences`
 
 ---
 
-## 一、特化藏在哪里
+## 1. Where the specialization hides
 
-**它写在每一个名字上，不只是逻辑里。** 用 `<site>` 代表被特化的那个来源：
+**It is written into every name, not just into the logic.** Let `<site>` stand for the specialized source:
 
-| 名字 | 问题 |
+| Name | Problem |
 |---|---|
-| `<site>Service.js` | 模块名 = 站点名 |
-| `search<Site>()` | 函数名 = 站点名 |
-| `use<Site>` | hook 名 = 站点名 |
-| `<Site>Item` / `<Site>SearchOptions` | 类型名 = 站点名 |
-| `CATEGORY_OPTIONS` | 该站的分类编码，却当通用常量导出 |
-| `<site>-search` / `api.<site>` | IPC 通道与命名空间 = 站点名 |
+| `<site>Service.js` | module name = site name |
+| `search<Site>()` | function name = site name |
+| `use<Site>` | hook name = site name |
+| `<Site>Item` / `<Site>SearchOptions` | type name = site name |
+| `CATEGORY_OPTIONS` | that site's category codes, yet exported as a generic constant |
+| `<site>-search` / `api.<site>` | IPC channel and namespace = site name |
 
-**重构的第一步是把这些名字改掉。**
-留旧名的代价：下一个加站点的人会以为「这只能搜那一个站」。
+**The first step of the refactor is to change these names.**
+The cost of keeping the old names: the next person adding a site will assume "this can only search that one site".
 
-**判据**：读一遍名字，问「如果加第二个来源，这个名字会变成谎言吗？」
+**Criterion**: read the names once and ask "if I add a second source, does this name become a lie?"
 
 ---
 
-## 二、真正的病灶：通用编排与站点特化缠在一起
+## 2. The real lesion: generic orchestration and site specialization are tangled together
 
 ```js
 async function search<Site>({ site, q, category, sort, pages }) {
-    for (let p = 1; p <= pageCount; p++) {          // ← 通用：翻页
-        const url = buildSearchUrl(site, {...});     // ← 特化：拼 URL
-        const html = await httpGetText(url, ...);    // ← 通用：取字节
-        const items = parseList(html, dlHost);       // ← 特化：解析
-        if (items.length === 0) break;               // ← 通用：终止条件
-        await sleep(800);                            // ← 通用：限速
+    for (let p = 1; p <= pageCount; p++) {          // <- generic: pagination
+        const url = buildSearchUrl(site, {...});     // <- specialized: build the URL
+        const html = await httpGetText(url, ...);    // <- generic: fetch bytes
+        const items = parseList(html, dlHost);       // <- specialized: parse
+        if (items.length === 0) break;               // <- generic: termination condition
+        await sleep(800);                            // <- generic: rate limiting
     }
-    // 去重、过滤、补字段                            // ← 全是通用
+    // dedupe, filter, fill fields                      // <- all generic
 }
 ```
 
-加第二个站只能再写一个 `searchXxx`，把翻页、去重、限速重抄一遍。
+Adding a second site can only mean writing another `searchXxx`, copying pagination, dedupe and rate limiting all over again.
 
-**拆解归属**：
+**Splitting ownership**:
 
-| 内容 | 去哪 |
+| Content | Where it goes |
 |---|---|
-| 站点地址、分类编码表 | provider |
-| `buildSearchUrl`（拼 URL） | provider |
-| `parse`（HTML → 条目） | provider |
-| 翻页、限速、终止条件 | **引擎** |
-| 去重、过滤、补字段 | **引擎** |
-| 取字节 | 传输层 |
-| 写盘、白名单校验 | 留主进程 |
+| Site address, category code table | provider |
+| `buildSearchUrl` (build the URL) | provider |
+| `parse` (HTML -> items) | provider |
+| Pagination, rate limiting, termination condition | **engine** |
+| Dedupe, filter, fill fields | **engine** |
+| Fetching bytes | transport layer |
+| Writing to disk, allowlist validation | stays in the main process |
 
-**特化不是消失，是被隔离。** 站点 URL 格式总得有人知道，变的是它住在哪 ——
-住在一个只干两件事（`buildSearchUrl` + `parse`）的纯函数插件里。
+**Specialization does not disappear; it is quarantined.** Someone has to know the site's URL format; what changes is where that lives —
+in a pure-function plugin that does exactly two things (`buildSearchUrl` + `parse`).
 
 ---
 
-## 三、插口契约
+## 3. The socket contract
 
 ```ts
 export interface SiteProvider {
     descriptor: SiteDescriptor;              // id / label / homepage / adult / kinds
-    buildSearchUrl(query: string): string;   // 关键词 → 搜索地址
+    buildSearchUrl(query: string): string;   // keyword -> search address
     parse(body: string, ctx: ParseContext): ProviderHit[];
     headers?: Record<string, string>;
 }
 ```
 
-**三条关键约束**：
+**Three key constraints**:
 
-1. **`buildSearchUrl` 与 `parse` 必须是纯函数** —— 不发请求、不读全局状态。
-   这样才能用保存的真实响应快照做离线测试。
-2. **provider 不填 `site` / `siteLabel`** —— 由引擎按注册表盖章。
-   否则同一站点名在两处各写一遍，迟早不一致。
-3. **`parse` 必须容错** —— 站点改版或返回错误页时返回空数组而非抛错。
-   单个站解析失败不该让整个扇出失败。
+1. **`buildSearchUrl` and `parse` must be pure functions** — they issue no requests and read no global state.
+   That is what makes offline testing against saved real response snapshots possible.
+2. **The provider does not fill in `site` / `siteLabel`** — the engine stamps those from the registry.
+   Otherwise the same site name is written in two places and will drift.
+3. **`parse` must be fault-tolerant** — when the site is redesigned or returns an error page it returns an empty array rather than throwing.
+   One site failing to parse must not fail the whole fan-out.
 
-### 注册表：加站点的唯一动作
+### The registry: the only action needed to add a site
 
 ```ts
 const PROVIDERS: SiteProvider[] = [providerA, providerB, ...];
 ```
 
-「加一个站点」= 写一个 `providers/<name>.ts` + 在数组里加一项。
-**引擎、UI、主进程都不用改。** UI 的站点选择按钮遍历注册表渲染，新站点自动出现。
+"Add a site" = write one `providers/<name>.ts` + add one entry to the array.
+**The engine, the UI and the main process need no change.** The UI's site-selection buttons render by iterating the registry, so a new site appears automatically.
 
 ---
 
-## 四、归一化：跨站排序的前提
+## 4. Normalization: the precondition for cross-site sorting
 
-各站字段格式完全不同，必须在 provider 里就地归一化：
+Each site's field formats differ completely and must be normalized in place inside the provider:
 
-| | 站点 A | 站点 B | 站点 C |
+| | Site A | Site B | Site C |
 |---|---|---|---|
-| 体积 | `"183567938"`（字节） | `"1.8 GB"` | `"6.6 GiB"` |
-| 时间 | epoch 秒 | epoch 秒 | `"2026-09-12 15:45"` |
-| 做种 | `"0"` 字符串 | 无 | 数字 |
+| size | `"183567938"` (bytes) | `"1.8 GB"` | `"6.6 GiB"` |
+| time | epoch seconds | epoch seconds | `"2026-09-12 15:45"` |
+| seeders | `"0"` string | absent | number |
 
-统一成 `sizeBytes: number` / `publishedAt: epoch ms`，未知一律 `-1`。
+Unify into `sizeBytes: number` / `publishedAt: epoch ms`, with unknown always `-1`.
 
-**为什么必须**：按 `"1.8 GB"` 与 `"709.4 MiB"` 这类字符串排序毫无意义
-（字典序里 `"1.8 GB" > "709.4 MiB"`，而实际相反）。
+**Why it is mandatory**: sorting by strings like `"1.8 GB"` and `"709.4 MiB"` is meaningless
+(lexicographically `"1.8 GB" > "709.4 MiB"`, while the reality is the opposite).
 
-### 未知值用 -1，不要用 0
+### Unknown values use -1, not 0
 
-`0` 是「确实是零」，`-1` 是「站点没公布」—— **两种不同的信息**。
+`0` means "it really is zero"; `-1` means "the site did not publish it" — **two different pieces of information**.
 
-- 排序时 `-1` 排末尾，不能当成最小值
-- 过滤时（如「做种 ≥ 5」）**必须保留未知值**，
-  否则会把不公布做种数的站整个滤掉
+- When sorting, `-1` goes last and must not be treated as the smallest value
+- When filtering (e.g. "seeders >= 5") **unknown values must be kept**,
+  otherwise sites that do not publish seeder counts are filtered out wholesale
 
 ```js
 hits.filter((h) => h.seeders === UNKNOWN || h.seeders >= minSeeders);
 ```
 
-### 磁链编码要统一
+### Magnet encoding must be unified
 
-各家用的 btih 编码不同：有的是 **32 位 base32**，有的是 **40 位 hex**。
-不统一成 hex 就没法跨站去重。
+Different sources use different btih encodings: some are **32-character base32**, others **40-character hex**.
+Without unifying to hex there is no way to dedupe across sites.
 
-**验证去重是否真生效，看的是「两站合计 − 去重后 = 交集数」这三个数字能不能对上**，
-不是看代码里有没有写 `Set`。
+**Whether dedupe actually works is judged by whether the three numbers "sum of both sites - after dedupe = size of intersection" line up**,
+not by whether a `Set` appears in the code.
 
-### 哨兵值参与比较器：`-Infinity` 会产出 `NaN`
+### Sentinel values in a comparator: `-Infinity` produces `NaN`
 
-给「未知值」定的哨兵若是 `-Infinity`，而比较器里做减法（`a - b`）：
+If the sentinel chosen for "unknown" is `-Infinity` and the comparator subtracts (`a - b`):
 
 ```js
--Infinity - (-Infinity)   // → NaN
+-Infinity - (-Infinity)   // -> NaN
 ```
 
-**比较器返回 `NaN` 时排序行为未定义**（不同引擎结果不同，且不报错）。
+**When a comparator returns `NaN` the sort behavior is undefined** (different engines give different results, and nothing errors).
 
 ```js
-// ✗ 未知值排末尾用了 -Infinity，两个未知值相减得到 NaN
-// ✓ 用有限哨兵，并导出唯一比较器供各处复用
+// bad: -Infinity to sort unknown last; two unknown values subtract to NaN
+// good: a finite sentinel, and export a single comparator for every call site to reuse
 const UNKNOWN_RANK = -Number.MAX_SAFE_INTEGER;
 export function compareBy(sort) { /* ... */ }
 ```
 
-**通用规则**：凡是「用一个特殊值表示未知或缺失」的设计，
-都要检查它会不会进入**算术运算**。会 → 换成有限值，或在比较器里先判等。
+**General rule**: for any design that "represents unknown or missing with one special value",
+check whether it can enter an **arithmetic operation**. If so, replace it with a finite value, or compare for equality first inside the comparator.
 
 ---
 
-## 五、容错：单站失败不拖垮整体
+## 5. Fault tolerance: one site's failure must not sink the whole
 
 ```js
 const settled = await Promise.allSettled(
@@ -163,71 +163,71 @@ const settled = await Promise.allSettled(
 );
 ```
 
-失败的站在 `sites[]` 里带 `error` 上报，其余结果照常返回。
+A failed site is reported with an `error` inside `sites[]`, and the remaining results are returned as usual.
 
-**为什么必须有这个字段**：只给一个合并列表，用户无法区分
-「没有这个资源」和「有个站挂了」。UI 要显示「N 站成功 / M 站失败」可展开明细。
+**Why this field is mandatory**: given only one merged list, the user cannot distinguish
+"this resource does not exist" from "one of the sites is down". The UI must show "N sites succeeded / M failed" with expandable detail.
 
-`searchOneSite` 内部把所有失败转成状态，**不抛**：
-构造 URL 失败、请求失败、解析抛错，各自记不同的 `error` 文案。
-其中「解析失败（站点结构可能已变）」要单独报 ——
-静默返回空结果会被误读成「这个站没有该资源」。
+Inside `searchOneSite` every failure becomes a status and **nothing is thrown**:
+URL construction failure, request failure and parse exceptions each record a different `error` message.
+Among them, "parse failed (the site structure may have changed)" must be reported separately —
+silently returning an empty result is misread as "this site does not have that resource".
 
 ---
 
-## 六、离线测试夹具（最高价值的一步）
+## 6. Offline test fixtures (the highest-value step)
 
-抓一次真实响应存成快照，测试直接读快照、不联网：
+Capture one real response into a snapshot; the test reads the snapshot directly and never goes online:
 
 ```js
 const parseFixture = (provider, file, query) =>
     provider.parse(fixture(file), { url: provider.buildSearchUrl(query), query });
 ```
 
-**价值**：站点改版导致解析失效时，测试直接失败，而不是等用户搜出空结果才发现。
+**Value**: when a site redesign breaks the parser, the test fails immediately instead of waiting for a user to search and get an empty result.
 
-**实测抓出的两个真 bug**（手写假 HTML 时不可能发现）：
+**Two real bugs this caught** (impossible to find while hand-writing fake HTML):
 
-1. `alt` 属性出现在 `class` **之前**，而正则假设了相反顺序 —— 两种排列都要认
-2. 某个字段名里带**斜杠**（`Date/time submitted`），
-   写进正则字面量会提前结束匹配，必须转义成 `Date\/time`
+1. The `alt` attribute appeared **before** `class`, while the regex assumed the opposite order — both arrangements must be accepted
+2. A field name contained a **slash** (`Date/time submitted`);
+   written into a regex literal it terminates the match early, so it must be escaped as `Date\/time`
 
 ---
 
-## 七、一个解析器服务多个站点
+## 7. One parser serving several sites
 
-**前提是先做一件事：确认两个站是不是跑同一套程序。**
+**The precondition is doing one thing first: confirm the two sites run the same software.**
 
-很多站点是**同一个程序的不同实例**（同一套论坛 / 博客 / 资源站软件，
-只是域名和皮肤不同），HTML 结构逐字段一致。这时不要写两个 provider，
-用工厂函数传不同配置生成两个实例：
+Many sites are **different instances of the same program** (the same forum / blog / resource-site software,
+differing only in domain and skin), with field-for-field identical HTML structure. In that case do not write two providers;
+use a factory function taking different configuration to produce two instances:
 
 ```ts
-export function createProvider(cfg: SiteConfig): SiteProvider { /* 一份解析逻辑 */ }
+export function createProvider(cfg: SiteConfig): SiteProvider { /* one body of parsing logic */ }
 
 export const providerA = createProvider({ id:'a', base:'https://a.example', ... });
 export const providerB = createProvider({ id:'b', base:'https://b.example',
-    downloadBase:'https://dl.b.example',   // ← 直链域名可能与页面域名不同
+    downloadBase:'https://dl.b.example',   // <- the direct-link domain may differ from the page domain
     adult:true, ... });
 ```
 
-**差异往往只有三处**，全在配置里：
+**The differences are usually only three, all in configuration**:
 
-1. 域名
-2. 相对地址 vs 绝对地址
-3. **直链域名可能与页面域名不同**（页面挂在一个域，下载链却指向另一个域）
+1. The domain
+2. Relative vs absolute addresses
+3. **The direct-link domain may differ from the page domain** (the page sits on one domain while the download link points at another)
 
-> **判据**：加第二个站之前，先抓两个站的真实响应 diff 一遍。
-> 结构一致 → 工厂函数；结构不同 → 老实写第二个 provider。
-> **不要凭「看起来像同一套程序」就合并** ——
-> 那会得到一个到处是 `if (site === ...)` 的解析器。
+> **Criterion**: before adding the second site, capture both sites' real responses and diff them once.
+> Identical structure -> factory function; different structure -> honestly write a second provider.
+> **Do not merge merely because they "look like the same program"** —
+> that yields a parser littered with `if (site === ...)`.
 
-**测试注意**：别断言 `p1.parse === p2.parse` —— 工厂每次返回新对象，引用不同。
-要断言「同一份 HTML 交给两者，解析出的字段结构一致」。
+**Testing note**: do not assert `p1.parse === p2.parse` — the factory returns a new object each time, so the references differ.
+Assert instead that "the same HTML given to both yields identical parsed field structure".
 
 ---
 
-## 八、传输层要可替换
+## 8. The transport layer must be replaceable
 
 ```ts
 export interface Transport {
@@ -235,41 +235,41 @@ export interface Transport {
 }
 ```
 
-**两个实际好处**：
+**Two practical benefits**:
 
-1. 测试注入假实现，离线跑完整扇出流程（含失败注入）
-2. 将来某站要过 Cloudflare 挑战（需开 `BrowserWindow` + CDP），
-   只需换一个实现，引擎与全部 provider 一行都不用改
+1. Tests inject a fake implementation and run the whole fan-out flow offline (including failure injection)
+2. If some site later needs to pass a Cloudflare challenge (requiring a `BrowserWindow` + CDP),
+   only one implementation changes; the engine and every provider stay untouched
 
-**渲染层 fetch 的两个注意点**：
+**Two cautions for renderer-side fetch**:
 
-- `referrer` 选项只接受同源地址，传跨域会直接抛 `TypeError`（一传所有站点全挂）
-- `Referer` 是 fetch 的禁止头，放进 `headers` 会被静默丢弃
+- The `referrer` option accepts same-origin addresses only; passing a cross-origin one throws `TypeError` outright (which takes down every site at once)
+- `Referer` is a forbidden header for fetch; placing it in `headers` is silently dropped
 
 ---
 
-## 九、验证清单
+## 9. Verification checklist
 
-| 项 | 手段 |
+| Item | Means |
 |---|---|
-| 各 provider 解析正确 | 真实快照离线测试 |
-| 引擎扇出 / 容错 / 去重 / 排序 | 假 transport 注入失败 |
-| 端到端可用 | 真实站点跑一次，打印各站条数 / 耗时 |
-| 跨站去重真的生效 | 对比「两站合计」与「去重后」，并验证交集数字对得上 |
+| Each provider parses correctly | offline test against real snapshots |
+| Engine fan-out / fault tolerance / dedupe / sorting | fake transport with injected failures |
+| End-to-end usable | run once against the real sites, printing per-site counts and timing |
+| Cross-site dedupe actually works | compare "sum of both sites" against "after dedupe", and verify the intersection number lines up |
 
-**并发扇出的总耗时约等于最慢那个站，不是各站相加。**
+**The total time of a concurrent fan-out is roughly that of the slowest site, not the sum of all sites.**
 
 ---
 
-## 自查清单
+## Self-check list
 
-- [ ] 模块名 / 函数名 / 类型名 / IPC 通道里还有站点名吗？
-- [ ] 翻页、限速、去重、补字段这些通用逻辑，是否已全部上提到引擎？
-- [ ] `buildSearchUrl` 与 `parse` 是纯函数吗（不联网、不读全局）？
-- [ ] provider 有没有重复填 `site` / `siteLabel`（应由引擎盖章）？
-- [ ] 未知值用的是 `-1` 还是 `0`？过滤时会不会把不公布该字段的站滤掉？
-- [ ] 哨兵值会不会进入比较器的减法，产出 `NaN`？
-- [ ] 磁链编码统一成 hex 了吗？「合计 − 去重后 = 交集」对得上吗？
-- [ ] 合并两个站之前，diff 过它们的真实响应结构吗？
-- [ ] 单站失败时，用户能区分「没有资源」和「这个站挂了」吗？
-- [ ] 解析器测试用的是真实快照，还是手写的假 HTML？
+- [ ] Do module names / function names / type names / IPC channels still contain a site name?
+- [ ] Have pagination, rate limiting, dedupe and field-filling — all generic — been lifted entirely into the engine?
+- [ ] Are `buildSearchUrl` and `parse` pure functions (no network, no globals)?
+- [ ] Does the provider redundantly fill in `site` / `siteLabel` (the engine should stamp those)?
+- [ ] Are unknown values `-1` or `0`? Does filtering drop sites that do not publish that field?
+- [ ] Can a sentinel value enter a comparator's subtraction and produce `NaN`?
+- [ ] Is the magnet encoding unified to hex? Does "sum - after dedupe = intersection" line up?
+- [ ] Before merging two sites, did you diff their real response structure?
+- [ ] When one site fails, can the user distinguish "no such resource" from "that site is down"?
+- [ ] Do the parser tests use real snapshots, or hand-written fake HTML?

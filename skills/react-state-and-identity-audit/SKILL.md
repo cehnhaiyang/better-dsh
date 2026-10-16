@@ -1,50 +1,51 @@
 ---
 name: react-state-and-identity-audit
-description: 审查 React 状态与数据标识时的七类高频缺陷模式与排查手法——键/标识不唯一导致两条数据塌成一条、同一判据多处各写一份而漂移、异步结果写回过期上下文、共享布尔量被并发操作互相覆盖、注释与代码不符、不可达分支与无人用的死代码、以及 memo 被"每轮新引用"悄悄废掉。每类都给出判据、修法与可复制的排查脚本。被要求"审查/修复某模块的所有问题"时、审查 hook 或面板状态与列表渲染与持久化往返时、写完功能自查时、或感觉"界面上显示的和实际发生的不一致"时读。
+description: Seven high-frequency defect patterns and their detection techniques when auditing React state and data identity — keys/identifiers that are not unique so two records collapse into one, the same predicate written in several places that then drift, an async result written back into a stale context, a shared boolean clobbered by concurrent operations, comments that contradict the code, unreachable branches and dead code nobody uses, and memo silently defeated by "a new reference every render". Each pattern gives its criterion, the fix, and a reproducible detection script. Read when asked to "audit/fix every problem in a module", when auditing a hook or panel state with list rendering and persistence round-trips, when self-checking a feature you just wrote, or when the UI shows something different from what actually happens.
 ---
 
-# React 状态与数据标识审查
+# React State and Data Identity Audit
 
-**用途**：一份**缺陷模式清单**，用于主动找 bug，而不是等它暴露。
+**Purpose**: a **checklist of defect patterns** for actively hunting bugs rather than waiting for them to surface.
 
-一个 Electron + React 应用的浏览器链路连续多轮审查找到 20+ 个真 bug，
-事后分类发现它们**反复落在这七类里**。
+Repeated audit rounds over the browser pipeline of one Electron + React application found 20+ real bugs,
+and classifying them afterwards showed they **land in these seven patterns over and over**.
 
-- 验证手法（变异测试、抽取求值）见 `verification-discipline`
-- 编码与工具坑见 `safe-source-file-editing`
+- For verification techniques (mutation testing, extraction and evaluation) see `verification-discipline`
+- For encoding and tooling pitfalls see `safe-source-file-editing`
 
 ---
 
-## 模式 A：键 / 标识不唯一 → 两条数据塌成一条
+## Pattern A: a key / identifier that is not unique -> two records collapse into one
 
-**最隐蔽的一类**：代码不报错、测试不失败，只是**少显示一条**。
+**The most insidious kind**: the code does not error, no test fails, it merely **shows one fewer row**.
 
-### 判据
+### Criterion
 
-列表 / Map / reduce 的键，是否**真的唯一**？
+Is the key of a list / Map / reduce **actually unique**?
 
 ```js
-// ✗ 键不含 domain —— 而 Chrome 的 cookie 主键是 name + domain + path
+// bad: the key omits domain — yet Chrome's cookie primary key is name + domain + path
 cookiePathIndex = (c) => !c.path || c.path === '/' ? c.name : `${c.name} (${c.path})`
 
-// 访问 https://sub.example.com/ 时 cookies.get 同时返回
+// Visiting https://sub.example.com/ makes cookies.get return both
 //   sid@sub.example.com  (HOST-ONLY)
-//   sid@.example.com      (PARENT-DOM)
-// reduce 后 { "sid": "PARENT-DOM" }  ← 只显示 1 条，应为 2
+//   sid@.example.com     (PARENT-DOM)
+// after reduce: { "sid": "PARENT-DOM" }   <- shows 1 row, should be 2
 ```
 
-### 三类连带后果
+### Three knock-on consequences
 
-| 后果 | 说明 |
+| Consequence | Explanation |
 |---|---|
-| 界面少一行 | 用户不知道有两条 |
-| 回写改错对象 | `find(c => c.name === key)` 永远命中第一条 |
-| **属性被污染** | `setCookie` 是整条覆盖 → 把第一条的 `httpOnly` / 过期时间抄到第二条 |
+| One row missing in the UI | the user does not know there were two |
+| Writing back hits the wrong object | `find(c => c.name === key)` always matches the first |
+| **Attributes get contaminated** | `setCookie` replaces the whole record -> copies the first one's `httpOnly` / expiry onto the second |
 
-### 修法：碰撞感知的键，而不是无脑加字段
+### Fix: a collision-aware key, not blindly adding fields
 
 ```js
-// 先算最简键，只在真会撞时才补区分信息 —— 否则界面被刷成噪声
+// Compute the briefest key first, and add distinguishing information only when a real collision occurs —
+// otherwise the UI is smeared with noise
 export const buildCookieKeys = (cookies) => {
     const brief = cookies.map((c) => !c.path || c.path === '/' ? c.name : `${c.name} (${c.path})`);
     const counts = new Map();
@@ -54,161 +55,162 @@ export const buildCookieKeys = (cookies) => {
 };
 ```
 
-配套 `buildCookieData` / `findCookieByKey`，**面板与 Agent 共用**。
+Pair it with `buildCookieData` / `findCookieByKey`, **shared by the panel and the Agent**.
 
-### 排查手法
+### Detection technique
 
 ```js
-// 造两条「业务上不同、键上相同」的数据，看 reduce / find 的结果
+// Build two records that are "business-wise different, key-wise identical" and inspect reduce / find
 const cookies = [
   { name:'sid', value:'A', domain:'sub.example.com', path:'/' },
   { name:'sid', value:'B', domain:'.example.com',   path:'/' },
 ];
 const data = cookies.reduce((a,c)=>({...a,[key(c)]:c.value}), {});
-console.log(Object.keys(data).length);   // 应为 2
+console.log(Object.keys(data).length);   // should be 2
 ```
 
-### 变体：按「值」去重丢掉了「位置」
+### Variant: deduping by "value" throws away "location"
 
 ```js
-// ✗ 同一个 token 常同时躺在 local / session / cookie 里（登录态就是这样）
+// bad: the same token often lives in local / session / cookie at once (that is what a login state looks like)
 if (!found.some((f) => f.token === token)) found.push({ token, from, area, key });
-// → 只报最先扫到的那一处，模型以为改一处就够了
+// -> only the first scanned location is reported, and the model thinks fixing one place is enough
 ```
 
-**判据**：去重的目的若是「避免重复条目」，就该按**位置**去重，不是按值。
-值相同但位置不同，是**两条需要分别处理的信息**。
+**Criterion**: if the purpose of deduping is "avoid duplicate entries", dedupe by **location**, not by value.
+The same value in different locations is **two pieces of information that must be handled separately**.
 
 ---
 
-## 模式 B：同一判据多处各写一份 → 漂移
+## Pattern B: the same predicate written in several places -> drift
 
-### 判据
+### Criterion
 
-搜同一个语义判断出现了几次：
+Search for how many times one semantic judgment appears:
 
 ```powershell
-# 例：判断「这条结果是否属于当前页」
+# e.g. judging "does this result belong to the current page"
 Select-String -Path hooks\*.ts,components\*.tsx -Pattern 'pageUrl ===|!.*pageUrl'
 ```
 
-三份实现里，「清空当前」那份**少了 `!item.pageUrl` 一支**：
+Among three implementations, the "clear current" one **is missing the `!item.pageUrl` arm**:
 
 ```
-点「仅当前页」后显示的条目 : a, b
-点「清空当前」后剩下的条目 : b, c
-清空后仍在列表里的 : b      ← 按钮看起来没生效
+Rows shown after clicking "only current page" : a, b
+Rows left after clicking "clear current"      : b, c
+Still in the list after clearing              : b      <- the button looks like it did nothing
 ```
 
-### 修法
+### Fix
 
-抽成**唯一实现**（放 `utils/`，因为跨组件 + 可单测），三处共用。
-若其中一份在**无法 import 的地方**（如注入脚本的模板字符串里），
-就写**交叉验证测试**在同一批输入上比对两边结论。
+Extract a **single implementation** (put it in `utils/`, because it is cross-component and unit-testable) and share it in all three places.
+If one copy sits **somewhere that cannot import** (such as a template string in an injected script),
+write a **cross-verification test** comparing the two conclusions on the same batch of inputs.
 
-### 跨进程变体
+### Cross-process variant
 
-主进程（CJS）不能 import 渲染层（TS）→ 常量是**派生副本**。
-副本漂移**不报错**，只让同一输入在两条路径上得到不同结论：
+The main process (CJS) cannot import the renderer (TS) -> constants become **derived copies**.
+A copy drifting **does not error**; it just makes the same input yield different conclusions on two paths:
 
-| 漂移 | 后果 |
+| Drift | Consequence |
 |---|---|
-| 某扩展名在主进程属 video、在 utils 属 stream | 筛选归错类；`type !== 'stream'` 让它**跳过转码检查** |
-| UA 字面量两份 | 三处 UA 矛盾 → Cloudflare 挑战必失败 |
+| One extension is video in the main process but stream in utils | filtering misclassifies it; `type !== 'stream'` makes it **skip the transcode check** |
+| The UA literal exists in two copies | three UA values contradict -> the Cloudflare challenge always fails |
 
-**修法**：在静态自检里加一致性断言 —— **只比对两边都有的键**，
-并让报错**打印出具体差异**，否则看到 `FAIL` 也不知道差在哪。
+**Fix**: add a consistency assertion to the static self-check — **compare only the keys both sides have**,
+and make the error **print the concrete difference**, otherwise seeing `FAIL` tells you nothing about where.
 
 ---
 
-## 模式 C：过期结果写回新上下文
+## Pattern C: a stale result written back into a new context
 
-**异步操作返回时，它出发时的那个上下文可能已经不在了。**
+**When an async operation returns, the context it departed from may no longer exist.**
 
-### 判据
+### Criterion
 
-每个 `await` 之后、**写 state 之前**，有没有校验「我还是当初那个我」？
+After every `await`, **before writing state**, is there a check that "I am still the same me as when I started"?
 
 ```js
-// ✗ AI 接口要十几秒，用户完全可能中途切页
+// bad: an AI endpoint takes over ten seconds, and the user can easily switch pages meanwhile
 const extracted = await extractMediaLinks(content, ...);
-addLinks(extracted.map((item) => ({ ...item, pageUrl: targetUrl })));  // 旧页 URL 入列！
+addLinks(extracted.map((item) => ({ ...item, pageUrl: targetUrl })));  // the OLD page URL enters the list!
 ```
 
-### 修法：两种判据，按驱动方式选
+### Fix: two criteria, chosen by what drives the operation
 
 ```js
-// ① 由 URL 变化驱动、有轮次的 → 用 runId
+// (1) driven by a URL change, with rounds -> use a runId
 const isCurrentRun = (runId) => runId === undefined || latestRunRef.current === runId;
 
-// ② 不由 URL 驱动、没有轮次的 → 比「出发时那个页面还是当前页吗」
+// (2) not URL-driven, no rounds -> compare "is the page I departed from still the current page"
 const stillOnPage = () => (activeTabRef.current?.url || '') === targetUrl;
-if (!stillOnPage()) return;   // 结果属于上一个页面，丢弃
+if (!stillOnPage()) return;   // the result belongs to a previous page, discard it
 ```
 
-**选错判据的代价**：给②硬套 runId 会永远为真（没有轮次在推进）。
+**The cost of choosing the wrong criterion**: forcing a runId onto case (2) makes it permanently true (no round is advancing).
 
-### 同族：下标在过滤后错位
+### Same family: an index misaligned after filtering
 
 ```js
-// ✗ activeIndex 是落盘时那份数组的下标，而读回时会过滤掉空白页
+// bad: activeIndex indexes the array as persisted, but reading it back filters out blank pages
 const tabs = saved.tabs.filter(t => t.url).slice(0, MAX);
 const activeIndex = Math.min(saved.activeIndex, tabs.length - 1);
-// [空白, A, B] 且正在看 A（index 1）→ 过滤成 [A, B] → 用 1 索引 → 落到 B
+// [blank, A, B] while viewing A (index 1) -> filtered to [A, B] -> index 1 -> lands on B
 ```
 
-**修法**：**一边过滤一边映射下标**，而不是过滤完再套用旧下标。
+**Fix**: **map the indices while filtering**, rather than applying the old index after filtering.
 
-### 同族：`slice(0, MAX)` 保留的是最旧的
+### Same family: `slice(0, MAX)` keeps the oldest
 
-条目按发现 / 收藏顺序**追加**，末尾最新 → `slice(0, MAX)` 把磁盘副本
-永久冻结在最早那批，之后**再操作什么都不会落盘**。
+Entries are **appended** in discovery / bookmark order, so the newest is at the end -> `slice(0, MAX)` freezes the on-disk copy
+at the earliest batch forever, after which **nothing you do gets persisted**.
 
 ```js
-// ✗ 攒够 300 条后，磁盘上永远是启动时那批
+// bad: once 300 entries accumulate, disk holds the startup batch forever
 saveJSON(KEY, items.slice(0, MAX));
-// ✓ 保留最新的
+// good: keep the newest
 saveJSON(KEY, items.slice(-MAX));
 ```
 
-**同族：`findIndex` 在 `slice` 之后**
+**Same family: `findIndex` after a `slice`**
 
 ```js
-// ✗ 25 个标签页、正在看第 25 个 → 存下 index=24，但只保存了 20 条 → 越界
+// bad: 25 tabs while viewing the 25th -> stores index=24, but only 20 are saved -> out of range
 const activeIndex = Math.max(0, tabs.findIndex(t => t.id === activeTabId));
 saveJSON(KEY, { tabs: tabs.slice(0, MAX), activeIndex });
-// ✓ 先在保存的那一批里找
+// good: search within the batch actually being saved
 const kept = tabs.slice(0, MAX);
 const found = kept.findIndex(t => t.id === activeTabId);
 ```
 
-> **元规则**：每修一个 bug，问「同一模式在别处还有吗」。
-> 发现 `slice(0, MAX)` 取最旧 → 全仓搜同一模式 → **又找到 3 处**（书签、嗅探、标签页）。
+> **Meta-rule**: after fixing one bug, ask "does the same pattern exist elsewhere".
+> Finding that `slice(0, MAX)` keeps the oldest -> search the whole repo for the same pattern -> **found 3 more** (bookmarks, sniffer, tabs).
 
 ---
 
-## 模式 D：共享布尔量被并发操作互相覆盖
+## Pattern D: a shared boolean clobbered by concurrent operations
 
-### 判据
+### Criterion
 
-`isXxx` 布尔 state 是否被**两个以上独立操作**写？
+Is the `isXxx` boolean state written by **two or more independent operations**?
 
 ```js
-// ✗ scan 与 analyzeWithAi 共用一个 isAnalyzing
-setIsAnalyzing(true);   // scan 开始
-setIsAnalyzing(false);  // scan 结束 —— 但 AI 请求还在飞
+// bad: scan and analyzeWithAi share one isAnalyzing
+setIsAnalyzing(true);   // scan starts
+setIsAnalyzing(false);  // scan ends — but the AI request is still in flight
 ```
 
-时间线：
+Timeline:
 
 ```
-analyzeWithAi(A) 开始 : isAnalyzing = true
-scan(B, run1) 开始    : isAnalyzing = true
-scan(B, run1) 结束    : isAnalyzing = false   ← 转圈在这里停了
-=> 界面显示「未在分析」、按钮重新可点，用户以为没反应，再点一次 → 并发两轮
+analyzeWithAi(A) starts : isAnalyzing = true
+scan(B, run1) starts    : isAnalyzing = true
+scan(B, run1) ends      : isAnalyzing = false   <- the spinner stops here
+=> the UI shows "not analyzing" and the button becomes clickable again; the user thinks nothing happened
+   and clicks again -> two concurrent rounds
 ```
 
-### 修法：计数 + `trackOp` 包一层
+### Fix: a counter plus a `trackOp` wrapper
 
 ```js
 const [pendingOps, setPendingOps] = useState(0);
@@ -217,118 +219,118 @@ const isAnalyzing = pendingOps > 0;
 const trackOp = useCallback(async (fn) => {
     setPendingOps((n) => n + 1);
     try { return await fn(); }
-    finally { setPendingOps((n) => Math.max(0, n - 1)); }   // 必须夹下界
+    finally { setPendingOps((n) => Math.max(0, n - 1)); }   // the lower bound is mandatory
 }, []);
 ```
 
-**三个要点**：
+**Three points**:
 
-1. 用 `finally` 归还，覆盖成功 / 失败 / 提前 `return` 三条路径
-2. `Math.max(0, n - 1)` 夹下界 —— 否则提前 return 累积会让它变负、之后永久 `true`
-3. **不要**再按轮次判断何时归还（`if (isCurrentRun(runId)) setX(false)`）——
-   过期轮次也持有自己那份计数，漏掉就永久转圈
+1. Return the count in `finally`, covering success / failure / early `return`
+2. Clamp with `Math.max(0, n - 1)` — otherwise early returns accumulate it negative and it stays `true` forever
+3. Do **not** decide when to return the count by round (`if (isCurrentRun(runId)) setX(false)`) —
+   a stale round holds its own count too, and missing one spins forever
 
 ---
 
-## 模式 E：注释与代码不符
+## Pattern E: comments that contradict the code
 
-**注释说的和代码做的不一致时，人（和 AI）会照着注释推理，得出错误结论。**
+**When a comment says something different from what the code does, people (and AI) reason from the comment and reach a wrong conclusion.**
 
-| 注释声称 | 代码实际 |
+| The comment claims | The code actually |
 |---|---|
-| 「对外只导出 X 与状态类型」 | 还额外导出了两个纯函数 |
-| 某常量注释「全满载占预算 66%」 | 实际值让占用达 **220%** |
-| 「Chrome 的 cookie 主键是 name + domain + path」 | 实现只用了 name + path（见模式 A） |
-| 「过滤某类切片分段」 | 判据对该类分片**永不成立**（见模式 F） |
-| 「内容始终挂载（收起只是 display:none）」 | 代码是提前 `return`，收起时**卸载**了，滚动位置会丢 |
+| "only X and the status type are exported publicly" | it also exports two pure functions |
+| a constant is commented "fully loaded uses 66% of the budget" | the actual value makes usage reach **220%** |
+| "Chrome's cookie primary key is name + domain + path" | the implementation uses name + path only (see pattern A) |
+| "filter out segments of that kind" | the predicate is **never true** for that kind (see pattern F) |
+| "content stays mounted (collapsing is only display:none)" | the code returns early, so collapsing **unmounts** it and scroll position is lost |
 
-### 手法：核对注释里提到的标识符是否还存在
+### Technique: check whether the identifiers mentioned in comments still exist
 
 ```js
 const inCode = src.split('\n').filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
 for (const id of mentions) {
-  if (!new RegExp(`(?<![\\w$])${id}(?![\\w$])`).test(inCode)) console.log('可能过时:', id);
+  if (!new RegExp(`(?<![\\w$])${id}(?![\\w$])`).test(inCode)) console.log('possibly stale:', id);
 }
 ```
 
-**注意误报**：`IPC`、`HTML`、`UTF`、`MIDI` 这类缩写会被当成标识符；
-跨目录引用的符号也会误报。**逐个核实，不要照着扫描结果直接改。**
+**Beware false positives**: abbreviations like `IPC`, `HTML`, `UTF`, `MIDI` get treated as identifiers,
+and symbols referenced across directories also produce false positives. **Verify each one; do not edit straight from the scan output.**
 
-### 一条给自己的规矩
+### A rule for yourself
 
-**改动让某条注释失真时，同一次改动里就要改掉它。**
+**When a change makes a comment false, fix that comment in the same change.**
 
-写「始终 / 永远 / 不会」这类**绝对化措辞**时，**立刻回代码里找出对应的那一行**。
-找不到就是注释在说谎。
+When you write absolute wording like "always / never / will not", **immediately go find the corresponding line in the code**.
+If you cannot find it, the comment is lying.
 
 ```powershell
-Select-String -Path components/*.tsx -Pattern '始终|永远|绝不|只是|不会'
+Select-String -Path components/*.tsx -Pattern 'always|never|just|will not'
 ```
 
-### 反模式：留下「这里曾经有什么」的历史叙述
+### Anti-pattern: leaving a historical narrative of "what used to be here"
 
-删掉一段代码后写注释说明「这里曾有一个 XX 按钮，已删除，因为……」——
-**这是给读代码的人增加噪音**：他不需要知道曾经有什么。
+After deleting a block of code, writing a comment explaining "there used to be an XX button here, removed because ..." —
+**that is noise added for whoever reads the code**: they do not need to know what used to be there.
 
-**判据**：注释应该解释「为什么现在是这样」，而不是「以前不是这样」。
-唯一的例外是记录**仍可能复发的陷阱**（如「不要改回条件渲染，会丢状态」）——
-那是在防止未来的错误，不是历史叙述。
+**Criterion**: a comment should explain "why it is like this now", not "it was not like this before".
+The only exception is recording a **trap that can still recur** (such as "do not change back to conditional rendering, it loses state") —
+that prevents a future error rather than narrating history.
 
 ---
 
-## 模式 F：不可达 / 无人用的死代码
+## Pattern F: unreachable / unused dead code
 
-### 三个子类
+### Three subclasses
 
-| 子类 | 判据 | 例子 |
+| Subclass | Criterion | Example |
 |---|---|---|
-| **分支不可达** | 条件在调用点永远为假 | `ext === 'ts'` 对 HLS 分片永不成立（`ext` 是 `'mp2t'`）→ 里面的判断是死代码 → **几十个分片全进列表** |
-| **类 / 常量无人用** | 定义存在、全仓零引用 | 某动画类名 + 对应 `@keyframes`；三个同族常量只剩声明 |
-| **机制无入口** | 整条链路没有任何调用方 | 一组导航函数约 53 行，三个提交里都零调用 |
+| **Unreachable branch** | the condition is never true at the call site | `ext === 'ts'` is never true for HLS segments (`ext` is `'mp2t'`) -> the checks inside are dead -> **dozens of segments all enter the list** |
+| **Class / constant nobody uses** | the definition exists, zero references repo-wide | an animation class name plus its `@keyframes`; three sibling constants left as declarations only |
+| **Mechanism with no entry point** | no caller anywhere along the chain | a set of navigation functions, about 53 lines, zero calls across three commits |
 
-### 分支不可达怎么找
+### How to find an unreachable branch
 
-**看条件的取值域是否真的能命中**：
+**Check whether the condition's value domain can actually be hit**:
 
 ```js
-// 步骤 1 先跑：contentType.startsWith('video/') → detectedType='video', ext='mp2t'
-// 步骤 2 只在 !detectedType 时跑 → ext 保持 'mp2t'
-// 步骤 3 判据 ext === 'ts' → 'mp2t' !== 'ts' → 永不进入
+// step 1 runs first: contentType.startsWith('video/') -> detectedType='video', ext='mp2t'
+// step 2 only runs when !detectedType -> ext stays 'mp2t'
+// step 3 tests ext === 'ts' -> 'mp2t' !== 'ts' -> never entered
 ```
 
-**手法**：把判定逻辑复刻出来，喂**真实世界的输入**，看分支走不走得到：
+**Technique**: replicate the decision logic, feed it **real-world inputs**, and see whether the branch is reachable:
 
 ```js
 for (const [ct, path] of [['video/mp2t','/hls/seg001.ts'], ['','/hls/seg001.ts']]) {
   const r = detect(ct, path);
-  console.log(`ct=${ct} → type=${r.detectedType} ext=${r.ext}`);
+  console.log(`ct=${ct} -> type=${r.detectedType} ext=${r.ext}`);
 }
 ```
 
-### 死代码的危害不只是冗余
+### The harm of dead code is not merely redundancy
 
-- **掩盖机制失效**：不可达分支让代码「看起来有防护」，实际没有
-- **误导下一个读者**：某个常量存在会让人以为「改它能改到对应部位」
-- **危险 API 暴露**：把「错误写法」也导出成可用入口，注释明写它会每渲染清空状态 ——
-  **删掉它就没有第二条路可选**
+- **It masks a broken mechanism**: an unreachable branch makes the code "look guarded" when it is not
+- **It misleads the next reader**: the existence of a constant makes people think "changing it changes that part"
+- **It exposes a dangerous API**: exporting the "wrong way" as a usable entry point, with a comment plainly saying it clears state on every render —
+  **delete it and there is no second option left**
 
-### 子类四：删掉一个 UI 特判会带出一整条死 prop 链
+### Subclass four: deleting one UI special case drags out a whole dead prop chain
 
-删掉「按域名决定显示哪个按钮」的 UI 特判后，那条特判用到的 prop
-**就此失去唯一消费点**，但编译**不会报错**
-（TS 的 prop 类型允许父组件传一个子组件不用的值）——
-于是它变成一条**空转的管道**：父组件算、传、子组件收，没人用。
+After deleting the UI special case that "decides which button to show by domain", the props that special case used
+**lose their only consumer**, yet the compiler **does not error**
+(TS's prop types allow a parent to pass a value the child never uses) —
+so it becomes an **idling pipe**: the parent computes and passes it, the child receives it, nobody uses it.
 
-**连锁清单**：
+**The knock-on list**:
 
-| 死掉的东西 | 原因 |
+| What died | Why |
 |---|---|
-| 一个回调 prop（穿过两层组件 + 顶层传参） | 那个按钮是唯一用处 |
-| 另一个回调 prop（穿过两层组件 + 顶层传参） | 那条横幅是唯一用处 |
-| 若干 icon / 判定函数的 import | 随代码一起失效 |
-| 顶层一个 ~75 行的处理函数 | 它的两个调用点正是被删的两个入口 |
+| one callback prop (through two component layers plus a top-level argument) | that button was its only use |
+| another callback prop (through two component layers plus a top-level argument) | that banner was its only use |
+| imports of several icons / predicate functions | they became dead with the code |
+| a ~75-line handler at the top level | its two call sites were exactly the two deleted entry points |
 
-**手法**：删完 UI 后，对每个曾用到的 prop / import **数一次引用**：
+**Technique**: after deleting UI, **count references once** for every prop / import that was involved:
 
 ```powershell
 @'
@@ -337,163 +339,164 @@ const src = fs.readFileSync('D:/proj/components/Panel.tsx', 'utf8');
 const noComments = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
 for (const n of ['SomeIcon','OtherIcon','isSpecialSite','onOpenThing']) {
   const c = (noComments.match(new RegExp('(?<![\\w$])' + n + '(?![\\w$])', 'g')) || []).length;
-  console.log(n.padEnd(24) + c + (c <= 1 ? '  <-- 只剩 import 行，死代码' : ''));
+  console.log(n.padEnd(24) + c + (c <= 1 ? '  <-- only the import line remains, dead code' : ''));
 }
 '@ | node -
 ```
 
-**判据**：**引用数 = 1 且那一处就是 import / 类型声明** → 死代码。
+**Criterion**: **reference count = 1 and that one occurrence is the import / type declaration** -> dead code.
 
-**终审用编译器**，比肉眼看可靠：
+**Use the compiler for the final check**; it is more reliable than the eye:
 
 ```powershell
 npx tsc --noEmit --noUnusedLocals --noUnusedParameters 2>&1 |
   Select-String -Pattern 'Panel|App\.tsx'
 ```
 
-> 默认的 `tsc --noEmit` **不报**未使用的局部变量 / 参数，
-> 所以「构建是绿的」不能证明没有死代码。要专门开这两个开关查一次。
-> ⚠️ 全项目跑这个开关会有既有告警（音频面板、解析器等），
-> **只看你改过的文件**，不要去修别人的。
+> A default `tsc --noEmit` **does not report** unused locals / parameters,
+> so "the build is green" does not prove there is no dead code. Turn both switches on and check once.
+> Note: running these switches project-wide produces pre-existing warnings (audio panel, parsers, etc.),
+> so **look only at the files you changed** and do not go fix other people's.
 
-**删入口前先摸清依赖归属**：那些 prop 的**兄弟**可能还活着 ——
-若某个 handler 同时是另一个面板的 props，就**必须保留**。
-判据是「除了这条死链，还有谁在用」。
+**Establish dependency ownership before deleting an entry point**: the **siblings** of those props may still be alive —
+if a handler is also the props of another panel, it **must be kept**.
+The criterion is "besides this dead chain, who else uses it".
 
-### 子类五：纯 UI 的站点特判
+### Subclass five: pure-UI site special cases
 
-**判据**：这段代码只因为「当前站点是 X」而改变**外观或入口**，不影响数据正确性。
+**Criterion**: this code changes **appearance or entry points** only because "the current site is X", and does not affect data correctness.
 
-**典型的两处（可删）**：
+**The two typical spots (deletable)**:
 
-- 地址栏按域名 + 路径关键字切换按钮文案与配色
-- 嗅探面板顶部「本站页面…请走画廊」的横幅
+- the address bar switching button labels and colors by domain plus a path keyword
+- the "this site's pages ... please use the gallery" banner at the top of the sniffer panel
 
-**但同一批站点判定调用里，另两处必须保留** —— 它们**不是 UI**：
+**But among the same batch of site-predicate call sites, two others must be kept** — they are **not UI**:
 
-| 保留 | 为什么 |
+| Keep | Why |
 |---|---|
-| 嗅探过滤里的站点判定 | **过滤规则**：删了图床会把封面 / 分片灌进嗅探列表 |
-| 站点判定工具函数本身 | 同时是 HLS 请求签名的开关：删了该类视频**全部 403** |
-| 主进程的嗅探排除后缀表 | 主进程是嗅探的实际拦截点，且被静态自检校验同口径 |
+| the site predicate in sniffer filtering | it is a **filter rule**: deleting it floods the sniffer list with covers / segments |
+| the site-predicate utility function itself | it is also the switch for HLS request signing: deleting it makes that class of video **403 across the board** |
+| the main process's sniffer exclusion-suffix table | the main process is the actual interception point for sniffing, and it is checked for agreement by the static self-check |
 
-**教训**：用户说「删掉某站点的特殊检测」时，
-**先按「它改变的是外观还是数据」分类**，把清单和后果列给用户确认，
-**不要整批删**。同一个判定函数的调用点可能分属两类。
+**Lesson**: when the user says "delete the special detection for some site",
+**first classify by "does it change appearance or data"**, list the items and consequences for the user to confirm,
+and **do not delete the whole batch**. The call sites of one predicate function can belong to both classes.
 
 ---
 
-## 模式 G：记忆化被「每轮新引用」悄悄废掉
+## Pattern G: memoization silently defeated by "a new reference every render"
 
-**不报错、不影响功能，只是白写了 `React.memo`** ——
-所以没人会发现，直到某天列表长到卡顿。
+**It does not error and does not affect functionality; it just makes `React.memo` pointless** —
+so nobody notices until the list grows long enough to stutter.
 
-### 判据：`useMemo` / `React.memo` 的依赖里，有没有**每轮新建**的东西
+### Criterion: do the dependencies of `useMemo` / `React.memo` contain something **rebuilt every render**?
 
-**其一：依赖了整个 actions 对象。**
+**Case one: the whole actions object is a dependency.**
 
 ```tsx
-// 逐个取出：actions 对象每轮都是新引用，直接依赖它会让下面所有 memo 失效
+// Pulling them out one by one: the actions object is a new reference each render, so depending on it
+// invalidates every memo below
 const { downloadHit, saveFile, setNotice, setError } = actions;
 
 const onDeleteTask = useCallback((task) => {
-  if (window.confirm(msg)) void actions.cancelTask(task.id);   // ✗ 又用了 actions
-}, [actions]);                                                  // ✗ 依赖也带上了
+  if (window.confirm(msg)) void actions.cancelTask(task.id);   // bad: uses actions again
+}, [actions]);                                                  // bad: and depends on it too
 ```
 
-某个 hook 的返回是**裸对象字面量**（不是 `useMemo`），
-所以 `actions` 每次渲染都是新引用 → `onDeleteTask` 每轮重建 →
-传给 `React.memo(TaskRow)`（列表行组件）的 prop 每轮都变 → **memo 完全无效**。
+Some hook returns a **bare object literal** (not `useMemo`),
+so `actions` is a new reference every render -> `onDeleteTask` is rebuilt every render ->
+the prop passed to `React.memo(TaskRow)` (a list-row component) changes every render -> **memo is entirely ineffective**.
 
-**修法**：`const { …, cancelTask } = actions;` 然后 `[cancelTask]`。
+**Fix**: `const { ..., cancelTask } = actions;` then `[cancelTask]`.
 
-**其二：JSX 元素数组每次重建。**
+**Case two: the JSX element array is rebuilt every render.**
 
 ```tsx
-// ✗ 拖动悬浮球时 position 每帧变 → 整个组件重渲染 →
-//   这个数组每帧重建 → 里面 300 条列表跟着每帧重建
+// bad: dragging the floating ball changes position every frame -> the whole component re-renders ->
+//      this array is rebuilt every frame -> the 300-row list inside is rebuilt every frame
 const panels = [
   { key: 'sniff', node: <SniffPanel ... /> },
   { key: 'tasks', node: <TaskPanel /> },
 ];
 ```
 
-**修法**：元素本身 memo 住，引用不变时 React 会跳过整棵子树
-（**与它是不是 `hidden` 无关**）：
+**Fix**: memoize the elements themselves; when the reference is unchanged React skips the entire subtree
+(**regardless of whether it is `hidden`**):
 
 ```tsx
 const sniffNode = useMemo(() => <SniffPanel ... />, [sniffer, onPlay, onAiAnalyze, currentUrl]);
-const taskNode = useMemo(() => <TaskPanel />, []);   // 不吃 props → 真正一次性
+const taskNode = useMemo(() => <TaskPanel />, []);   // takes no props -> genuinely one-shot
 ```
 
-### 变体：内联 `style` 悄悄盖掉类上的过渡
+### Variant: inline `style` silently overrides a transition on the class
 
 ```tsx
-// 原来：transition: 'all 320ms ...' 顺带覆盖了 transform
-// 改成显式列属性时漏了 transform ↓
+// Before: transition: 'all 320ms ...' incidentally covered transform
+// Rewritten as an explicit property list, transform was missed
 style={{ transition: 'left 320ms, top 320ms, width 320ms' }}
-className="transition-transform hover:scale-105"   // ✗ 永远不生效
+className="transition-transform hover:scale-105"   // bad: never takes effect
 ```
 
-**内联 `transition` 会盖掉类上的 `transition-*`。**
-把 `all` 展开成显式属性时，**必须把类里用到的属性一并列进去**（这里是 `transform`），
-否则 hover 缩放从「渐变」退化成「瞬变」。
+**An inline `transition` overrides `transition-*` on the class.**
+When expanding `all` into explicit properties, **you must list the properties the class uses too** (here `transform`),
+otherwise the hover scale degrades from "animated" to "instant".
 
-### 排查手法
+### Detection technique
 
 ```js
-// 1. 找「每轮新建」的对象来源：hook 返回的那个对象是不是 useMemo 的？
-//    判据要落到具体那个对象，不是整个 return：
-//      某个 hook → 裸对象字面量，actions 每轮新引用  ← 出问题的就是它
-//      另一个   → return useMemo(...)，actions 稳定
-//      第三个   → 外层 return 是字面量，但内部 methods 本身是 useMemo，稳定
+// 1. Find the source of the "rebuilt every render" object: is the object that hook returns a useMemo?
+//    The criterion must land on that specific object, not the whole return:
+//      one hook   -> bare object literal, actions is a new reference each render  <- this is the culprit
+//      another    -> return useMemo(...), actions is stable
+//      a third    -> the outer return is a literal, but the inner methods are themselves useMemo, stable
 const s = fs.readFileSync('hooks/useSearch.ts','utf8');
-console.log(/return useMemo/.test(s) ? 'useMemo（引用稳定）' : '裸对象字面量（每轮新引用）');
+console.log(/return useMemo/.test(s) ? 'useMemo (stable reference)' : 'bare object literal (new reference every render)');
 
-// 2. 找 useCallback 依赖里的大对象
-//    逐个列出依赖数组，扫一眼有没有 actions / state / props 整体
+// 2. Find large objects in useCallback dependencies
+//    List the dependency arrays one by one and scan for a whole actions / state / props
 ```
 
-> **元规则**：给某个组件加 `React.memo` 时，
-> **必须同时检查它收到的每个 prop 是否引用稳定**。
-> 加 memo 而不修 prop，等于没加 —— 而且更难发现，因为代码「看起来已经优化过了」。
+> **Meta-rule**: when adding `React.memo` to a component,
+> **you must simultaneously check that every prop it receives has a stable reference**.
+> Adding memo without fixing the props is the same as not adding it — and is harder to notice, because the code "looks already optimized".
 
 ---
 
-## 通用排查顺序
+## General audit order
 
-面对「审查某模块所有问题」这类任务，按这个顺序走效率最高：
+For a task like "audit every problem in a module", this order is the most efficient:
 
-1. **列出数据流**：什么数据、存哪（state / localStorage / 主进程）、谁读写
-2. **查键唯一性**（模式 A）—— 最隐蔽，先查
-3. **搜重复判据**（模式 B）—— 同一个语义判断出现 >1 次就有风险
-4. **每个 `await` 后问「上下文还在吗」**（模式 C）
-5. **每个布尔 state 问「谁会写它」**（模式 D）
-6. **核对注释提到的标识符**（模式 E）
-7. **找不可达分支与零引用导出**（模式 F）
-8. **看每个 memo 的依赖是否引用稳定**（模式 G）
-
----
-
-## 一条元规则
-
-> **每修一个 bug，问「同一模式在别处还有吗」。**
-
-收益几乎都来自这一步：
-
-- 发现 `slice(0, MAX)` 取最旧 → 全仓搜同一模式 → **又找到 3 处**（书签、嗅探、标签页）
-- 发现 cookie 键缺 domain → 同一缺陷在另一处 `tokens` 里**更严重**（两条来源字段完全相同）
-- 发现 `analyzeWithAi` 无过期保护 → 对照 `scan` 有 6 处守卫 → 确认是遗漏而非设计
+1. **Map the data flow**: what data, where it is stored (state / localStorage / main process), who reads and writes it
+2. **Check key uniqueness** (pattern A) — the most insidious, so check it first
+3. **Search for duplicated predicates** (pattern B) — one semantic judgment appearing more than once is a risk
+4. **After every `await`, ask "is the context still there"** (pattern C)
+5. **For every boolean state, ask "who writes it"** (pattern D)
+6. **Verify the identifiers mentioned in comments** (pattern E)
+7. **Find unreachable branches and zero-reference exports** (pattern F)
+8. **Check whether every memo's dependencies have stable references** (pattern G)
 
 ---
 
-## 自查清单
+## One meta-rule
 
-- [ ] 每个列表 / Map 的键都真的唯一吗（造两条「业务不同、键相同」的数据验一下）？
-- [ ] 同一个语义判断在全仓出现几次？超过一次就抽成唯一实现
-- [ ] 每个 `await` 写 state 前，校验「我还是当初那个我」了吗？
-- [ ] 过滤 / 截断之后，下标是在**过滤后的那份**里算的吗？
-- [ ] 每个 `isXxx` 布尔量有几个写者？并发时会不会互相覆盖？
-- [ ] 注释里提到的东西，代码里都还在吗？绝对化措辞有对应实现吗？
-- [ ] 有没有永假分支、零引用导出、无入口机制？
-- [ ] 每个 `React.memo` 的每个 prop 都引用稳定吗？
+> **After fixing one bug, ask "does the same pattern exist elsewhere".**
+
+Almost all the payoff comes from this step:
+
+- Found `slice(0, MAX)` keeping the oldest -> searched the repo for the same pattern -> **found 3 more** (bookmarks, sniffer, tabs)
+- Found a cookie key missing domain -> the same defect in `tokens` elsewhere was **worse** (two sources with identical fields)
+- Found `analyzeWithAi` had no stale protection -> compared against `scan`, which has 6 guards -> confirmed it was an omission, not a design
+
+---
+
+## Self-check list
+
+- [ ] Is every list / Map key genuinely unique (build two records "business-different, key-identical" and check)?
+- [ ] How many times does one semantic judgment appear repo-wide? More than once means extract a single implementation
+- [ ] Before every `await` writes state, is there a check that "I am still the same me as when I started"?
+- [ ] After filtering / truncating, is the index computed **within the filtered batch**?
+- [ ] How many writers does each `isXxx` boolean have? Can they clobber each other under concurrency?
+- [ ] Do the things mentioned in comments still exist in the code? Does the absolute wording have a corresponding implementation?
+- [ ] Are there always-false branches, zero-reference exports, mechanisms with no entry point?
+- [ ] Does every prop of every `React.memo` have a stable reference?

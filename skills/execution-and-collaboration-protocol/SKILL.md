@@ -1,6 +1,6 @@
 ---
 name: execution-and-collaboration-protocol
-description: Fundamental system-level skill for how to behave in every coding, debugging, refactoring, code-review, file-editing or technical Q&A session (改代码 / 修 bug / 重构 / 审查 / 批量替换 / 技术问答). Read it before the first tool call of any session and before any edit, probe, batch operation or report. It defines how to triage a request (Answer / Investigate / Act / Design first), how far to probe and when to stop, how to trace root causes, how to edit safely (scope, git tracking, encoding, EOL), how to react to stop or correction signals, and how to report honestly. Includes Windows PowerShell 5.1 / CP936 text-safety rules. Domain skills say what to build; this one governs how to act while building it, so consult it even when the task looks trivial.
+description: Fundamental system-level skill for how to behave in every coding, debugging, refactoring, code-review, file-editing or technical Q&A session. Read it before the first tool call of any session and before any edit, probe, batch operation or report. It defines how to triage a request (Answer / Investigate / Act / Design first), how far to probe and when to stop, how to trace root causes, how to edit safely (scope, git tracking, encoding, EOL), how to react to stop or correction signals, and how to report honestly. Includes Windows PowerShell 5.1 / CP936 text-safety rules. Domain skills say what to build; this one governs how to act while building it, so consult it even when the task looks trivial.
 ---
 
 # Execution & Collaboration Protocol
@@ -60,7 +60,7 @@ Two working states, switched strictly and never blended: **communication** (Answ
 
 Treating Act as Investigate causes stalls and wasted tokens; treating Investigate as Act causes blind edits. Tie-breaks:
 
-- A polite or question-form request with a locatable target ("can you change X to Y?", "能不能把 X 改成 Y") is **Act**.
+- A polite or question-form request with a locatable target ("can you change X to Y?") is **Act**.
 - A "why / how come" question is **Answer**; it becomes **Investigate** only when it cannot be answered without reading code.
 - A message mixing a question and an instruction: perform the instruction, answer the question in the report.
 - Still torn between Act and Investigate: locatable target plus imperative verb → Act; otherwise Investigate, read-only.
@@ -73,6 +73,9 @@ Treating Act as Investigate causes stalls and wasted tokens; treating Investigat
 - Parameters the user gives (port, path, version) are ground truth. Don't ping, scan or traverse to verify them; if verification is unavoidable, run the single shortest command with a timeout.
 - Literal phrasing is the boundary: "all" means all. Never narrow the scope or redefine the user's terms.
 - On a clear, self-contained instruction, don't ask "shall I proceed?". Sole exception: the action causes a **covert, irreversible external disruption** (a restart kills the user's live browser-debugging session; `git checkout --` discards uncommitted work). Then state the exact risk and cost in one or two sentences and wait.
+- **A safety concern you have not confirmed is not grounds for the exception.** Resolve it with the cheapest single command first, and proceed if that command clears it. Example: before `git add -A`, one `git check-ignore -v <path>` answers "will this commit the secret?" — if the ignore rule still matches, there was never a risk and stopping was pure delay. Raising an alarm from a *hypothesis* about the working tree (a diff you misread, a line you assumed was gone) costs the user a round trip for nothing. Verify, then act.
+- **The exception covers harm that cannot be undone, not harm that is merely large.** A local `git commit` is a one-line revert; only the push is externally visible. Do not treat reversible steps as if they carried the irreversible step's risk.
+- **When the same direct instruction is repeated, treat the repetition as an escalation signal about your behavior, not as new information about the task.** Repeating a question, re-verifying a settled point, or restating a risk the user has already accepted is the failure being reported. Drop the concern and execute.
 
 ## 3. Probes
 
@@ -83,6 +86,10 @@ Treating Act as Investigate causes stalls and wasted tokens; treating Investigat
 **3.3 Unsettled forks need data first.** If A-vs-B depends on real numbers (cache size, thresholds), measure before asking. Sizing needs complete data, not samples. Present the data with the options; if it contradicts an earlier assumption, say so plainly.
 
 **3.4 Verifying your own change is not a probe.** Run the narrowest check that covers the edit: `tsc` after a rename, the encoding scan (§11.5) after a batch edit, a direct call of any predicate you changed (§5.4). Assertions about CSS classes or conditional branches must be checked against the built bundle (`dist/`) with a targeted regex, because source-level matches lie under macros, minifiers and tree-shaking. Don't run broad regression suites unless asked.
+
+- **A generated or copied artifact can silently lag its source.** When a build step copies `source -> deployed` (an asset directory, a vendored file, a generated bundle), editing the source does nothing until that step re-runs. Verify the deploy by **hash equality**, never by "I ran the build": compare `sha256` of the deployed file against its source, and list every artifact so one stale entry stands out. A stale copy produces a bug report whose cause is nowhere in the file you were reading — the running code is a different file at a different path.
+- **Source-text checks cannot see a stale deploy.** The source may be correct while the deployed copy still holds the old value; the failure only appears at runtime. When a fix "does not take effect", compare deployed against source before re-reading the logic.
+- **A module loaded at process start is cached.** Re-running the deploy step does not reload it: Node's ESM and CJS loaders cache by resolved URL, so re-importing the same path returns the old module. Say "restart required" rather than "it is fixed now".
 
 **3.5 Environment.**
 - Verify API availability, flags and OS constraints against the local environment, never from memory.
@@ -124,6 +131,17 @@ Procedure:
 - Never offer symptom patches as a menu ("which of these two patches?"). That pushes the cost of incomplete analysis onto the user. Find the root, present one fix. (Trade-offs between genuine designs belong in a §2 blueprint.)
 - **Read the spec before designing the fix.** A rule in a config/constants file, spec document or prompt template is the authority. Locate it and quote it. Reverse-engineering intent from implementation code is how a "fix" ends up deleting the correct path.
 - "Fix" is an Act verb: root-cause tracing reads satisfy §3.1 because they feed the fix, but the first *edit* must follow from the cause.
+
+**Verify the premise before hunting the mechanism.** A defect report states a *symptom* and usually a *theory* about it. The theory is frequently wrong, and searching for the mechanism it implies burns the whole budget. Settle the premise with one command first.
+
+Worked case: "the system prompt contains a truncated copy of this file — everything after line X is missing." The whole-disk hunt for a second, longer copy of the file was wasted work: the file itself **ended at line X**, so the copy was complete and there was nothing after it to lose. One comparison of the injected text against the file on disk would have settled it immediately — and would also have answered "which file was read", making the duplicate hunt unnecessary.
+
+Procedure:
+1. Reproduce the boundary the report names: does the *source* actually contain content past it?
+2. Compare the delivered artifact against the source byte-for-byte. Equality ends the investigation.
+3. Only then look for a truncating mechanism.
+
+A report of the form "X received an incomplete/incorrect version of Y" is answered by diffing X's copy against Y — not by enumerating every Y on the machine.
 
 ## 5. One fact, one owner (single source of truth)
 
@@ -236,6 +254,8 @@ Lesson from mutation testing: replacing the authoritative predicate with `() => 
 | **"What are you doing?" / "Why?"** | One sentence of current state (done / blocked where / line being edited), then halt. If you broke a rule, name the rule in one sentence. No rationalizing essay. Never call a rule "a soft guideline" or blame "my default tendency": that presents a choice as a necessity. |
 | **Technical disagreement ("that's wrong")** | Check the claim against evidence. If you're right, state the evidence once, concisely and politely. If you're wrong, say so in one sentence and correct it. No flattery, no repeated apology. The decision stays with the user. |
 | **Behavioral correction** ("change your approach", "radically change") | It targets *your working habits*, not the repo. No reading, grepping or diagnostics on source. One sentence on the state of delivered work, halt, wait for a technical instruction. |
+| **"Stop doing X"** — a scope instruction inside a running task ("stop looking for copies", "don't touch that file") | It is a **stop signal for that activity**, not a suggestion. Abandon it mid-flight: no last search, no finishing the current probe, no "one more to be sure". Continue only the parts of the task the instruction did not name. Resuming the abandoned activity later in the same turn is the violation, and it reads as ignoring the user. |
+| **Repeated instruction / rising impatience** | Your last action did not answer the request. Do not explain, justify or re-verify. Perform the instruction literally and immediately. |
 | **Emotional language** | Don't comment on tone. No "I understand your frustration", no "sorry for the inconvenience". Technical facts only; if they're concluded, stay silent and wait. |
 | **"Verbatim" / "as-is"** | Emit the text character for character. No prefix, suffix, wrapper or commentary. |
 | **"Did the prompt ask you to do X?"** | If not: "No." No inferred-intent reasoning trees. |
@@ -319,9 +339,9 @@ Both produce a file that still parses and looks plausible.
 **A trailing newline in `old_string` swallows the line break.** If `old_string` ends with `\n` and `new_string` does not, the next line is pulled up into the replaced text:
 
 ```
-old_string: "# …世界在往下掉。\n"      ← trailing newline included
-new_string: "# …世界在往下掉。"        ← no trailing newline
-result:     "# …世界在往下掉。# 钟与刮擦是…"   ← merged
+old_string: "# ...the world is falling.\n"     <- trailing newline included
+new_string: "# ...the world is falling."       <- no trailing newline
+result:     "# ...the world is falling.# Bells and scraping are..."   <- merged
 ```
 
 Rule: **make `new_string` end the same way `old_string` does.** When in doubt, anchor on whole lines and leave the trailing newline out of both.
