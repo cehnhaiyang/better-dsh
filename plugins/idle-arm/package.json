@@ -1,0 +1,25 @@
+{
+  "name": "dsh-plugin-idle-arm",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Arm the idle-guard file-write interception from a button beside the composer submit action",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

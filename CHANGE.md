@@ -210,12 +210,39 @@
   另外，删目录时原来「头读不出来就静默跳过该 id」会让缓存清理漏项，现按
   `decodeSegment()`（`encodeSegment` 的严格逆运算）从目录名还原真实 id 兜底。
 
-### 未改动但值得记录的两点
+### 补全 idle-arm 的客户端半边
 
-- `plugins/idle-arm/package.json` 与 `lib/client.js` 是脚本刻意不覆盖的手写资源
-  （脚本只在缺失时告警）。当前磁盘上这两份确实缺失，因此 idle-arm 的客户端半边
-  （提交键旁的按钮）不会出现，宿主半边的 `POST /idle-arm/arm` 仍正常注册。
-  这是既有状态，不属于本次迁移范围。
+`plugins/idle-arm/` 原先只有脚本生成的宿主半边，`package.json` 与 `lib/client.js`
+缺失，因此「提交键旁的武装按钮」从未出现过——而脚本只打印一行 `console.warn`，
+结尾照样喊「部署成功」。本次补齐并顺势堵掉这条静默失败路径。
+
+- **新增 `plugins/idle-arm/package.json`**：`dsh.client.platform = 'web'`、
+  `exports["./client"] = "./lib/client.js"`；`inject` 只声明真正需要的
+  `dsh-client-locale` 与 `dsh-client-ui-conversation`。
+- **新增 `plugins/idle-arm/lib/client.js`**：以
+  `window.__ModuleLoader__.load({ id, factory })` 注册，`id` 严格等于包名
+  （`dsh-client-modules` 用 manifest 里请求的 id 与注册 id 比对，不一致就报
+  「loaded without registering」并静默不装配）；在 `conversation.input.right`
+  （提交键左侧）挂一个「武装」控件，POST `idle-arm/arm` 把
+  `{ sessionId, minutes }` 交给宿主，成功后就地显示已武装分钟数，失败显示宿主
+  返回的原因；文案走 `ctx.locale.register`（zh/en），样式经 `ctx.effect` 注入，
+  用主题令牌取色因而跟随明暗主题。
+- **脚本改为契约校验而非存在性告警**：新增 `verifyIdleArmBundle()`，逐条核对
+  `dsh.client.platform`、`exports["./client"]` 指向的文件真实存在、以及
+  bundle 注册 id 与 `package.json` 的 `name` 一致；任一不满足即以退出码 1 结束。
+- **成功横幅改为条件输出**：结尾的「🎉 全量部署成功」只在
+  `process.exitCode` 为 0 时打印，否则打印「⚠️ 部署未完成」。此前任何一步设了
+  非零退出码（补丁拒绝落盘、idle-arm 声明不完整等）都会被一句祝贺盖住。
+
+验证：`node --check` 通过；`--apply` 连跑两次字节级幂等；启动 dsh Web 后抓取
+实际下发的 bundle，确认 `id: 'dsh-plugin-idle-arm'` 与包名一致、且包含注册与请求
+代码；`POST /idle-arm/arm` 的信任栅栏（401）、方法守卫（405）、非法 JSON／越界
+分钟数／缺 sessionId（400）、未知会话（404）逐项实测符合预期；把 bundle 放进
+迷你 React 运行时真实执行，21 项断言全过（注册契约、渲染结构、越界本地拦截不发
+请求、POST 体形状、错误回显、以及「空闲时武装的标记不被立刻抹掉」这条修复）。
+
+### 未改动但值得记录的一点
+
 - `.agent-presets/create/创作准则（无限制版）.md` 在工作区里处于已删除状态。核对了
   脚本全部文件系统调用：只有会话目录、临时文件与生成物被写/删，**没有任何**删除
   preset `.md` 的代码；该文件也不被任何 `agent.cordis.yml` 引用，与脚本行为无关。

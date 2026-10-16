@@ -2612,14 +2612,68 @@ const IDLE_ARM_PKG = path.join(IDLE_ARM_DIR, 'package.json')
 const IDLE_ARM_HOST = path.join(IDLE_ARM_DIR, 'lib', 'index.js')
 const IDLE_ARM_CLIENT = path.join(IDLE_ARM_DIR, 'lib', 'client.js')
 fs.mkdirSync(path.join(IDLE_ARM_DIR, 'lib'), { recursive: true })
-// package.json 与客户端 bundle 是手写资源（内容不在这里），脚本只确保目录存在，不覆盖。
+// package.json 与客户端 bundle 是手写资源（内容在仓库里，见 plugins/idle-arm/），脚本不生成也不覆盖。
 // 宿主半边则相反：它的内容就在上面那个 IDLE_ARM_HOST_CODE 里，属于生成物，必须每次覆写。
 // 早先这里用的是 existsSync 守卫，结果模板改了、磁盘上那份没跟着改，注释里还留着
 // 早已不存在的 /idle-arm 命令——生成物一旦有「只在缺失时写」的守卫就会这样悄悄漂移。
-if (!fs.existsSync(IDLE_ARM_PKG)) console.warn(`[plugins] 缺少 ${IDLE_ARM_PKG}（idle-arm 需要它才能被客户端模块系统定位）`)
 fs.writeFileSync(IDLE_ARM_HOST, IDLE_ARM_HOST_CODE, 'utf8')
-if (!fs.existsSync(IDLE_ARM_CLIENT)) console.warn(`[plugins] 缺少 ${IDLE_ARM_CLIENT}（界面按钮不会出现）`)
-console.log(`[plugins] idle-arm 双面插件就位: ${IDLE_ARM_DIR}`)
+
+/**
+ * 校验 idle-arm 的双面声明是否真的成立。
+ *
+ * 只检查文件存在是不够的：客户端半边要靠 package.json 的 dsh.client + exports["./client"]
+ * 才会被 dsh-client-modules 装配，而 bundle 里 `__ModuleLoader__.load({ id })` 的 id
+ * 又必须严格等于 package.json 的 name（client-modules 会拿 manifest 里的 id 去比对，
+ * 不一致就报「loaded without registering」）。这两处任何一处错位，结果都是按钮
+ * 静默不出现——脚本却照样打印「部署成功」。所以这里逐条验到契约层面，任一不满足即
+ * 以非零码退出，绝不把「界面缺了一块」伪装成成功。
+ * @returns 校验发现的问题列表（空数组表示全部通过）。
+ */
+function verifyIdleArmBundle() {
+    const problems = []
+    if (!fs.existsSync(IDLE_ARM_PKG)) {
+        problems.push(`缺少 ${IDLE_ARM_PKG}`)
+        return problems
+    }
+    if (!fs.existsSync(IDLE_ARM_CLIENT)) {
+        problems.push(`缺少 ${IDLE_ARM_CLIENT}（客户端半边不存在，提交键旁的按钮不会出现）`)
+        return problems
+    }
+    let manifest
+    try {
+        manifest = JSON.parse(fs.readFileSync(IDLE_ARM_PKG, 'utf8'))
+    } catch (error) {
+        problems.push(`${IDLE_ARM_PKG} 不是合法 JSON: ${error.message}`)
+        return problems
+    }
+    const name = manifest.name
+    if (typeof name !== 'string' || name.length === 0) problems.push(`${IDLE_ARM_PKG} 缺少 name`)
+    if (manifest?.dsh?.client?.platform !== 'web') problems.push(`${IDLE_ARM_PKG} 的 dsh.client.platform 必须是 'web'`)
+    const clientExport = manifest?.exports?.['./client']
+    const clientRel = typeof clientExport === 'string' ? clientExport : clientExport?.default
+    if (typeof clientRel !== 'string' || clientRel.length === 0) {
+        problems.push(`${IDLE_ARM_PKG} 的 exports["./client"] 未指向客户端 bundle`)
+    } else if (!fs.existsSync(path.join(IDLE_ARM_DIR, clientRel))) {
+        problems.push(`${IDLE_ARM_PKG} 的 exports["./client"] 指向不存在的文件: ${clientRel}`)
+    }
+    // bundle 注册的 id 必须与包名一致，否则 client-modules 直接判为「loaded without registering」。
+    const registered = /__ModuleLoader__\.load\(\{\s*id:\s*['"]([^'"]+)['"]/.exec(fs.readFileSync(IDLE_ARM_CLIENT, 'utf8'))
+    if (registered === null) {
+        problems.push(`${IDLE_ARM_CLIENT} 未按 window.__ModuleLoader__.load({ id, factory }) 形式注册`)
+    } else if (name !== undefined && registered[1] !== name) {
+        problems.push(`bundle 注册 id「${registered[1]}」与 package.json name「${name}」不一致（client-modules 会拒绝装配）`)
+    }
+    return problems
+}
+
+const idleArmProblems = verifyIdleArmBundle()
+if (idleArmProblems.length > 0) {
+    for (const problem of idleArmProblems) console.error(`  [idle-arm] ${problem}`)
+    console.error('  [idle-arm] 双面声明不完整：界面按钮不会出现（宿主端点 /idle-arm/arm 仍可用）。请从仓库恢复 plugins/idle-arm/。')
+    process.exitCode = 1
+} else {
+    console.log(`[plugins] idle-arm 双面插件就位: ${IDLE_ARM_DIR}`)
+}
 
 // 3. 自建预设迁移：把旧版目录预设转成声明式预设
 //    官方已彻底移除对 ~/.dsh/.agent-presets/<id>/ 目录的读取（官方 skill
@@ -3708,6 +3762,12 @@ function syncWorkspaces(dshRoot, force = false) {
 
 syncWorkspaces(DSH_ROOT, process.argv.includes('--repair-workspaces') || process.argv.includes('-r'))
 
+// 收尾横幅必须反映真实结果：前面任何一步设了非零退出码（补丁拒绝落盘、idle-arm 声明不完整等），
+// 就不能再喊「全量部署成功」——否则失败被一句祝贺盖住，正是本脚本要消灭的那种静默故障。
 console.log('=============================================================')
-console.log('🎉 恭喜！DSH 全套改进（插件/配置/底层补丁）已全量部署成功！')
+if (process.exitCode !== undefined && process.exitCode !== 0) {
+    console.error(`⚠️  部署未完成：上面有 ${process.exitCode} 号退出码对应的错误，请先处理后再重跑。`)
+} else {
+    console.log('🎉 恭喜！DSH 全套改进（插件/配置/底层补丁）已全量部署成功！')
+}
 console.log('=============================================================')
