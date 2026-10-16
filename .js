@@ -4,9 +4,7 @@
 // DSH 全量独立部署与维护脚本
 //
 // 用法：
-//   node .js            进入维护台菜单：1 管理会话 / 2 应用补丁 / 3 图形界面 / q 退出
-//   node .js --console  直接启动会话管理界面（浏览器操作，支持跨目录移动会话）
-//   node .js --console --console-port 8080   指定端口（默认 7788）
+//   node .js            进入维护台菜单：1 管理会话 / 2 应用补丁 / q 退出
 //   node .js --apply    直接执行全部补丁（等价旧版行为，便于脚本化）
 //   node .js --list     非交互列出工作区目录（目录名反解为可读路径）
 //   node .js --list <目录名|路径片段|序号>   列出该目录下的会话（含标题）
@@ -15,14 +13,12 @@
 //   本脚本是 DSH 功能增强与自定义插件生态的「一键生成与维护总入口」。
 //   在任何时候运行（`node .js`），会自动全量构建并注入全部改进：
 //
-//   0. 基线版本：本脚本按 dsh 0.2.0-rc.2 的结构维护（0.1.7 → 0.2.0 的主要变更：
-//      会话格式升到 v4（消息内容块扁平化，header 增补 isSeeded/delegationDepth）；
-//      交互式预设选择器由会话头部搬到新会话首屏（conversation.hero.agentPreset），
-//      头部标签退化为只读（第 5 节的 4.2 号补丁负责在头部恢复交互面）；
-//      profile 补丁层之上新增家目录层 `~/.dsh/cordis.patch.yml`，同一条目以家目录层为准）。
-//      0.1.6 → 0.1.7 的变更（预设改为声明式行、`dsh-agent-presets` 拆为
-//      `dsh-agent-preset` + `dsh-agent-preset-registry`、`~/.dsh/.agent-presets/`
-//      目录不再被读取、profile patch 由 dsh-hmr 原生热重放）在 0.2.0-rc.2 复核仍成立。
+//   0. 基线版本：本脚本按 dsh 0.2.1-alpha.4 的结构维护。
+//      版本沿革、历次迁移的核对结论与已执行的迁移动作，全部记录在同目录的
+//      `CHANGE.md` 里；本头部只描述当前行为，不再复述历史。
+//      当前基线下与旧版最关键的一处差异：Agent 的公开生命周期面已收敛，
+//      `agent.phase` 不再是公开 API（公开面为 `agent.status` 与 `agent.whenIdle()`），
+//      脚本内两处相位判断已按此迁移。
 //
 //   1. 插件自动创建与落地（直接写在 `~/.dsh/plugins/` 下，不再套一层 custom/）：
 //      - 自动生成 `~/.dsh/plugins/reflect-command.js`
@@ -34,71 +30,46 @@
 //      - 自动生成 `~/.dsh/plugins/explore-command.js`
 //        （/explore：全面探索工作区项目的架构与实现，产出一份完善的 PROJECT.md）
 //
-//   2. 自建预设迁移与落地（0.1.7 新增）：
-//      - 扫描 `~/.dsh/.agent-presets/<id>/`，按官方迁移口径把每个目录转成
-//        `@deepseek-ai/dsh-agent-preset` 声明行：id 取目录名，
-//        name/description/order 取 preset.yml，plugins 取 agent.cordis.yml 的原样内联；
-//      - 相对资源（如 `./inject-filezone.js`、`./typecheck.js`）复制到
-//        `profiles/web/preset-assets/<id>/` 并同步改写引用（插入行的相对路径
-//        锚定在声明所在 patch 文件的目录）；
-//      - 声明段以固定标记整段重建，幂等且始终位于 profile patch 末尾。
+//   2. 自建预设迁移与落地：
+//      扫描 `~/.dsh/.agent-presets/<id>/`，把每个目录转成一条
+//      `@deepseek-ai/dsh-agent-preset` 声明行（id 取目录名，name/description/order 取
+//      preset.yml，plugins 为 agent.cordis.yml 的原样内联）；相对资源复制到
+//      `profiles/web/preset-assets/<id>/` 并改写引用。声明段以固定标记整段重建，幂等。
 //
-//   3. 旧版 settings.yaml 迁移（0.1.7 新增）：
-//      - 0.1.7 起 `~/.dsh/settings.yaml` 不再是生效源：dsh 只在启动时把它一次性导入
-//        （改名为 .imported，写进同名 Loader 条目），且只接受 volatile 字段，
-//        导入不成的 section 只剩警告、网页端读不到；
-//      - 本脚本用同一套旧名映射把「有同名条目」的 section 直接写进 profile patch
-//        （静态 config 不受 volatile 限制，覆盖面更全），无同名条目的打印丢弃原因；
-//      - 幂等：补丁里已有同名顶层条目的 section 一律跳过，不覆盖你在网页端的修改。
+//   3. 旧版 settings.yaml 迁移：
+//      `~/.dsh/settings.yaml` 不再是生效源（dsh 只在启动时一次性导入，且只接受
+//      volatile 字段）；本脚本用同一套旧名映射把「有同名条目」的 section 直接写进
+//      profile patch（静态 config 不受 volatile 限制，覆盖面更全）。补丁里已有同名
+//      条目的 section 一律跳过，不覆盖网页端的修改。
 //
 //   4. 配置自动注入与挂载：
 //      - 自动检查并更新 `~/.dsh/profiles/web/cordis.patch.yml`，
 //        确保上述插件与迁移内容被持久化包含与挂载（缺失时按需创建）。
-//        注意 0.2.0 起该 profile 层之上还有家目录层 `~/.dsh/cordis.patch.yml`：
+//        注意该 profile 层之上还有家目录层 `~/.dsh/cordis.patch.yml`：
 //        同 id 条目以家目录层为准，本脚本不创建、不改写它。
 //
 //   5. 底层增强补丁全量内嵌应用（幂等执行，一体化集成，无需外置脚本）：
 //      - preset-switch：解除非空白会话锁定（保留「有未闭合回合」这一硬锁），
-//        会话头部按闸门自动降级：可交互下拉的闸门与 AgentPresetSeat 内部完全一致
-//        （开发者工具开关 + 花名册就绪 + 主视图保留），
-//        闸门未开时回退为原只读标签（否则头部标签会整体消失）；
-//      - compaction：压缩阈值改按 surface 计价（该差值即工具 schema 与 provider
-//        用量的漂移，系统提示词已作为 system/message 节点计入 surface），
-//        并让压缩指令忽略规则库与工作流。
-//        ⚠ compact 后端自 0.1.6 起已下沉到 agent preset（预设的 isolate 组内挂载
-//        compaction-basic / command-compact / tool-result-pruner），因此脚本不再在 host 层
-//        强制启用 compaction-basic，并会自动清理旧版本注入的那一行。
+//        并把会话头部标签升级为可交互下拉（闸门未开时回退为原只读标签）；
+//      - compaction：压缩阈值改按 surface 计价，并让压缩指令忽略规则库与工作流。
+//        compact 后端已下沉到 agent preset，因此脚本不在 host 层强制启用
+//        compaction-basic，并会自动清理旧版本注入的那一行。
+//      各补丁的锚点与闸门条件见 applyCorePatches() 内的逐条注释。
 //
-//   6. 工作区与会话完整性内嵌自愈（全内嵌巡检，无需外置脚本，仅在 --apply 流程内执行）：
-//      - 自动扫描归纳迁移/游离会话，恢复归属工作区，消除“未分组”异常；
-//      - 已入册会话一律沿用原归属路径：cwd 暂时不可解析（离线盘/目录已删）也不再丢组；
-//        仅新会话要求 cwd 能解析出真实目录才建立归属（与 dsh-workspace 的校验一致）；
-//      - 扫描覆盖会话日志的**全部代**（session.jsonl 与 session.vN.jsonl，含 .zstd），
-//        并且只重建、不丢账：本次未能入组的旧账一律按原归属保留。
-//   7. 会话管理台（交互菜单第 1 项 / 图形界面第 3 项，无需 dsh 运行）：
-//      - 把 ~/.dsh/sessions/<编码目录名> 反解为可读路径（真实路径优先取会话头 cwd，
-//        取不到才按官方 projectKey() 规则反向解码——该编码对含 - 的段名有损）；
-//      - 逐层列出目录与会话（创建时间/大小/预设/标题/首条消息），支持删除目录或单个会话，
-//        删除后同步摘除 workspace.json 里的归属账目，保证注册表自洽。
-//   8. 会话移动（命令行 m <序号> / 图形界面「移动到…」）：
-//      - 官方把「会话属于哪个目录」编码在 header.cwd，并由它推导磁盘位置，且
-//        dsh-session-persistence-jsonl 会校验「文件实际路径 == logPath(cwd)」，
-//        所以移动必须同时做三件事：改写每一代日志 header 的 cwd、把会话目录搬到
-//        新 projectKey 下、同步 workspace.json 归属；
-//      - header 是「恰好一行」的独立 zstd 帧，只重压第 0 帧、其余帧逐字节保留，
-//        历史事件零改动（已对全部 111 个会话 / 131 代日志做过往返验证）；
-//        尾部若有未写完的帧则**拒绝改写**（那说明正被写入或上次写入中断，
-//        重写会掩盖故障），而不是冒险写出一份截断的日志；
-//      - 执行顺序为「先写目标 → 校验 → 再删源」，任何失败都只回滚目标副本，
-//        源会话保持原样，不会出现两头不完整的中间态；
-//      - 安全闸门：DSH 运行中（Web 端口在监听，或任一会话写锁被占用）一律拒绝移动；
-//        投影缓存（session_projcache）的身份含 cwd，移动后必然失配，故一并清除。
-//   9. 会话管理图形界面（--console，默认 http://127.0.0.1:7788/）：
-//      - 单文件、零依赖、无构建；只监听回环地址，四个接口由本脚本提供；
-//      - 页面是独立源码文件 `~/.dsh/session-console.html`，本脚本只按请求读盘返回，
-//        界面代码不内嵌在本脚本里，改页面无需重跑本脚本；
-//      - 所有磁盘操作复用第 7/8 项的同一套实现，语义与命令行完全一致；
-//      - 界面只做查看/移动/删除会话，不触碰补丁、插件与预设。
+//   6. 工作区与会话完整性内嵌自愈（仅在 --apply 流程内执行）：
+//      自动扫描归纳游离会话、恢复归属工作区；已入册会话沿用原归属路径，绝不因
+//      cwd 暂时不可解析（离线盘/目录已删）而丢组；扫描覆盖日志的全部代，只重建不丢账。
+//   7. 会话管理台（交互菜单第 1 项，无需 dsh 运行）：
+//      把 ~/.dsh/sessions/<编码目录名> 反解为可读路径（优先取会话头 cwd，取不到才按
+//      官方 projectKey() 反向解码——该编码对含 - 的段名有损）；逐层列出目录与会话，
+//      支持删除目录或单个会话，并同步摘除 workspace.json 的归属账目与
+//      session_projcache 投影缓存（缓存按会话身份绑定，日志删除后不清就是死记录）。
+//   8. 会话移动（命令行 m <序号>）：
+//      官方把「会话属于哪个目录」编码在 header.cwd，并校验「文件实际路径 ==
+//      logPath(cwd)」，故移动必须同时改写每一代日志 header 的 cwd、搬迁会话目录、
+//      同步 workspace.json 归属。执行顺序为「先写目标 → 校验 → 再删源」，失败只回滚
+//      目标副本；DSH 运行中（Web 端口在监听或写锁被占用）一律拒绝移动。
+//      机制细节见下文「会话移动引擎」一节。
 // ─────────────────────────────────────────────────────────────────────────────
 
 const fs = require('node:fs')
@@ -116,18 +87,12 @@ const PROFILE_NAME = 'web'
 const PLUGINS_DIR = path.join(DSH_ROOT, 'plugins')
 const WEB_PROFILE_DIR = path.join(DSH_ROOT, 'profiles', PROFILE_NAME)
 const CORDIS_PATCH_FILE = path.join(WEB_PROFILE_DIR, 'cordis.patch.yml')
-// 会话管理界面页面文件：纯静态源码，服务端每次请求读盘返回，改动无需重跑本脚本。
-const SESSION_CONSOLE_FILE = path.join(DSH_ROOT, 'session-console.html')
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 交互入口：会话管理 / 补丁
 //
-// 默认（不带参数）进入命令行菜单，不再立刻改环境；补丁流程用 --apply 触发：
-//   node .js            进入菜单（1 管理会话 / 2 应用补丁 / 3 图形界面 / q 退出）
-//   node .js --console  直接启动会话管理界面（支持跨目录移动会话）
-//   node .js --apply    直接执行全部补丁（等价于旧版行为，便于脚本化）
-//   node .js --list     非交互列出工作区目录（含反向解码路径），便于核对
-//   node .js --list <项目目录名|路径片段>   列出该项目下的会话
+// 默认（不带参数）进入命令行菜单，不立刻改环境；补丁流程用 --apply 触发。
+// 各入口的完整用法见文件头部。
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SESSIONS_DIR = path.join(DSH_ROOT, 'sessions')
@@ -533,6 +498,28 @@ function encodeSegment(raw) {
     return out
 }
 
+/**
+ * 官方 encodeSegment() 的严格逆运算：会话目录名 → 会话 id。
+ *
+ * 该编码是无损可逆的（安全码元原样保留，其余写成 `~XXXX`），所以拿不到会话头时
+ * 仍能从目录名还原出真实 id —— 这比直接用目录名当 id 可靠：后者在 id 含非安全码元
+ * 时（编码成 `~XXXX`）会写出一个永远不匹配的键。
+ * @param name - 会话目录名。
+ * @returns 还原后的会话 id。
+ */
+function decodeSegment(name) {
+    let out = ''
+    for (let i = 0; i < name.length; i += 1) {
+        if (name[i] === '~' && /^[0-9A-Fa-f]{4}$/.test(name.slice(i + 1, i + 5))) {
+            out += String.fromCharCode(parseInt(name.slice(i + 1, i + 5), 16))
+            i += 4
+            continue
+        }
+        out += name[i]
+    }
+    return out
+}
+
 /** 原子写 JSON：先写同目录临时文件再 rename，避免中断留下半个文件。 */
 function writeJsonAtomic(file, value) {
     const tmp = path.join(path.dirname(file), `.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`)
@@ -702,34 +689,24 @@ async function detectRunningDsh() {
 /** DSH Web 的候选端口：官方默认 3080，另附常用备用端口。 */
 const DSH_WEB_PORTS = [3080, 3081, 8080]
 
-/** 从投影缓存读取会话标题（比扫描整篇日志廉价得多；缓存缺失就返回 undefined）。 */
-function readCachedTitle(sessionId) {
-    try {
-        const file = path.join(DSH_ROOT, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)
-        if (!fs.existsSync(file)) return undefined
-        const title = JSON.parse(fs.readFileSync(file, 'utf8'))?.record?.rows?.title?.val
-        return typeof title === 'string' && title.length > 0 ? title : undefined
-    } catch {
-        return undefined
-    }
-}
-
-/** 把会话 id 从注册表摘除，并删除其投影缓存。 */
-function deleteSessionDir(sessionDir) {
-    const logPath = pickSessionLog(sessionDir)
-    let id = path.basename(sessionDir)
-    if (logPath !== undefined) {
+/**
+ * 删除一批会话的投影缓存。
+ *
+ * 缓存记录按「会话身份」（createdAt/cwd/格式代）绑定：会话目录一旦删除，这条记录
+ * 就永远等不到匹配的日志，成为永不失效的死记录。官方不清理它（缓存本身按身份
+ * 失配即丢弃，读路径安全），因此删除动作必须自己收尾。
+ * @param sessionIds - 已删除的会话 id 列表。
+ * @returns 实际尝试清除的条数。
+ */
+function removeProjectionCache(sessionIds) {
+    let removed = 0
+    for (const id of sessionIds) {
         try {
-            id = readSessionHeader(logPath)?.id ?? id
+            fs.rmSync(path.join(DSH_ROOT, 'storages', 'session_projcache', 'sessions', `${id}.json`), { force: true })
+            removed += 1
         } catch { }
     }
-    const size = logPath === undefined ? 0 : fs.statSync(logPath).size
-    fs.rmSync(sessionDir, { recursive: true, force: true })
-    const pruned = pruneWorkspaceState([id])
-    try {
-        fs.rmSync(path.join(DSH_ROOT, 'storages', 'session_projcache', 'sessions', `${id}.json`), { force: true })
-    } catch { }
-    return { id, size, pruned }
+    return removed
 }
 
 /**
@@ -901,7 +878,6 @@ function moveSession(sessionDir, targetInput, options = {}) {
 
 /**
  * 命令行里的交互式移动：收集目标目录、确认后调用 moveSession。
- * 图形界面走同一套 moveSession，因此两条路径的语义完全一致。
  * @param nextLine - 行读取器。
  * @param session - readSessionSummary() 的返回值。
  */
@@ -1014,10 +990,11 @@ async function confirm(nextLine, prompt) {
     return normalized === 'y' || normalized === 'yes'
 }
 
-function reportDeletion(deletedSessionIds, note) {
+function reportDeletion(deletedSessionIds, note, removedCache) {
     const pruned = pruneWorkspaceState(deletedSessionIds)
     console.log(`[删除] ${note}`)
     console.log(`[删除] 工作区账目同步摘除：${pruned.sessions} 个会话归属、${pruned.workspaces} 个已清空的工作区`)
+    console.log(`[删除] 投影缓存已清除 ${removedCache} 条（避免留下永不命中的死记录）`)
     console.log('[删除] 若 dsh 正在运行，请重启后查看侧栏（进程内状态不会热感知磁盘删除）')
 }
 
@@ -1073,7 +1050,7 @@ async function manageOneProject(nextLine, project) {
                 continue
             }
             fs.rmSync(session.sessionPath, { recursive: true, force: true })
-            reportDeletion([session.id], `已删除会话 ${session.id}`)
+            reportDeletion([session.id], `已删除会话 ${session.id}`, removeProjectionCache([session.id]))
             project.sessionDirs = project.sessionDirs.filter((entry) => entry.name !== path.basename(session.sessionPath))
             if (project.sessionDirs.length === 0) {
                 console.log('[提示] 该目录已无会话，可返回上级用 d <序号> 删除整个目录')
@@ -1106,17 +1083,20 @@ async function manageSessions(nextLine) {
             }
             const ids = []
             for (const entry of project.sessionDirs) {
+                let id
                 try {
                     const header = entry.logPath === undefined ? undefined : readSessionHeader(entry.logPath)
-                    if (typeof header?.id === 'string') ids.push(header.id)
+                    if (typeof header?.id === 'string') id = header.id
                 } catch { }
+                // 头读不出来时退回目录名的严格逆编码，绝不拿编码名当 id。
+                ids.push(id ?? decodeSegment(entry.name))
             }
             if (!(await confirm(nextLine, `将永久删除目录 ${project.displayPath}（${project.sessionDirs.length} 个会话，${formatBytes(project.totalBytes)}）`))) {
                 console.log('已取消')
                 continue
             }
             fs.rmSync(project.path, { recursive: true, force: true })
-            reportDeletion(ids, `已删除目录 ${project.dirName}（${project.sessionDirs.length} 个会话）`)
+            reportDeletion(ids, `已删除目录 ${project.dirName}（${project.sessionDirs.length} 个会话）`, removeProjectionCache(ids))
             continue
         }
 
@@ -1146,21 +1126,13 @@ async function runMenu() {
     try {
         for (; ;) {
             console.log('')
-            console.log('  1) 管理会话（按目录查看/删除会话，目录名已反解为可读路径）')
+            console.log('  1) 管理会话（按目录查看/删除/移动会话，目录名已反解为可读路径）')
             console.log('  2) 应用补丁（插件 / 预设 / profile 挂载 / 底层补丁 / 工作区自愈）')
-            console.log('  3) 打开会话管理界面（图形界面，支持跨目录移动会话）')
             console.log('  q) 退出')
             const choice = await promptLine(nextLine, '选择 › ')
             if (choice === undefined || choice.toLowerCase() === 'q' || choice === '') break
             if (choice === '1') await manageSessions(nextLine)
             else if (choice === '2') applyPatchesInProcess()
-            else if (choice === '3') {
-                // 界面服务会接管事件循环，因此先关掉菜单的 readline，避免两边抢 stdin。
-                rl.close()
-                startSessionConsole(7788)
-                console.log('[menu] 界面已启动，本菜单随服务一起驻留；关闭服务窗口即可结束。')
-                return
-            }
             else console.log('无法识别的输入')
         }
     } finally {
@@ -1172,18 +1144,6 @@ async function runMenu() {
 // ── 入口分流：默认进菜单；--apply 才执行补丁 ───────────────────────────────────
 const APPLY_MODE = process.argv.includes('--apply') || process.argv.includes('-a')
 const LIST_INDEX = process.argv.indexOf('--list')
-const CONSOLE_INDEX = process.argv.indexOf('--console')
-const CONSOLE_PORT_INDEX = process.argv.indexOf('--console-port')
-
-// --console：启动会话管理界面（唯一会长期驻留的入口，因此最先分流）。
-// 它不需要 --apply：界面只做会话的查看/移动/删除，不碰补丁与插件。
-if (CONSOLE_INDEX >= 0) {
-    const requested = CONSOLE_PORT_INDEX >= 0 ? Number(process.argv[CONSOLE_PORT_INDEX + 1]) : 7788
-    const port = Number.isInteger(requested) && requested > 0 && requested < 65536 ? requested : 7788
-    startSessionConsole(port)
-    // 服务接管事件循环，不再落入下面的补丁流程。
-    return
-}
 
 if (LIST_INDEX >= 0) {
     const target = process.argv[LIST_INDEX + 1]
@@ -1732,29 +1692,37 @@ module.exports = {
 
     // 压缩总时长上限：压缩会发一次真实的模型请求，输入可达数 MB。
     // 没有上限时，请求一旦悬挂，runMaintenance 的 finally 永不执行，
-    // agent 相位会永久停在 maintenance —— 后续输入全被 latch 住，
+    // agent 会永久停在维护相位 —— 后续输入全被 latch 住，
     // Web 端表现为「刷新不动、切会话持续加载」。这是必须兜底的根因。
     const COMPACTION_TIMEOUT_MS = 5 * 60 * 1000
 
     /**
-     * 等待 agent 真正可执行维护压缩。
+     * 等待 agent 真正静止（既无活动回合，也不在维护中）。
      *
-     * 绝不能用 agent.whenIdle()：它的实现是 \`await this.activityDone\`，而
-     * runMaintenance 自己就把 activityDone 设成了本次维护的 promise，从维护
-     * 内部调用必然自我死锁。也不能用 agent.status —— 该 getter 把 maintenance
-     * 相位也算作 'idle'，无法区分「真空闲」与「正在维护」。
+     * 判据用公开的 \`agent.whenIdle()\`：它等到 activityDone 链收敛，而维护任务
+     * 同样会占据 activityDone，所以「真空闲」与「正在维护」都能区分——这正是
+     * \`agent.status\` 做不到的（该 getter 把 maintenance 相位也报成 'idle'）。
+     * \`agent.phase\` 是 agent-loop 的内部实现，不是公开 API，不得依赖。
      *
-     * 唯一可靠的判据是相位本身：只有 kind === 'idle' 才能进入维护。
+     * 本函数在 compactNow 之前调用，不在维护任务内部，因此不会触发
+     * 「runMaintenance 把 activityDone 设成本次维护 promise」导致的自我死锁；
+     * 死锁只在维护内部调用 whenIdle 时才会发生。
      * @param {object} agent - 目标 agent。
      * @param {number} deadline - 等待截止时间戳（毫秒）。
-     * @returns {Promise<boolean>} 是否等到空闲。
+     * @returns {Promise<boolean>} 是否等到静止。
      */
     async function waitForIdle(agent, deadline) {
-      for (;;) {
-        const phase = agent.phase
-        if (phase === undefined || phase.kind === 'idle') return true
-        if (Date.now() > deadline) return false
-        await new Promise((resolve) => setTimeout(resolve, 200))
+      if (typeof agent.whenIdle !== 'function') return true
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return false
+      let timer
+      try {
+        return await Promise.race([
+          agent.whenIdle().then(() => true),
+          new Promise((resolve) => { timer = setTimeout(() => resolve(false), remaining) }),
+        ])
+      } finally {
+        clearTimeout(timer)
       }
     }
 
@@ -1942,19 +1910,14 @@ module.exports = {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 内嵌资源 C：preset-hotreload-and-meter.js
+// 插件内部注释已详述实现依据；此处只记脚本层面必须知道的几点：
+//   - `agentPresets.recompose(ctx, id)` 会把已有绑定切到新 generation，但它内部的
+//     retain() 会命中缓存，所以必须等 dsh-hmr 真正重建完声明行之后再调用，否则只是
+//     重绑到旧修订（这正是 flush 要延迟 250ms 的原因）。
+//   - `agent.phase` 不是公开 API（公开面为 `agent.status` 与 `agent.whenIdle()`），
+//     本插件的空闲判据不读内部相位。
+//   - 上下文计量的呈现层修正由第 4.4 号补丁完成，本插件不再覆盖 contextBreakdown 投影。
 // ─────────────────────────────────────────────────────────────────────────────
-// 解决两大问题：
-// 1. 预设热重载：预设声明已改由 profile patch 承载（见脚本第 3 节），dsh-hmr 会在
-//    patch 文件变更时重放整层；本插件在其后把已运行的会话重绑到新修订，实时生效无需重启。
-//    实现依据（0.1.7 实测，0.2.0-rc.2 复核）：
-//      - `agentPresets.resolve(id)` 只返回 { id, broken? }，不再有 path，旧版按
-//        组装文件路径取戳的判据已不可用；判据改为「预设行重新初始化」+「patch 文件戳」。
-//      - `agentPresets.recompose(ctx, id)` 仍会把已有绑定切到新 generation
-//        （bind → binding.parent.rebind），但 retain() 会命中缓存，故必须等重放真正
-//        重建声明行之后再调用，否则只是重绑到旧修订。
-//      - 官方语义是「已有会话保持启动时的修订」，所以这一步是必需的，不是冗余。
-// 2. 上下文计量说明：原用于覆盖 contextBreakdown 投影的代码已移除（理由见插件内注释），
-//    呈现层的总量对齐由脚本第 4.4 号补丁完成。
 const PRESET_HOTRELOAD_AND_METER_CODE = `'use strict'
 
 const fs = require('node:fs')
@@ -1975,7 +1938,7 @@ module.exports = {
     const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 
     // ── 1. 预设热重载 ───────────────────────────────────────────────────────────
-    // 0.1.7 起预设不再是 ~/.dsh/.agent-presets/<id>/ 目录，而是 patch 层里的
+    // 预设不再是 ~/.dsh/.agent-presets/<id>/ 目录，而是 patch 层里的
     // @deepseek-ai/dsh-agent-preset 声明行；dsh-hmr 会监听下列 patch 文件，并在
     // 变更时重放整层（行 dispose 后重新 init，注册表随之拿到新修订）。
     // 官方语义是「已有会话保持启动时的修订」，所以本插件只补最后一步：
@@ -2009,6 +1972,27 @@ module.exports = {
       }, 250)
     }
 
+    /**
+     * 会话当前是否真正静止（无活动回合，也不在维护中）。
+     *
+     * \`agent.status\` 在维护期间仍报 'idle'（官方语义：runMaintenance 执行时
+     * public status stays idle），所以单看 status 无法区分「真空闲」与「正在维护」；
+     * \`agent.phase\` 又是 agent-loop 的内部实现，不是公开 API。这里用公开的
+     * \`agent.whenIdle()\` 做即时探测：真空闲时它在微任务内就 resolve，
+     * 维护或回合进行中则要等，因此给一个很短的等待窗——等不到就按「忙」处理。
+     * 语义：忙的会话本次跳过重绑，等下一次 patch 变更再试。
+     * @param {object} agent - 目标 agent。
+     * @returns {Promise<boolean>} 是否可立即重绑。
+     */
+    const quiescentNow = (agent) => {
+      if (typeof agent.whenIdle !== 'function') return Promise.resolve(true)
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(false), 50)
+        const settle = (value) => { clearTimeout(timer); resolve(value) }
+        agent.whenIdle().then(() => settle(true), () => settle(false))
+      })
+    }
+
     const flush = async () => {
       const ids = [...changedPresetIds]
       changedPresetIds.clear()
@@ -2023,8 +2007,12 @@ module.exports = {
         }
         if (presetId === undefined) continue
         if (ids.length > 0 && !ids.includes(presetId)) continue
-        if (agent.phase !== undefined && agent.phase.kind !== 'idle') {
-          console.log('[preset-hotreload] 会话 ' + agent.id + ' 正处于 ' + agent.phase.kind + ' 相位，本次跳过重绑')
+        if (agent.status !== undefined && agent.status !== 'idle') {
+          console.log('[preset-hotreload] 会话 ' + agent.id + ' 状态为 ' + agent.status + '，本次跳过重绑')
+          continue
+        }
+        if (!(await quiescentNow(agent))) {
+          console.log('[preset-hotreload] 会话 ' + agent.id + ' 仍在活动或维护中，本次跳过重绑')
           continue
         }
         targets.push({ agent, presetId })
@@ -2103,10 +2091,6 @@ module.exports = {
 // ─────────────────────────────────────────────────────────────────────────────
 // 内嵌资源 D：explore-command.js
 // ─────────────────────────────────────────────────────────────────────────────
-// /explore 与 /reflect 同构（注册命令 → steer 一个带完整指令的模型回合），
-// 但对象是代码仓库而非会话历史：产出 PROJECT.md。
-// 项目根取「最近含 .git 的祖先目录」，与会话 cwd 可能不同（cwd 常是仓库子目录），
-// 这与 dsh-skill-filesystem 的发现口径一致。
 const EXPLORE_COMMAND_CODE = `'use strict'
 
 // explore-command.js —— 工作区项目全面探索插件 (/explore)
@@ -2247,56 +2231,18 @@ module.exports = {
 // ─────────────────────────────────────────────────────────────────────────────
 // 内嵌资源 E：idle-guard.js
 // ─────────────────────────────────────────────────────────────────────────────
-// 落盘拦截规则，有两种模式：
+// 落盘拦截规则，两种模式：默认（普通提交键）不拦截任何调用；武装（界面按钮发起）
+// 由客户端先 POST /idle-arm/arm 置位，随后按检查点拦截非落盘调用，持续到回合结束。
+// 时间曲线、三阶段压力、计数器分工等设计理由全部写在插件内部注释里（随插件一起
+// 落盘到 ~/.dsh/plugins/idle-guard.js），此处不重复。
 //
-//   1. 默认（普通提交键）：不拦截任何调用。模型可以自由读取、检索、推理。
-//   2. 武装（界面上的按钮发起）：客户端先 POST /idle-arm/arm 把该会话置为武装，
-//      再走正常提交把用户草稿送出。自回合开始（或上次落盘）起，按**检查点**拦截
-//      非落盘的工具调用，武装持续到回合结束。
-//
-// 拦截时间曲线：设起拦时间为 S（用户对本次任务耗时的预估），单段间隔
-//     gap = max(3, ceil(S / 2))
-// 第 k 个检查点落在 T(k) = S + (k-1)·gap。四条设计约束：
-//   · 首个检查点就是 S——在用户自己声明的预算内不干预，这正是「起拦时间」的字面含义。
-//   · 间隔全部由 S 推导，时间表里没有任何与 S 无关的绝对分钟数：S 大的任务疏、
-//     S 小的任务密。旧的 S、S+1、S+2… 递增曲线里的那个「+1 分钟」是凭空的绝对量，
-//     对 S=3 和 S=300 一视同仁地加一分钟，既不随任务规模伸缩，也说不出来由。
-//   · 为什么取 S/2：S 这种量级的人工预估本身就有两倍上下的误差（计划谬误的量级）。
-//     比 S/2 更密就落进预估自身的噪声带，警告退化成重复打扰；比 S/2 更疏，盲区就
-//     超过用户自认可接受时长的一半，限时失去意义。
-//   · 下限 3 分钟：一次警告要被读、被判断、被落实成一次落盘，短于 3 分钟做不到，
-//     更密的检查点只会打断正在进行的有效工作。下限同时约束首段，因此输入下限也
-//     提到 3——否则 S=1 时首段就是 1 分钟，「每段不少于 3 分钟」不成立。
-// S=3 时曲线为 3、6、9、12…；S=10 时为 10、15、20、25…；S=30 时为 30、45、60…
-//
-// 拦截分三个阶段，压力随「已送达的拦截次数」递增。阶段与曲线是正交的两件事：
-// **曲线管何时允许拦**（节奏），**阶段管措辞与重复方式**（压力）。闸门取
-// passed > served，所以升级的时机仍由 T(1)、T(2)、T(3)… 决定，模型不会在 T(1)
-// 被软拦后立刻吃到严厉与强制——升级要等曲线走到下一个检查点。
-//
-//   阶段一（软拦截）：措辞不变，拦一次即升到阶段二。
-//   阶段二（严厉）  ：措辞更严厉，且要连拦两次——第一次拦下后不升级，模型再调用
-//                     一次才会吃到第二次，两次都吃过才升到阶段三。
-//   阶段三（闩锁）  ：不再看时钟，每一次非落盘调用都被拒，直到出现一次落盘。
-//
-// 一次落盘把三个阶段全部复位（served=0），计时也从那一刻重新起算：落盘就是本规则
-// 要的结果，压力理应全部释放。武装本身保留到回合结束，所以复位之后还会再拦——
-// 否则模型写一行就再也不会被拦。
-//
-// 每一级都保留「尚未落盘 / 落盘后又空转」两套措辞：模型明明落过盘却被说成
-// 「从未编辑」，会把它往错误方向推，这条区分在任何一级都成立。
-//
-// 基准取会话自身的回合计时（turn/start 事件的 time），即界面左下角「深度求索中，
-// 用时」的同一个起点，因此本规则与用户看到的计时永远一致，不另起一套时钟。
-// 回合中途才武装时，基准改取武装时刻——否则该回合已积累的时长会立刻触发拦截，
-// 用户刚设定的起拦时间形同虚设。
-//
-// 为什么不用宿主命令传递分钟数：`session.command()` 执行的是宿主斜杠命令，
-// 它既不读也不提交输入框草稿——空草稿会照样推一条命令流程，有草稿时用户输入
-// 反而永远发不出去。武装必须是「静默的旁路」，与提交动作分开。
-//
-// 结算必须发生在 step/end 而不是单次调用：模型常在一个批次里并发调用多个工具，
-// 若按调用结算，批次里第一个被拒后其余会全部放行——那正是要堵住的漏洞。
+// 脚本层面需要知道的两点：
+//   1. 武装为什么不用宿主命令传递分钟数：`session.command()` 执行的是宿主斜杠命令，
+//      它既不读也不提交输入框草稿——空草稿会照样推一条命令流程，有草稿时用户输入
+//      反而永远发不出去。武装必须是「静默的旁路」，与提交动作分开。
+//   2. 基准取会话自身的回合计时（turn/start 事件的 time），即界面左下角「深度求索中，
+//      用时」的同一个起点，因此本规则与用户看到的计时永远一致，不另起一套时钟。
+// ─────────────────────────────────────────────────────────────────────────────
 const IDLE_GUARD_CODE = `'use strict'
 
 // idle-guard.js —— 闲置落盘拦截（宿主级持久插件）
@@ -2675,177 +2621,8 @@ fs.writeFileSync(IDLE_ARM_HOST, IDLE_ARM_HOST_CODE, 'utf8')
 if (!fs.existsSync(IDLE_ARM_CLIENT)) console.warn(`[plugins] 缺少 ${IDLE_ARM_CLIENT}（界面按钮不会出现）`)
 console.log(`[plugins] idle-arm 双面插件就位: ${IDLE_ARM_DIR}`)
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 会话管理 HTTP 服务（session-console）
-//
-// 只监听回环地址，只服务一个静态页面与四个接口。所有磁盘操作复用上面的
-// moveSession / deleteSessionDir / loadProjectEntries，与命令行菜单同源。
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** 组装界面所需的目录与会话清单（含标题，标题优先取投影缓存以免读整篇日志）。 */
-function buildConsolePayload() {
-    const projects = loadProjectEntries().map((project) => ({
-        dirName: project.dirName,
-        displayPath: project.displayPath,
-        exact: project.exact,
-        newest: project.newest,
-        sessionCount: project.sessionDirs.length,
-        sessions: project.sessionDirs.map((entry) => {
-            const summary = readSessionSummary(entry.path)
-            const cached = readCachedTitle(summary.id)
-            return {
-                id: summary.id,
-                title: summary.title ?? cached,
-                firstUserText: oneLine(summary.firstUserText, 200),
-                agentPreset: summary.header?.agentPreset,
-                cwd: summary.header?.cwd,
-                lastTime: summary.lastTime,
-                size: summary.size,
-                sessionPath: entry.path,
-            }
-        }),
-    }))
-    return { root: SESSIONS_DIR, projects }
-}
-
-/** 读取请求体并解析 JSON。 */
-function readJsonBody(request) {
-    return new Promise((resolve, reject) => {
-        let raw = ''
-        request.on('data', (chunk) => {
-            raw += chunk
-            if (raw.length > 1024 * 1024) reject(new Error('请求体过大'))
-        })
-        request.on('end', () => {
-            try {
-                resolve(raw.length === 0 ? {} : JSON.parse(raw))
-            } catch {
-                reject(new Error('请求体不是合法 JSON'))
-            }
-        })
-        request.on('error', reject)
-    })
-}
-
-function sendJson(response, status, payload) {
-    const body = JSON.stringify(payload)
-    response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
-    response.end(body)
-}
-
-/**
- * 启动会话管理界面服务。
- * @param port - 监听端口。
- * @returns 用于打印的访问地址。
- */
-function startSessionConsole(port) {
-    const http = require('node:http')
-    const server = http.createServer(async (request, response) => {
-        const url = new URL(request.url, `http://127.0.0.1:${port}`)
-        try {
-            if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
-                if (!fs.existsSync(SESSION_CONSOLE_FILE)) {
-                    response.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
-                    response.end(`界面文件不存在：${SESSION_CONSOLE_FILE}`)
-                    return
-                }
-                response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
-                response.end(fs.readFileSync(SESSION_CONSOLE_FILE, 'utf8'))
-                return
-            }
-
-            if (request.method === 'GET' && url.pathname === '/api/list') {
-                const status = await detectRunningDsh()
-                sendJson(response, 200, { ...buildConsolePayload(), running: status.running, runningReasons: status.reasons })
-                return
-            }
-
-            if (request.method === 'POST' && url.pathname === '/api/quit') {
-                sendJson(response, 200, { ok: true })
-                console.log('[console] 收到退出请求，服务关闭。')
-                setTimeout(() => { server.close(); process.exit(0) }, 120)
-                return
-            }
-
-            if (request.method === 'POST' && url.pathname === '/api/move') {
-                const body = await readJsonBody(request)
-                const status = await detectRunningDsh()
-                if (status.running) {
-                    sendJson(response, 409, { error: `DSH 正在运行，已拒绝移动。\n${status.reasons.join('\n')}` })
-                    return
-                }
-                const sessionPath = resolveConsoleSessionPath(body.dir, body.session)
-                const result = moveSession(sessionPath, body.target, { create: body.create === true })
-                console.log(`[console] 已移动会话 ${result.id}: ${result.from ?? '(无 cwd)'} → ${result.to}`)
-                sendJson(response, 200, { ok: true, id: result.id, from: result.from, to: result.to })
-                return
-            }
-
-            if (request.method === 'POST' && url.pathname === '/api/delete') {
-                const body = await readJsonBody(request)
-                const status = await detectRunningDsh()
-                if (status.running) {
-                    sendJson(response, 409, { error: `DSH 正在运行，已拒绝删除。\n${status.reasons.join('\n')}` })
-                    return
-                }
-                const sessionPath = resolveConsoleSessionPath(body.dir, body.session)
-                if (probeSessionLock(sessionPath) === 'held') {
-                    sendJson(response, 409, { error: '该会话的写锁被占用（DSH 正在写入），已拒绝删除。' })
-                    return
-                }
-                const removed = deleteSessionDir(sessionPath)
-                console.log(`[console] 已删除会话 ${removed.id}`)
-                sendJson(response, 200, { ok: true, id: removed.id })
-                return
-            }
-
-            sendJson(response, 404, { error: '未找到该接口' })
-        } catch (error) {
-            sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
-        }
-    })
-
-    server.on('error', (error) => {
-        if (error.code === 'EADDRINUSE') console.error(`[console] 端口 ${port} 已被占用，请用 --console-port 指定其它端口。`)
-        else console.error('[console] 服务异常:', error.message)
-    })
-
-    server.listen(port, '127.0.0.1', () => {
-        const address = `http://127.0.0.1:${port}/`
-        console.log('')
-        console.log('=============================================================')
-        console.log(`🖥  会话管理界面已启动：${address}`)
-        console.log(`    页面文件：${SESSION_CONSOLE_FILE}`)
-        console.log('    浏览器会自动打开；关闭本窗口或点页面上的「退出服务」即可停止。')
-        console.log('=============================================================')
-        console.log('')
-        try {
-            spawnSync('cmd', ['/c', 'start', '', address], { stdio: 'ignore', windowsHide: true })
-        } catch { }
-    })
-
-    return server
-}
-
-/** 校验界面传来的「目录序号 + 会话 id」，解析出真实的会话目录路径。 */
-function resolveConsoleSessionPath(dirIndex, sessionId) {
-    const index = Number(dirIndex)
-    if (!Number.isInteger(index)) throw new Error('目录序号无效')
-    const project = loadProjectEntries()[index]
-    if (project === undefined) throw new Error('目录序号超出范围，请刷新后重试')
-    for (const entry of project.sessionDirs) {
-        let id
-        try {
-            const logPath = pickSessionLog(entry.path)
-            id = logPath === undefined ? undefined : readSessionHeader(logPath)?.id
-        } catch { }
-        if (id === sessionId) return entry.path
-    }
-    throw new Error('未在该目录下找到指定会话，请刷新后重试')
-}
-
-// 3. 自建预设迁移：把旧版目录预设转成 0.1.7 的声明式预设
-//    0.1.7 已彻底移除对 ~/.dsh/.agent-presets/<id>/ 目录的读取（官方 skill
+// 3. 自建预设迁移：把旧版目录预设转成声明式预设
+//    官方已彻底移除对 ~/.dsh/.agent-presets/<id>/ 目录的读取（官方 skill
 //    `editing-cordis-compositions` 原文：Nothing reads that directory any more）。
 //    现在一个预设就是一条 `@deepseek-ai/dsh-agent-preset` 声明行，config 为
 //    { id, name, description, order, plugins }，plugins 即旧 agent.cordis.yml 的条目列表。
@@ -2936,7 +2713,7 @@ function buildPresetDeclarationsBlock() {
     const header = [
         PRESET_BLOCK_BEGIN,
         '# 本节由 ~/.dsh/.js 依据 ~/.dsh/.agent-presets/<id>/ 自动生成，请勿手改本段。',
-        '# 旧目录预设自 0.1.7 起不再被读取：每个目录在此转成一条声明行，',
+        '# 旧目录预设不再被读取：每个目录在此转成一条声明行，',
         '# name/description/order 取自 preset.yml，plugins 为 agent.cordis.yml 的原样内联；',
         '# 相对资源已复制到 profiles/web/preset-assets/<id>/ 并改写引用。',
     ].join('\n')
@@ -2944,9 +2721,9 @@ function buildPresetDeclarationsBlock() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3.5 旧版 settings.yaml 迁移（0.1.7 起「设置」改存 profile 补丁）
+// 3.5 旧版 settings.yaml 迁移（「设置」改存 profile 补丁）
 //
-// 0.1.7 的 dsh-settings 只在启动时把 ~/.dsh/settings.yaml 一次性导入——先改名为
+// dsh-settings 只在启动时把 ~/.dsh/settings.yaml 一次性导入——先改名为
 // settings.yaml.imported，再逐 section 写进「同名 Loader 条目」的 config；且它只接受
 // 声明为 volatile 的字段（write() 里三道拒绝：无同名条目 / 无 volatile 字段 /
 // 该字段非 volatile）。导入不成的 section 只打一条警告，值就永远留在 .imported 里，
@@ -3000,7 +2777,7 @@ function yamlModule() {
  * 把 legacy 文档归一化成「待迁移条目」清单。
  *
  * 两种历史形状都必须认：
- *   - 0.1.7 起的顶层数组：每项已是一条完整的 Loader 条目 `{ id, name?, config? }`，
+ *   - 顶层数组：每项已是一条完整的 Loader 条目 `{ id, name?, config? }`，
  *     条目 id 直接可用，不经旧名映射；
  *   - 更早的 section 映射：`{ <section>: <values> }`，section 名经
  *     LEGACY_SECTION_ENTRIES 映射成现行条目 id。
@@ -3192,7 +2969,7 @@ function buildLegacySettingsBlock(patchContent, profileName) {
     const header = [
         LEGACY_SETTINGS_BLOCK_BEGIN,
         `# 由 ~/.dsh/.js 从 ${legacy.source} 迁移而来，请勿手改本段。`,
-        '# 0.1.7 起 settings.yaml 不再是生效源：设置一律存在本 profile 补丁里。',
+        '# settings.yaml 不再是生效源：设置一律存在本 profile 补丁里。',
         '# 已在其他位置出现同名条目的 section 不会被覆盖（会打印在运行日志里）。',
     ].join('\n')
     return { text: `${header}\n${rows.join('\n\n')}\n`, imported, skipped, dropped }
@@ -3221,8 +2998,8 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     const absIdleGuard = pathToFileURL(idleGuardPath).href
     const absIdleArm = pathToFileURL(IDLE_ARM_HOST).href
 
-    // 1. 不再在 host 层启用 compaction-basic（同时自愈：删除旧版本脚本注入的那一行）。
-    //    0.1.6 的 dsh-web-app bundle 明确把该 host 行置为 disabled，压缩后端整体下沉到
+    // 1. 不在 host 层启用 compaction-basic（同时自愈：删除旧版本脚本注入的那一行）。
+    //    dsh-web-app bundle 明确把该 host 行置为 disabled，压缩后端整体下沉到
     //    agent preset：standard 预设在自己的 isolate 组里挂载 compaction-basic /
     //    command-compact / tool-result-pruner。若 host 层再挂一个引擎，由于其 auto 默认为
     //    true（会注册 agent/pre-step 自动压缩），将与预设实例对同一会话重复触发压缩，
@@ -3236,7 +3013,7 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     const legacyCompactionPattern = /(^|\n)- id: compaction-basic\n  disabled: false\n?/
     if (legacyCompactionPattern.test(patchContent)) {
         patchContent = patchContent.replace(legacyCompactionPattern, '\n').replace(/\n{3,}/g, '\n\n').trim()
-        console.log('  [profile] 已移除旧的 host 层 compaction-basic 启用行（0.1.6 压缩后端由 agent preset 提供）')
+        console.log('  [profile] 已移除旧的 host 层 compaction-basic 启用行（压缩后端由 agent preset 提供）')
     }
 
     // 挂载位置：托管区块（legacy 设置 / 预设声明）必须固定位于文件末尾，因此新条目
@@ -3385,7 +3162,7 @@ function applyCorePatches(baseDir) {
     if (!fs.existsSync(baseDir)) return
 
     // 4.1 preset-switch: 后端 agent 预设注册表解除非空白会话限制
-    //     0.1.7 的包名变更：dsh-agent-presets（复数）已拆成
+    //     包名沿革：dsh-agent-presets（复数）已拆成
     //     dsh-agent-preset（声明插件）与 dsh-agent-preset-registry（`agentPresets` 服务）。
     //     补丁目标的 select() 现位于 dsh-agent-preset-registry/lib/index.js，
     //     仍以 `boundary !== void 0 && (boundary.openTurnStartSeq !== null || boundary.lastTurn > 0)`
@@ -3430,7 +3207,7 @@ function applyCorePatches(baseDir) {
 						inject: labelInjected
 					}, AgentPresetLabel);`
         // AgentPresetLabel 被刻意设计为只读（其源码注释：会话一旦开始，组成即固定），
-        // 交互面在 0.2.0 移到了新会话首屏的 conversation.hero.agentPreset 插槽。这里把
+        // 交互面位于新会话首屏的 conversation.hero.agentPreset 插槽。这里把
         // 二者合进会话头部：闸门条件与 AgentPresetSeat 内部的渲染门完全一致，
         // 保证「渲染下拉」与「回退只读标签」互斥且不留空白：
         //   1. developerTools —— hooks.developerTools，值取自
@@ -3491,14 +3268,14 @@ function applyCorePatches(baseDir) {
     }
 
     // 4.3 compaction: 压缩阈值改按 surface 计价 + 压缩提示词忽略规则库
-    //     tokenMeter.measure() 的返回形态（0.1.6 起，0.2.0-rc.2 复核未变）为 { logRevision, baseline, surfaceDeltaTokens,
-    //     totalTokens, surfaceTokens, nodes }：
+    //     tokenMeter.measure() 的返回形态为
+    //     { logRevision, baseline, surfaceDeltaTokens, totalTokens, surfaceTokens, nodes }：
     //       totalTokens   = provider usage 锚定的「真实请求规模」（含工具 schema）
     //       surfaceTokens = 当前 surface（system/message + 会话消息）的启发式计价
     //     两者之差因此是「工具 schema（estimateToolsTokens）+ provider 用量漂移」；
     //     系统提示词已经作为 system/message 节点计入 surfaceTokens，所以本补丁的实际语义
-    //     是「忽略工具 schema 对压缩阈值的压力」，而非早期版本的「剥离系统提示词压力」。
-    //     已复核 0.2.0-rc.2：measure() 返回值未变，compaction-basic 里的三处判断
+    //     是「忽略工具 schema 对压缩阈值的压力」，而非「剥离系统提示词压力」。
+    //     该形态在 0.2.1-alpha.4 复核未变，compaction-basic 里的三处判断
     //     （两处 return null、一处 return result）仍是原文，补丁锚点全部命中。
     const compactionBasicFile = path.join(baseDir, 'node_modules', '@deepseek-ai', 'dsh-compaction-basic', 'lib', 'index.js')
     if (fs.existsSync(compactionBasicFile)) {
@@ -3647,7 +3424,7 @@ function syncWorkspaces(dshRoot, force = false) {
 
     // 会话日志按「代」存储：第 0 代是 `session.jsonl`，其后每一代在 `.jsonl` 前带
     // `.vN`（见 dsh-session-format 的 CANONICAL_LOG_FILENAME），压缩后追加 `.zstd`。
-    // 0.1.7 的活跃会话大量落在 v3/v4：旧版扫描只认 `session.jsonl(.zstd)`，会整片
+    // 活跃会话大量落在 v3/v4：只认 `session.jsonl(.zstd)` 的扫描会整片
     // 漏掉新代日志；而下面的重建只写回「扫描到的」会话，于是这些会话连同账目一起
     // 消失，侧栏显示为「未分组」。因此扫描必须覆盖全部代。
     // 同一目录多代并存时取版本最高的一代（低代是迁移前的残留）；`.bak`/临时文件
@@ -3835,7 +3612,7 @@ function syncWorkspaces(dshRoot, force = false) {
     // 两种来源：扫描不到的会话目录（新代日志、文件名未预期、文件暂不可读），
     // 以及扫描到但 cwd 不可解析的已入册会话（离线盘、目录已删）。
     // 官方记录同样保留这些槽位——视图会按 sessionPath 过滤掉它们，但账目本身不动；
-    // 一旦在这里丢弃，归属链接就永久断了（0.1.7 新代日志被漏扫时的事故正是如此）。
+    // 一旦在这里丢弃，归属链接就永久断了（新代日志被漏扫时的事故正是如此）。
     // 原工作区记录（路径、标题、时间戳）一并保留，并且必须进入 workspaceIds：
     // dsh-workspace 的 validateStoredState() 要求顺序表与表项严格一一对应。
     let preservedAccounts = 0
