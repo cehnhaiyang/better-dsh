@@ -85,7 +85,12 @@ window.__ModuleLoader__.load({
       'background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
       '.dshIdleArm_trigger:disabled{cursor:default;opacity:.6}',
       '.dshIdleArm_triggerArmed{color:var(--dsw-alias-label-primary-bluish);border-color:var(--dsw-alias-button-info-fill)}',
-      '.dshIdleArm_panel{box-sizing:border-box;width:260px;padding:12px;',
+      // position:fixed 是必需的，不是样式偏好：useAnchoredPosition 返回的是视口坐标
+      // （left/top），只有 fixed 才把它当视口定位。缺少它时元素按 static/relative 参与
+      // 文档流，top 变成「距文档顶部」——面板会被推到页面下方几千像素处，看起来就是
+      // 「点了按钮没反应」。宿主自带的 MenuSurface 使用者（如 ui-jobs）同样在样式里
+      // 声明 position:fixed，这里必须对齐。
+      '.dshIdleArm_panel{position:fixed;z-index:100;box-sizing:border-box;width:260px;padding:12px;',
       'border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md);',
       'background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);',
       'font-family:var(--dsw-font-family);font-size:12px;line-height:18px;',
