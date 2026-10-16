@@ -1,0 +1,87 @@
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      cline:
+        displayName: cline
+        apiKeyEnv: CLINE_API_KEY
+        api: openai-completions
+        baseURL: https://api.cline.bot/api/v1/
+        models:
+          - id: deepseek/deepseek-4.1-falsh
+            name: deepseek/deepseek-4.1-falsh
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+            contextWindow: 1000000
+      gcli2api:
+        displayName: gcli2api
+        apiKeyEnv: GCLI2API_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:7861/antigravity/v1
+        defaultContextWindow: 1000000
+        models:
+          - id: gemini-3.8-flash-high
+            name: gemini-3.8-flash-high
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+          - id: claude-sonnet-4-6
+            name: claude-sonnet-4-6
+      agent2api:
+        displayName: agent2api
+        apiKeyEnv: AGENT2API_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:3065/v1
+        models:
+          - id: glm-5.3
+            name: glm-5.3
+            contextWindow: 1000000
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+          - id: GLM-5.3
+            name: GLM-5.3
+            contextWindow: 1000000
+          - id: cn:deepseek-v4.1-flash
+            name: cn:deepseek-v4.1-flash
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+          - id: global:deepseek-v4.1-flash
+            name: global:deepseek-v4.1-flash
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+          - id: Qwen3.8-Flash
+            name: Qwen3.8-Flash
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+          - id: deepseek-v4.1-flash
+            name: deepseek-v4.1-flash
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
