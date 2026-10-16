@@ -1,12 +1,14 @@
 // idle-arm 客户端半边。
 //
-// 职责只有一个：在提交键左侧放一个「武装」按钮，把起拦分钟数交给本会话。
+// 一个「落盘拦截」按钮：点开一个小面板配置起栏时间，确认后把分钟数交给宿主置位，
+// 并自动提交当前输入——全程不需要用户再按一次提交键或回车。
+//
 // 落盘拦截的规则、计时曲线与拦截端点全在 ~/.dsh/plugins/idle-guard.js 里
-// （宿主半边 POST /idle-arm/arm）；这里只负责发起那一次 POST。
+// （宿主半边 POST /idle-arm/arm）；这里只负责「配置 + 置位 + 提交」这一串动作。
 //
 // 为什么武装要单独走一个旁路 POST，而不是提交一条宿主斜杠命令：session.command()
 // 会把输入框草稿一并推成命令流程——空草稿也能推一条，有草稿时用户输入反而发不出去。
-// 武装必须是静默的置位动作，与提交动作彻底分开。
+// 武装必须是静默的置位动作，与提交动作彻底分开；提交则由本控件在置位成功后显式发起。
 //
 // 模块身份：id 必须等于 package.json 的 name（client-modules 会校验
 // window.__ModuleLoader__.load 注册的 id 与它在 boot manifest 里请求的 id 一致）。
@@ -14,6 +16,7 @@ window.__ModuleLoader__.load({
   id: 'dsh-plugin-idle-arm',
   factory: (require) => {
     const React = require('react')
+    const ReactDOM = require('react-dom')
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
 
     // 宿主端点。与 open-in-app 等宿主路由同一约定：去掉前导斜杠写成相对路径，
@@ -24,101 +27,126 @@ window.__ModuleLoader__.load({
     const MIN_MINUTES = 3
     const MAX_MINUTES = 600
     const DEFAULT_MINUTES = 10
+    const VIEWPORT_MARGIN = 12
+    const MENU_GAP = 5
+    // 未定位时的面板样式：隐藏但保持可布局，以便首次定位能测到真实尺寸。
+    const MEASURE_STYLE = { visibility: 'hidden', left: 0, top: 0 }
 
     const NS = 'idle-arm'
     const zh = {
-      'action.arm': '武装落盘拦截',
-      'action.arming': '正在武装…',
-      'action.armed': '已武装 {minutes} 分钟',
-      'action.aria': '武装落盘拦截：{minutes} 分钟后开始拦截非落盘调用',
-      'field.minutes': '起拦分钟数',
-      'field.minutes.aria': '起拦分钟数（3 到 600）',
-      'hint': '武装后，本回合内长时间不落盘的工具调用会被拦截并警告。',
-      'error.failed': '武装失败：{message}',
-      'error.range': '起拦分钟数需在 3 到 600 之间',
-      'error.unavailable': '当前会话不可用'
+      'trigger': '落盘拦截',
+      'trigger.armed': '落盘拦截 {minutes} 分',
+      'trigger.aria': '落盘拦截设置',
+      'panel.title': '落盘拦截',
+      'panel.minutes': '起栏时间（分钟）',
+      'panel.hint': '确认后将开始计时：超时未落盘的调用会被拦截并警告，直到出现一次文件编辑。',
+      'action.confirm': '确认并发送',
+      'action.confirming': '正在置位…',
+      'action.cancel': '取消',
+      'error.range': '起栏时间需在 3 到 600 分钟之间',
+      'error.failed': '置位失败：{message}'
     }
     const en = {
-      'action.arm': 'Arm write guard',
-      'action.arming': 'Arming…',
-      'action.armed': 'Armed for {minutes} min',
-      'action.aria': 'Arm the write guard: intercept non-writing calls after {minutes} minutes',
-      'field.minutes': 'Trigger minutes',
-      'field.minutes.aria': 'Trigger minutes (3 to 600)',
-      'hint': 'Once armed, tool calls that avoid writing for too long are intercepted with a warning during this turn.',
-      'error.failed': 'Arming failed: {message}',
+      'trigger': 'Write guard',
+      'trigger.armed': 'Write guard {minutes} min',
+      'trigger.aria': 'Write-guard settings',
+      'panel.title': 'Write guard',
+      'panel.minutes': 'Trigger minutes',
+      'panel.hint': 'Confirming starts the clock: calls that avoid writing past the deadline are intercepted with a warning until a file edit lands.',
+      'action.confirm': 'Confirm and send',
+      'action.confirming': 'Arming…',
+      'action.cancel': 'Cancel',
       'error.range': 'Trigger minutes must be between 3 and 600',
-      'error.unavailable': 'The session is unavailable'
+      'error.failed': 'Arming failed: {message}'
     }
 
     const CLASS = {
       root: 'dshIdleArm_root',
-      button: 'dshIdleArm_button',
-      armed: 'dshIdleArm_armed',
+      trigger: 'dshIdleArm_trigger',
+      triggerArmed: 'dshIdleArm_triggerArmed',
+      panel: 'dshIdleArm_panel',
+      title: 'dshIdleArm_title',
+      field: 'dshIdleArm_field',
       minutes: 'dshIdleArm_minutes',
+      hint: 'dshIdleArm_hint',
+      actions: 'dshIdleArm_actions',
+      primary: 'dshIdleArm_primary',
+      ghost: 'dshIdleArm_ghost',
       error: 'dshIdleArm_error'
     }
     // 只声明本插件真正用到的样式；用主题令牌取色，因此跟随宿主明暗主题。
     const css = [
-      '.dshIdleArm_root{display:inline-flex;align-items:center;gap:4px;flex:none}',
-      '.dshIdleArm_button{display:inline-flex;align-items:center;gap:4px;box-sizing:border-box;height:28px;',
+      '.dshIdleArm_root{display:inline-flex;align-items:center;flex:none;position:relative}',
+      '.dshIdleArm_trigger{display:inline-flex;align-items:center;gap:4px;box-sizing:border-box;height:28px;',
       'padding:0 8px;border:.5px solid var(--dsw-alias-border-l4);border-radius:var(--dsw-radius-sm);',
       'background:0 0;color:var(--dsw-alias-label-secondary);cursor:pointer;',
       'font-family:var(--dsw-font-family);font-size:12px;line-height:18px;white-space:nowrap}',
-      '.dshIdleArm_button:hover:not(:disabled),.dshIdleArm_button:focus-visible{background:var(--dsw-alias-interactive-bg-hover);',
-      'color:var(--dsw-alias-label-primary)}',
-      '.dshIdleArm_button:disabled{cursor:default;opacity:.6}',
-      '.dshIdleArm_armed{color:var(--dsw-alias-label-primary-bluish);border-color:var(--dsw-alias-button-info-fill)}',
-      '.dshIdleArm_minutes{box-sizing:border-box;width:48px;height:28px;padding:0 4px;',
+      '.dshIdleArm_trigger:hover:not(:disabled),.dshIdleArm_trigger:focus-visible{',
+      'background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+      '.dshIdleArm_trigger:disabled{cursor:default;opacity:.6}',
+      '.dshIdleArm_triggerArmed{color:var(--dsw-alias-label-primary-bluish);border-color:var(--dsw-alias-button-info-fill)}',
+      '.dshIdleArm_panel{box-sizing:border-box;width:260px;padding:12px;',
+      'border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md);',
+      'background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);',
+      'font-family:var(--dsw-font-family);font-size:12px;line-height:18px;',
+      'box-shadow:0 6px 24px rgba(0,0,0,.18)}',
+      '.dshIdleArm_title{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);margin-bottom:8px}',
+      '.dshIdleArm_field{display:flex;align-items:center;gap:8px;margin-bottom:8px}',
+      '.dshIdleArm_field label{color:var(--dsw-alias-label-secondary);white-space:nowrap}',
+      '.dshIdleArm_minutes{box-sizing:border-box;flex:1;height:28px;padding:0 6px;',
       'border:.5px solid var(--dsw-alias-border-l4);border-radius:var(--dsw-radius-sm);',
-      'background:0 0;color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family);font-size:12px;text-align:center}',
-      '.dshIdleArm_error{color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:16px;max-width:220px}'
+      'background:0 0;color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family);font-size:12px}',
+      '.dshIdleArm_hint{color:var(--dsw-alias-label-tertiary);margin-bottom:10px}',
+      '.dshIdleArm_actions{display:flex;justify-content:flex-end;gap:8px}',
+      '.dshIdleArm_primary,.dshIdleArm_ghost{box-sizing:border-box;height:28px;padding:0 10px;',
+      'border-radius:var(--dsw-radius-sm);cursor:pointer;font-family:var(--dsw-font-family);font-size:12px}',
+      '.dshIdleArm_primary{border:.5px solid var(--dsw-alias-button-info-fill);',
+      'background:var(--dsw-alias-button-info-fill);color:var(--dsw-alias-label-primary-inverted)}',
+      '.dshIdleArm_primary:hover:not(:disabled){background:var(--dsw-alias-button-info-hover);border-color:var(--dsw-alias-button-info-hover)}',
+      '.dshIdleArm_primary:disabled{cursor:default;opacity:.6}',
+      '.dshIdleArm_ghost{border:.5px solid var(--dsw-alias-border-l4);background:0 0;color:var(--dsw-alias-label-secondary)}',
+      '.dshIdleArm_ghost:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+      '.dshIdleArm_error{color:var(--dsw-alias-state-error-primary);margin-top:8px}'
     ].join('')
 
     /**
-     * 提交键左侧的武装控件。
+     * 提交键左侧的落盘拦截控件。
      *
-     * 武装只对「发起它的那一回合」负责：宿主在 turn/end 时解除武装。因此这里不
-     * 自己维护过期逻辑，而是跟着会话的运行状态收尾——会话回到空闲即视为武装结束，
-     * 与宿主侧的生命周期保持同一个判据。
-     * @param props - 插槽标准道具（sessionId / useSessionStatus）与本地化函数 t。
+     * 交互按既定设计：一个按钮 → 展开小面板配置起栏时间 → 确认后置位并自动提交。
+     * 自动提交调用插槽注入的 `inputActions.submit()`，与用户按提交键走同一条提交
+     * 流程（adjudication / claim / default sink 都在其中），因此不会凭空造一条旁路。
+     * @param props - 插槽标准道具（sessionId / inputActions）与本地化函数 t。
      * @returns 控件元素。
      */
-    function ArmControl({ sessionId, useSessionStatus, t }) {
-      const [minutes, setMinutes] = React.useState(DEFAULT_MINUTES)
+    function ArmControl({ sessionId, inputActions, useInput, t }) {
+      const [open, setOpen] = React.useState(false)
+      const [minutes, setMinutes] = React.useState(String(DEFAULT_MINUTES))
       const [pending, setPending] = React.useState(false)
       const [armedMinutes, setArmedMinutes] = React.useState(undefined)
       const [error, setError] = React.useState(undefined)
-      const running = useSessionStatus === undefined
-        ? false
-        : useSessionStatus((map) => map.get(sessionId)?.running === true)
-      // 已经观察到本会话跑起来过。武装的真实语义是「到回合结束为止」（宿主在 turn/end
-      // 才解除武装），而用户通常在空闲时就点按钮、之后才提交，所以「此刻空闲」绝不等于
-      // 「武装已失效」——只看 running===false 会在点下去的瞬间就抹掉标记。
-      // 正确的收尾判据是「跑起来过、又回到空闲」，即一次回合真正结束。
-      const sawRunning = React.useRef(false)
+      const rootRef = React.useRef(null)
+      const panelRef = React.useRef(null)
 
-      React.useEffect(() => {
-        if (running === true) {
-          sawRunning.current = true
-          return
-        }
-        if (sawRunning.current === true) {
-          sawRunning.current = false
-          setArmedMinutes(undefined)
-        }
-      }, [running])
+      const position = primitives.useAnchoredPosition({
+        open,
+        anchorRef: rootRef,
+        panelRef,
+        gap: MENU_GAP,
+        margin: VIEWPORT_MARGIN
+      })
+      primitives.useDismissOnOutsidePointer(rootRef, open, setOpen, panelRef)
 
-      // 武装是按会话置位的：换到别的会话后，上一个会话的标记不该跟过来。
-      React.useEffect(() => {
-        sawRunning.current = false
-        setArmedMinutes(undefined)
+      // 输入框正在提交（adjudicating/claimed/submitting）时不再重复发起，避免与用户的
+      // 提交撞车；队列里已有等待消息不影响本次提交，也不阻止它。
+      const phase = useInput === undefined ? undefined : useInput((state) => state.phase)
+      const submitting = phase !== undefined && phase !== 'plain'
+
+      const close = () => {
+        setOpen(false)
         setError(undefined)
-      }, [sessionId])
+      }
 
-      if (sessionId === undefined) return null
-
-      const arm = async () => {
+      const confirm = async () => {
         if (pending === true) return
         const value = Number(minutes)
         if (!Number.isSafeInteger(value) || value < MIN_MINUTES || value > MAX_MINUTES) {
@@ -142,6 +170,9 @@ window.__ModuleLoader__.load({
             return
           }
           setArmedMinutes(value)
+          close()
+          // 置位成功后才提交：先武装、再进入回合，宿主侧本回合即可按新曲线拦截。
+          if (inputActions !== undefined && typeof inputActions.submit === 'function') inputActions.submit()
         } catch (cause) {
           setError(t('error.failed', { message: cause instanceof Error ? cause.message : String(cause) }))
         } finally {
@@ -150,44 +181,79 @@ window.__ModuleLoader__.load({
       }
 
       const armed = armedMinutes !== undefined
-      const label = pending === true
-        ? t('action.arming')
-        : armed
-          ? t('action.armed', { minutes: armedMinutes })
-          : t('action.arm')
+      const triggerLabel = armed
+        ? t('trigger.armed', { minutes: armedMinutes })
+        : t('trigger')
 
-      return React.createElement('div', { className: CLASS.root },
-        React.createElement('input', {
-          className: CLASS.minutes,
-          type: 'number',
-          min: MIN_MINUTES,
-          max: MAX_MINUTES,
-          step: 1,
-          value: minutes,
-          disabled: pending,
-          title: t('field.minutes'),
-          'aria-label': t('field.minutes.aria'),
-          onChange: (event) => setMinutes(event.target.value)
-        }),
+      return React.createElement('div', { className: CLASS.root, ref: rootRef },
         React.createElement('button', {
           type: 'button',
-          className: armed ? `${CLASS.button} ${CLASS.armed}` : CLASS.button,
-          disabled: pending,
-          title: t('hint'),
-          'aria-label': t('action.aria', { minutes: Number(minutes) || DEFAULT_MINUTES }),
-          onClick: arm
-        }, React.createElement(primitives.IconClockOutlineRegular, { size: 16 }), label),
-        error === undefined
-          ? null
-          : React.createElement('span', { className: CLASS.error, role: 'alert' }, error)
+          className: armed ? `${CLASS.trigger} ${CLASS.triggerArmed}` : CLASS.trigger,
+          'aria-label': t('trigger.aria'),
+          'aria-haspopup': 'dialog',
+          'aria-expanded': open,
+          onClick: () => (open ? close() : setOpen(true))
+        },
+        React.createElement(primitives.IconClockOutlineRegular, { size: 16 }),
+        triggerLabel),
+
+        open === false ? null : ReactDOM.createPortal(
+          React.createElement(primitives.MenuSurface, {
+            ref: panelRef,
+            className: CLASS.panel,
+            style: position ?? MEASURE_STYLE,
+            role: 'dialog',
+            'aria-label': t('panel.title')
+          },
+          React.createElement('div', { className: CLASS.title }, t('panel.title')),
+          React.createElement('div', { className: CLASS.field },
+            React.createElement('label', { htmlFor: 'dsh-idle-arm-minutes' }, t('panel.minutes')),
+            React.createElement('input', {
+              id: 'dsh-idle-arm-minutes',
+              className: CLASS.minutes,
+              type: 'number',
+              min: MIN_MINUTES,
+              max: MAX_MINUTES,
+              step: 1,
+              value: minutes,
+              disabled: pending,
+              autoFocus: true,
+              onChange: (event) => setMinutes(event.target.value),
+              onKeyDown: (event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  void confirm()
+                }
+                if (event.key === 'Escape') close()
+              }
+            })
+          ),
+          React.createElement('div', { className: CLASS.hint }, t('panel.hint')),
+          React.createElement('div', { className: CLASS.actions },
+            React.createElement('button', {
+              type: 'button',
+              className: CLASS.ghost,
+              disabled: pending,
+              onClick: close
+            }, t('action.cancel')),
+            React.createElement('button', {
+              type: 'button',
+              className: CLASS.primary,
+              disabled: pending || submitting || sessionId === undefined,
+              onClick: () => void confirm()
+            }, pending ? t('action.confirming') : t('action.confirm'))
+          ),
+          error === undefined ? null : React.createElement('div', { className: CLASS.error, role: 'alert' }, error)
+        ),
+        document.body)
       )
     }
 
-    // 与 idle-guard.js 的 inject 对应：这里只需要插槽表与本地化服务。
+    // 与 idle-guard.js 的 inject 对应：这里需要插槽表与本地化服务。
     const inject = ['slots', 'locale']
 
     /**
-     * 客户端插件体：注册文案与提交键左侧的武装控件。
+     * 客户端插件体：注册文案、样式与提交键左侧的落盘拦截控件。
      * @param ctx - 客户端根上下文。
      */
     function apply(ctx) {

@@ -223,10 +223,13 @@
   `window.__ModuleLoader__.load({ id, factory })` 注册，`id` 严格等于包名
   （`dsh-client-modules` 用 manifest 里请求的 id 与注册 id 比对，不一致就报
   「loaded without registering」并静默不装配）；在 `conversation.input.right`
-  （提交键左侧）挂一个「武装」控件，POST `idle-arm/arm` 把
-  `{ sessionId, minutes }` 交给宿主，成功后就地显示已武装分钟数，失败显示宿主
-  返回的原因；文案走 `ctx.locale.register`（zh/en），样式经 `ctx.effect` 注入，
-  用主题令牌取色因而跟随明暗主题。
+  （提交键左侧）挂一个「落盘拦截」按钮。交互按既有设计恢复：**点按钮 → 展开小面板
+  配置起栏时间 → 确认后置位并自动提交**，不需要用户再按一次提交键或回车。
+  置位走旁路 POST `idle-arm/arm`（交 `{ sessionId, minutes }`）；自动提交调用插槽
+  注入的 `inputActions.submit()`，与用户按提交键走同一条提交流程。顺序固定为
+  「先置位、后提交」，置位失败则不提交并回显宿主原因；面板内按 Enter 同样确认。
+  文案走 `ctx.locale.register`（zh/en），样式经 `ctx.effect` 注入，用主题令牌取色
+  因而跟随明暗主题。
 - **脚本改为契约校验而非存在性告警**：新增 `verifyIdleArmBundle()`，逐条核对
   `dsh.client.platform`、`exports["./client"]` 指向的文件真实存在、以及
   bundle 注册 id 与 `package.json` 的 `name` 一致；任一不满足即以退出码 1 结束。
@@ -235,11 +238,11 @@
   非零退出码（补丁拒绝落盘、idle-arm 声明不完整等）都会被一句祝贺盖住。
 
 验证：`node --check` 通过；`--apply` 连跑两次字节级幂等；启动 dsh Web 后抓取
-实际下发的 bundle，确认 `id: 'dsh-plugin-idle-arm'` 与包名一致、且包含注册与请求
-代码；`POST /idle-arm/arm` 的信任栅栏（401）、方法守卫（405）、非法 JSON／越界
-分钟数／缺 sessionId（400）、未知会话（404）逐项实测符合预期；把 bundle 放进
-迷你 React 运行时真实执行，21 项断言全过（注册契约、渲染结构、越界本地拦截不发
-请求、POST 体形状、错误回显、以及「空闲时武装的标记不被立刻抹掉」这条修复）。
+实际下发的 bundle，确认 `id: 'dsh-plugin-idle-arm'` 与包名一致、且包含面板与
+`inputActions.submit()` 调用；`POST /idle-arm/arm` 的信任栅栏（401）、方法守卫
+（405）、非法 JSON／越界分钟数／缺 sessionId（400）、未知会话（404）逐项实测
+符合预期；把 bundle 放进迷你 React 运行时真实执行，27 项断言全过，其中直接覆盖
+「确认即自动提交、无需第二次按键」与「置位先于提交」两条关键顺序。
 
 ### 未改动但值得记录的一点
 
