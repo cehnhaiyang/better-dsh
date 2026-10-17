@@ -39,16 +39,6 @@
         api: openai-completions
         baseURL: http://127.0.0.1:3065/v1
         models:
-          - id: glm-5.3
-            name: glm-5.3
-            contextWindow: 1000000
-            reasoningEfforts:
-              low: low
-              high: high
-              max: max
-          - id: GLM-5.3
-            name: GLM-5.3
-            contextWindow: 1000000
           - id: cn:deepseek-v4.1-flash
             name: cn:deepseek-v4.1-flash
             contextWindow: 1000000
@@ -69,18 +59,19 @@
               low: low
               high: high
               max: max
-          - id: Qwen3.8-Flash
-            name: Qwen3.8-Flash
+          - id: sn-deepseek-v4-1-flash
+            name: sn-deepseek-v4-1-flash
             contextWindow: 1000000
             input:
               - text
               - image
-          - id: deepseek-v4.1-flash
-            name: deepseek-v4.1-flash
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+          - id: glm-5-3
+            name: glm-5-3
             contextWindow: 1000000
-            input:
-              - text
-              - image
             reasoningEfforts:
               low: low
               high: high

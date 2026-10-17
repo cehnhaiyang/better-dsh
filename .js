@@ -1,5 +1,3 @@
-'use strict'
-
 // ─────────────────────────────────────────────────────────────────────────────
 // DSH 全量独立部署与维护脚本
 //
@@ -3762,8 +3760,6 @@ function syncWorkspaces(dshRoot, force = false) {
 
 syncWorkspaces(DSH_ROOT, process.argv.includes('--repair-workspaces') || process.argv.includes('-r'))
 
-// 收尾横幅必须反映真实结果：前面任何一步设了非零退出码（补丁拒绝落盘、idle-arm 声明不完整等），
-// 就不能再喊「全量部署成功」——否则失败被一句祝贺盖住，正是本脚本要消灭的那种静默故障。
 console.log('=============================================================')
 if (process.exitCode !== undefined && process.exitCode !== 0) {
     console.error(`⚠️  部署未完成：上面有 ${process.exitCode} 号退出码对应的错误，请先处理后再重跑。`)

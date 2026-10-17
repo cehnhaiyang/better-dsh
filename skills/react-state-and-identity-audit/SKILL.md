@@ -230,6 +230,27 @@ const trackOp = useCallback(async (fn) => {
 3. Do **not** decide when to return the count by round (`if (isCurrentRun(runId)) setX(false)`) —
    a stale round holds its own count too, and missing one spins forever
 
+### Variant: a skip guard overloaded with retry policy -> refetch loop
+
+A dedup guard in an effect answers one question: "is this the same work as last time?"
+Adding terms like `&& imageUrl && !loadError` ("and we have a result, and it didn't fail") makes the guard
+answer a **second** question — retry policy — and inverts it:
+
+```tsx
+// bad: after one failure loadError is true -> the guard is permanently false ->
+// every dependency change refires the request; with an object-identity dep
+// (a record from a Map rebuilt every tick) that is one request per tick, forever
+if (currentHash === lastHashRef.current && imageUrl && !loadError) return;
+```
+
+Two compounding symptoms: the refetch loop itself, and a `setLoadError(false)` at the top of the effect
+erasing the error UI the moment it renders, so the user sees "request -> flash -> request".
+
+**Fix**: the guard answers only "has the work changed" (`if (currentHash === lastHashRef.current) return;`).
+Explicit retry is a user action that invalidates the ref and re-triggers the effect through a nonce dependency
+(`const [retryNonce, setRetryNonce] = useState(0)` in the dep array), so the load logic exists **exactly once** —
+never a second hand-copied loader in the retry handler that silently drops the stale-result check.
+
 ---
 
 ## Pattern E: comments that contradict the code
@@ -497,6 +518,7 @@ Almost all the payoff comes from this step:
 - [ ] Before every `await` writes state, is there a check that "I am still the same me as when I started"?
 - [ ] After filtering / truncating, is the index computed **within the filtered batch**?
 - [ ] How many writers does each `isXxx` boolean have? Can they clobber each other under concurrency?
+- [ ] Does any skip/dedup guard also encode error or result state (`&& hasResult && !error`), making it permanently false after one failure?
 - [ ] Do the things mentioned in comments still exist in the code? Does the absolute wording have a corresponding implementation?
 - [ ] Are there always-false branches, zero-reference exports, mechanisms with no entry point?
 - [ ] Does every prop of every `React.memo` have a stable reference?
