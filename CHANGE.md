@@ -7,9 +7,82 @@
 
 ## 当前基线
 
-- 脚本按 **dsh 0.2.1-alpha.4** 的结构维护。
+- 脚本按 **dsh 0.2.1-rc.2** 的结构维护。
 - 维护对象：`~/.dsh/`（可用 `DSH_HOME` 覆盖）与全局安装的 `@deepseek-ai/dsh`。
-- 四个底层增强补丁的锚点在 0.2.1-alpha.4 上逐字节命中，补丁逻辑无需改动。
+- 四个底层增强补丁的锚点在 0.2.1-rc.2 上逐字节命中，补丁逻辑无需改动。
+
+---
+
+## 0.2.1-alpha.4 → 0.2.1-rc.2
+
+先逐项复核 0.2.1-rc.2 的安装目录，再按结论修改脚本。**rc.2 未改动脚本依赖的任何公开契约**，
+因此本轮没有版本迁移动作；唯一修改来自复核时发现的一个与版本无关的真实缺陷。
+
+### 1. 契约复核：全部通过（未做改动）
+
+- **路径编码**：`encodeProjectKey` / `encodeSegment` 与
+  `dsh-session-persistence-jsonl` 的 `projectKey()` / `encodeSegment()`（含 `.`/`..` 特例、
+  `~XXXX` 转义、`--` 包裹、251 截断）逐字符等价。
+- **日志格式**：`dsh-session` 的 `SESSION_FORMAT_VERSION` 仍为 **4**；
+  `sessionFormatLogFilename()` 仍是 `session.jsonl` / `session.v${N}.jsonl`，
+  `.zstd` 后缀规则未变；`SESSION_LOG_PATTERN` 与之一致。
+- **会话头**：`SessionHeader` 字段未变（`isSeeded` / `delegationDepth` 仍必填，
+  `cwd` / `parentSession` / `origin` / `agentPreset` 仍为可选）；移动引擎改写的
+  `cwd` 仍是无损往返安全的字段。
+- **workspace 存储**：`workspaceDomainSpec` 仍是 `name: "workspace", version: 2`，
+  global 五字段与 `workspaceRecord`（`path`/`title`/`sessionIds`/`createdAt`/`updatedAt`）
+  未变，`pendingMutation` 语义未变。
+- **Agent 公开面**：仍是 `agent.status`（`'idle' | 'running'`）与 `agent.whenIdle()`；
+  `phase` 仍只存在于 `dsh-agent-loop` 内部。`runMaintenance` 的注释仍确认
+  「维护期间 public status stays idle」。
+- **agent-preset**：`Config` 仍是 `{ id, name, description, order, plugins }`；
+  `agentPresets` 服务仍提供 `composedPreset(ctx)` / `recompose(ctx, id)` / `serviceFor(...)`。
+- **各服务面**：`commands.register(definition)`（`rawInput` / `commandId` / `CommandResult`
+  的 `success|error`）、`system-prompt/assemble`（`PromptAssembly.sections[].{name,text}`，
+  `AssembleContext.agent` 仍由 dsh-agent 增强）、`tools/pre-execute`
+  （`PreToolDecision` 的 `deny+reason`、`exec.{name,arguments,agent,signal}`）、
+  `webServer.register({kind,path,handler})`、`connection.requestRejection`、
+  `agents.get(id)`、`loader/entry-init`、`session/event(session, event)`、
+  `agent.steer(UserMessage)` 的 `source.form: 'notice'`、`compaction.compactNow(agent, signal, commandId)`
+  全部与脚本用法一致。
+- **hmr 监听**：`dsh-hmr` 仍监听 `[profile.patchPath, join(profile.home, PROFILE_PATCH_FILENAME)]`，
+  `PROFILE_PATCH_FILENAME = "cordis.patch.yml"`，与插件的 `watchedFiles` 对应。
+- **bundle 结构**：`dsh-web-app` 的 `dsh.bundle.patch` 仍是
+  `cordis.patch.yml + presets/{standard,ptc,minimal,cordis}.patch.yml`。
+- **settings 导入**：`dsh-settings` 的 `importLegacyDocument()` 仍是「先把
+  `settings.yaml` 改名为 `settings.yaml.imported`，再逐 section `update()`」，
+  `LEGACY_SECTION_ENTRIES` 三条映射未变。
+- **CLI**：`--dump-config` 仍在，输出仍是 `- id: <entry>` 行式，脚本的解析正则照旧命中。
+
+### 2. 修复：4.2 的多行锚点因行尾差异永不命中（唯一的实际改动）
+
+- **症状**：补丁 4.2 分两段——`applyTarget`（单行）与会话头部槽位 `slotTarget`（多行）。
+  单行那段一直正常，多行那段**从未真正命中**：脚本只打印
+  「未匹配到会话头部槽位注册代码，已跳过下拉注入」，然后照常报「部署成功」，
+  结果是会话头部的预设下拉一直没注入，而日志看起来一切正常。
+- **成因**：脚本自身在 Windows 检出后是 CRLF，而 dsh 的 bundle 以 **LF** 发布。
+  `slotTarget` / `slotRep` 是模板字面量，行尾跟着载体文件走，于是带上 `\r\n`，
+  与 LF 的目标文件永不相等（实证：`rawHit=false`，把两侧都归一化成 LF 后 `lfNormHit=true`）。
+  全脚本 208 个模板字面量中只有 8 个带 CRLF，其中 6 个是写出去即完事的插件代码块（无害），
+  另 2 个正是这两处锚点/替换体。
+- **处置**：补丁函数新增 `readTargetCode()`，读取目标 bundle 时统一归一化为 LF；
+  `slotTarget` / `slotRep` 在匹配与注入前同样归一化。补丁结果因此与检出方式无关。
+- **影响面**：只影响补丁注入的源码文本，不改补丁语义；目标文件本就是 LF，
+  归一化对它们是无操作，写入仍是 LF。
+
+### 3. 验证方式与结论
+
+- **锚点比对**：4.1 / 4.2（两段）/ 4.3（三处）/ 4.4（两处）锚点逐字节比对 rc.2 原文命中；
+  修复前用副本实证 4.2 的 `slotTarget` 不命中、归一化后命中。
+- **补丁产物**：把四个补丁实际应用到真实安装目录，四个 bundle 的 `node --check` 全部通过；
+  变更行数与预期一致（4.1 一行、4.2 两处、4.3 三处替换 + 一条指令、4.4 注入 + 一处替换）。
+- **幂等**：`node .js --apply` 连续运行两次；第二次全部报「已处于目标状态」，
+  工作区注册表报「状态正常」，四个被打补丁模块的 md5 在两次之间不变。
+- **组合**：`--profile web --dump-config` 退出码 0，204 个顶层条目，
+  4 个官方预设与 8 个自建预设、6 个自定义插件全部挂载。
+- **实际启动**：启动 rc.2 的 Web profile 正常监听（无 error/warn），
+  抓取运行时下发的 `dsh-client-ui-agent-preset` 与 `dsh-client-ui-conversation` bundle，
+  `AgentPresetHeaderSeat` 与 `dshMeterShown` 标记确实存在——补丁确实到达浏览器。
 
 ---
 
@@ -120,8 +193,9 @@
 ### 已知副作用（非脚本缺陷）
 
 - 首次实际启动会触发 dsh 官方的 `settings.yaml` 一次性导入，把 `~/.dsh/settings.yaml`
-  改名为 `settings.yaml.imported`。这是官方行为，脚本的 legacy 迁移同时读取这两个路径，
-  因此不受影响。
+  改名为 `settings.yaml.imported`。这是官方行为。脚本的 legacy 迁移**只读 `settings.yaml`
+  本身**，不再把 `.imported` 当迁移源（那是官方已处理过一部分的旧值归档，拿它回写会覆盖
+  网页端现行设置）；`settings.yaml` 不存在时整段跳过并原样保留上一版托管区块。
 
 ## 逐条核对 dsh 0.2.1-alpha.4 源码的实现审计
 

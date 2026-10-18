@@ -11,12 +11,14 @@
 //   本脚本是 DSH 功能增强与自定义插件生态的「一键生成与维护总入口」。
 //   在任何时候运行（`node .js`），会自动全量构建并注入全部改进：
 //
-//   0. 基线版本：本脚本按 dsh 0.2.1-alpha.4 的结构维护。
+//   0. 基线版本：本脚本按 dsh 0.2.1-rc.2 的结构维护。
 //      版本沿革、历次迁移的核对结论与已执行的迁移动作，全部记录在同目录的
 //      `CHANGE.md` 里；本头部只描述当前行为，不再复述历史。
-//      当前基线下与旧版最关键的一处差异：Agent 的公开生命周期面已收敛，
-//      `agent.phase` 不再是公开 API（公开面为 `agent.status` 与 `agent.whenIdle()`），
-//      脚本内两处相位判断已按此迁移。
+//      与 0.2.1-alpha.4 相比，公开契约没有任何变化（会话格式 v4、projectKey/
+//      encodeSegment、workspace 域 v2、`agent.status` / `agent.whenIdle()`、
+//      agent-preset schema、四个补丁锚点逐字节一致），因此本轮只修掉一个与版本
+//      无关的缺陷：4.2 的多行锚点带 CRLF，与 LF 的 bundle 永不相等，导致会话头部
+//      的预设下拉从未真正注入（补丁函数现统一按 LF 读取目标文件）。
 //
 //   1. 插件自动创建与落地（直接写在 `~/.dsh/plugins/` 下，不再套一层 custom/）：
 //      - 自动生成 `~/.dsh/plugins/reflect-command.js`
@@ -3229,6 +3231,12 @@ console.log('[installer] 正在执行底层核心补丁全量注入...')
 function applyCorePatches(baseDir) {
     if (!fs.existsSync(baseDir)) return
 
+    // dsh 的 bundle 一律以 LF 发布，而本脚本在 Windows 检出后自身是 CRLF：凡是用
+    // 多行模板字面量写成的锚点（4.2 的会话头部槽位就是唯一一处）都会带上 \r\n，
+    // 与 LF 的目标文件永不相等，补丁于是「静默降级」——只打印一句跳过告警，
+    // 界面缺了一块却仍报部署成功。读取时统一归一化为 LF，使补丁结果与检出方式无关。
+    const readTargetCode = (file) => fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n')
+
     // 4.1 preset-switch: 后端 agent 预设注册表解除非空白会话限制
     //     包名沿革：dsh-agent-presets（复数）已拆成
     //     dsh-agent-preset（声明插件）与 dsh-agent-preset-registry（`agentPresets` 服务）。
@@ -3237,7 +3245,7 @@ function applyCorePatches(baseDir) {
     //     的形式出现，因此内层子串替换照旧成立。
     const agentPresetsFile = path.join(baseDir, 'node_modules', '@deepseek-ai', 'dsh-agent-preset-registry', 'lib', 'index.js')
     if (fs.existsSync(agentPresetsFile)) {
-        let fileCode = fs.readFileSync(agentPresetsFile, 'utf8')
+        let fileCode = readTargetCode(agentPresetsFile)
         const target = 'boundary.openTurnStartSeq !== null || boundary.lastTurn > 0'
         const rep = 'boundary.openTurnStartSeq !== null'
         if (fileCode.includes(target)) {
@@ -3256,7 +3264,7 @@ function applyCorePatches(baseDir) {
     // 4.2 preset-switch: 前端 dsh-client-ui-agent-preset 解锁 apply 并将头部升级为下拉交互组件
     const uiAgentPresetFile = path.join(baseDir, 'node_modules', '@deepseek-ai', 'dsh-client-ui-agent-preset', 'lib', 'client.js')
     if (fs.existsSync(uiAgentPresetFile)) {
-        let fileCode = fs.readFileSync(uiAgentPresetFile, 'utf8')
+        let fileCode = readTargetCode(uiAgentPresetFile)
         let uiChanged = false
 
         const applyTarget = 'if (!session.blank || presetOf(session) === staged)'
@@ -3315,9 +3323,14 @@ function applyCorePatches(baseDir) {
 						return (0, react_jsx_runtime.jsx)(AgentPresetSeat, props);
 					});`
 
+        // 多行锚点与替换体都要先归一化为 LF：它们写作模板字面量，行尾跟着载体文件走，
+        // 在 CRLF 检出下会带 \r\n，而目标 bundle 是 LF（readTargetCode 已把目标侧归一化）。
+        const slotTargetLf = slotTarget.replace(/\r\n/g, '\n')
+        const slotRepLf = slotRep.replace(/\r\n/g, '\n')
+
         const headerSeatApplied = fileCode.includes('AgentPresetHeaderSeat')
-        if (fileCode.includes(slotTarget)) {
-            fileCode = fileCode.replace(slotTarget, slotRep)
+        if (fileCode.includes(slotTargetLf)) {
+            fileCode = fileCode.replace(slotTargetLf, slotRepLf)
             uiChanged = true
             console.log('  [patch] dsh-client-ui-agent-preset: 会话头部已注入预设下拉（闸门未开时自动回退为只读标签，不残留空白）')
         } else if (!headerSeatApplied) {
@@ -3343,11 +3356,11 @@ function applyCorePatches(baseDir) {
     //     两者之差因此是「工具 schema（estimateToolsTokens）+ provider 用量漂移」；
     //     系统提示词已经作为 system/message 节点计入 surfaceTokens，所以本补丁的实际语义
     //     是「忽略工具 schema 对压缩阈值的压力」，而非「剥离系统提示词压力」。
-    //     该形态在 0.2.1-alpha.4 复核未变，compaction-basic 里的三处判断
+    //     该形态在 0.2.1-rc.2 复核未变，compaction-basic 里的三处判断
     //     （两处 return null、一处 return result）仍是原文，补丁锚点全部命中。
     const compactionBasicFile = path.join(baseDir, 'node_modules', '@deepseek-ai', 'dsh-compaction-basic', 'lib', 'index.js')
     if (fs.existsSync(compactionBasicFile)) {
-        let fileCode = fs.readFileSync(compactionBasicFile, 'utf8')
+        let fileCode = readTargetCode(compactionBasicFile)
         let compChanged = false
 
         const pressureTarget = 'if (measurement.totalTokens < spec.thresholdTokens) return null;'
@@ -3397,7 +3410,7 @@ function applyCorePatches(baseDir) {
     //     分配下去，保证加总自洽；不触碰估算器与压缩阈值，可随时回滚。
     const contextMeterFile = path.join(baseDir, 'node_modules', '@deepseek-ai', 'dsh-client-ui-conversation', 'lib', 'client.js')
     if (fs.existsSync(contextMeterFile)) {
-        let fileCode = fs.readFileSync(contextMeterFile, 'utf8')
+        let fileCode = readTargetCode(contextMeterFile)
 
         const shownBlock = [
             '/**',
