@@ -59,8 +59,8 @@
               low: low
               high: high
               max: max
-          - id: other:deepseek-v4-1-flash
-            name: other:deepseek-v4-1-flash
+          - id: other:deepseek-v4.1-flash
+            name: other:deepseek-v4.1-flash
             contextWindow: 1000000
             input:
               - text

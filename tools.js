@@ -3,14 +3,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // tools.js —— better-dsh 自定义工具集的唯一实现（由各预设按需声明使用）
 //
-// 本文件是 typecheck / test / git_commit / node / delete / browser 六个工具的
+// 本文件是 typecheck / test / git / node / delete / browser 六个工具的
 // 唯一实现，放在仓库根。**哪个预设能用哪几个工具，由那个预设自己在
 // agent.cordis.yml 里声明**，不再各存一份插件拷贝：
 //
 //     - id: custom-tools
 //       name: 'better-dsh:tools'
 //       config:
-//         tools: [typecheck, test, git_commit, node, delete, browser]
+//         tools: [typecheck, test, git, node, delete, browser]
 //
 // 其中 `better-dsh:tools` 是一个占位标记，由 `~/.dsh/.js` 在生成预设声明时改写成本
 // 文件的 file:// 绝对路径（DSH_ROOT 可被 DSH_HOME 覆盖，因此不能把绝对路径写死在
@@ -25,7 +25,7 @@
 //     - 挂成 profile 顶层条目的行 → 进入 dsh-tools 的**全局层**，而
 //       ToolRuntime.view(scope) 以全局层为起点组装可见集，于是**每个**预设的会话
 //       都会继承它。
-//   后者会把 node / delete / git_commit 这类执行能力强加给所有预设，包括设计上完全
+//   后者会把 node / delete / git 这类执行能力强加给所有预设，包括设计上完全
 //   不给命令行的文学类预设；而且那样一来「预设声明自己用什么工具」这句话本身就失去
 //   了意义。因此本文件只提供实现，注册范围一律由预设声明决定。
 //
@@ -44,16 +44,17 @@
 //   「必须拿到写权限」的前置条件：
 //     - 授权失败时工具直接不可用（实测 D:\the-play：SetNamedSecurityInfoW Win32 5
 //       ACCESS_DENIED，命令根本没跑）；
-//     - typecheck / test / git_commit 是零参数工具，schema 里没有 sandbox_permissions
-//       与 justification，模型无法提权重试，只能卡死。
+//     - typecheck / test 是零参数工具，git 的参数只是三选一的动作名；它们的 schema 里
+//       都没有 sandbox_permissions 与 justification，模型无法提权重试，只能卡死。
 //   一个只读检查、一次测试、一次提交，不该以写权限为前提。browser 更是如此：Chrome
 //   要在沙箱之外创建 mojo 管道（沙箱内实测 platform_channel Check failed）。
 //
 //   因此统一用 child_process 直接执行，安全性由「不可注入」保证，而不是由沙箱保证：
 //     - 命令、参数与提交信息是本文件的常量，模型触及不到、拼接不了；
 //     - cwd 固定为会话工作区根（或其中写死的子目录），不取自模型输入；
-//     - 唯一带参数的 node / delete / browser 各有一道边界：路径必须落在会话工作区
-//       之内（绝对路径与 `..` 穿越一律拒绝，见 resolveInside）。
+//     - 带自由参数的 node / delete / browser 各有一道边界：路径必须落在会话工作区
+//       之内（绝对路径与 `..` 穿越一律拒绝，见 resolveInside）；git 的参数则限定在
+//       三个写死的动作名里，连路径都进不来。
 //
 // 结构：共用基础设施 → 六个工具（各自一个 define 函数，内部符号互不污染）→ 按声明注册。
 // ─────────────────────────────────────────────────────────────────────────────
@@ -462,22 +463,35 @@ function defineTest(tools) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// git_commit —— 不给予命令行前提下的「提交」按钮
+// git —— 不给予命令行前提下的「提交 / 推送」按钮
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * 在会话工作区根目录把项目的所有更改提交到当前分支，把 git 的输出原样返回。
+ * 在会话工作区根目录执行一组写死的 git 命令：提交、推送，或两者连着做。
  *
- * 零参数：命令、路径与提交信息都写死在本文件里，模型看不到也改不了。
+ * 唯一的参数是 `action`，三选一（commit / push / c&p）。模型依然给不出命令行：每个
+ * 动作背后的子命令、参数与提交信息都是本文件的常量，action 只是在这几条写死的命令
+ * 序列里挑一条，模型既改不了命令，也拼不进任何东西。
  *
- * 为什么是两步 git 而不是一步（别改成 `git commit -a`）：
+ * 为什么提交是两步 git 而不是一步（别改成 `git commit -a`）：
  *   `commit -a` 只覆盖【已跟踪】文件的改动，新建的文件不在其中，而「项目的所有更改」
  *   必须包含它们。因此先 `add -A` 暂存全部改动（新文件、修改、删除），再 commit。
- *   两步都写死在本文件里，模型侧仍然只有一个按钮。
+ *
+ * 为什么推送写死成 `push -u origin HEAD` 而不是裸 `push`：
+ *   裸 `push` 依赖当前分支已有 upstream，新建分支上会直接失败——而本工具没有命令行
+ *   可补救（模型跑不了 `git push --set-upstream`）。`origin HEAD` 明确表示「把当前
+ *   分支推到远端同名分支」，首次推送也能一次成功；`-u` 顺手把 upstream 设好，之后
+ *   用户自己在终端里裸 `git push` 也能用。远端名固定为 origin：仓库若用了别的远端
+ *   名，git 自己的报错会原样返回给模型。
+ *
+ * 失败即止：序列里任何一步失败（起不来子进程、非零退出、超时）都不再执行后面的
+ * 步骤——没暂存完整的提交、没提交成功的推送，再跑一次只会把同一条错误重复一遍。
+ * 注意由此带来的一个副作用：工作区干净时 c&p 会停在 commit 的「nothing to commit」，
+ * 不会继续推送；此时再调一次 action=push 即可。
  * @param {object} tools - dsh-tools 注册表。
  */
-function defineGitCommit(tools) {
-  /** 单次执行的超时预算：提交可能触发 pre-commit 钩子（格式化、测试）。 */
+function defineGit(tools) {
+  /** 单次执行的超时预算：提交可能触发 pre-commit 钩子（格式化、测试），推送可能很慢。 */
   const TIMEOUT_MS = 300000
   /** 写死的提交信息：模型无法指定，避免为此开出可注入的入口。 */
   const COMMIT_MESSAGE = '更新'
@@ -485,6 +499,15 @@ function defineGitCommit(tools) {
   const GIT_ADD_ARGS = ['add', '-A']
   /** 写死的提交参数：-m 让 git 不打开编辑器。 */
   const GIT_COMMIT_ARGS = ['commit', '-m', COMMIT_MESSAGE]
+  /** 写死的推送参数：见上方注释，`-u origin HEAD` 让没有 upstream 的分支也能一次推成功。 */
+  const GIT_PUSH_ARGS = ['push', '-u', 'origin', 'HEAD']
+
+  /** 三个动作各自的命令序列；键就是 schema 里 enum 的取值，也用于执行前的白名单校验。 */
+  const STEP_SEQUENCES = {
+    commit: [GIT_ADD_ARGS, GIT_COMMIT_ARGS],
+    push: [GIT_PUSH_ARGS],
+    'c&p': [GIT_ADD_ARGS, GIT_COMMIT_ARGS, GIT_PUSH_ARGS]
+  }
 
   /**
    * 执行一次 git。
@@ -501,18 +524,23 @@ function defineGitCommit(tools) {
   }
 
   /**
-   * 先暂存全部改动，再提交，按顺序返回两次调用的结果。
+   * 按顺序执行一串命令，遇到第一个失败就停。
    *
    * 暂存失败（不在 git 仓库、index.lock 被占、超时）时不再 commit：此时提交必然
-   * 不完整，再跑一次只会把同一条错误重复一遍。
+   * 不完整。push 同理——没有暂存完整的提交，推出去的东西是错的。
    * @param {string} root - 会话工作区根目录。
+   * @param {string[][]} argsList - 本次动作的命令序列。
    * @param {AbortSignal} signal - 工具调用的取消信号。
-   * @returns {Promise<object[]>} runGit 结果的数组，长度 1 或 2。
+   * @returns {Promise<Array<{args: string[], result: object}>>} 已执行的命令及其结果。
    */
-  async function runCommit(root, signal) {
-    const staged = await runGit(root, GIT_ADD_ARGS, signal)
-    if (staged.spawnError !== null || staged.exitCode !== 0) return [staged]
-    return [staged, await runGit(root, GIT_COMMIT_ARGS, signal)]
+  async function runSequence(root, argsList, signal) {
+    const runs = []
+    for (const args of argsList) {
+      const result = await runGit(root, args, signal)
+      runs.push({ args, result })
+      if (result.spawnError !== null || result.exitCode !== 0) break
+    }
+    return runs
   }
 
   /** 单次 git 调用的正文：stdout，非空 stderr 追加在其后。 */
@@ -525,53 +553,74 @@ function defineGitCommit(tools) {
   }
 
   /**
-   * git 的执行结果，原样返回：stdout、stderr、退出码标记。
-   * @param {object[]} results - runCommit 的返回值。
+   * 每条命令一段：先回显 `$ git <参数>`，再是 stdout（非空 stderr 追加其后），
+   * 最后是这一步自己的退出码 / 超时标记，原样返回、不做归纳。
+   *
+   * 为什么逐条回显命令、逐条给标记：同一个工具现在有三种动作、最多三条命令，输出不
+   * 带命令行就分不清哪段来自 add、哪段来自 commit、哪段来自 push；标记若统一追加在
+   * 末尾，会让人误以为整条序列都失败了。
+   * @param {Array<{args: string[], result: object}>} runs - runSequence 的返回值。
    * @returns {string} 模型可见的文本。
    */
-  function renderResult(results) {
-    const blocks = []
-    const markers = []
-    for (const result of results) {
+  function renderResults(runs) {
+    const sections = []
+    for (const { args, result } of runs) {
+      const lines = [`$ git ${args.join(' ')}`]
       // 起不来子进程（git 缺失等）本身就是结果，原样报出，不当异常抛。
-      if (result.spawnError !== null) {
-        blocks.push(`无法执行 git：${result.spawnError}`)
-        continue
+      if (result.spawnError s!== null) {
+        lines.push(`无法执行 git：${result.spawnError}`)
+      } else {
+        const body = bodyOf(result)
+        // 暂存成功时 git add 无输出；「没说话」也是结果的一部分。
+        lines.push(body.length > 0 ? body : '(no output)')
+        if (result.timedOut) lines.push(`[timed out after ${TIMEOUT_MS}ms]`)
+        else if (result.exitCode !== 0) lines.push(`[exit code: ${result.exitCode}]`)
       }
-      const body = bodyOf(result)
-      if (body.length > 0) blocks.push(body)
-      if (result.timedOut) markers.push(`[timed out after ${TIMEOUT_MS}ms]`)
-      else if (result.exitCode !== 0) markers.push(`[exit code: ${result.exitCode}]`)
+      sections.push(lines.join('\n'))
     }
-    // 暂存成功时 git add 无输出，正常提交也只有 commit 的输出；全空说明确实没说话。
-    if (blocks.length === 0) blocks.push('(no output)')
-
-    let text = blocks.join('\n')
-    if (markers.length === 0) return text
-    if (!text.endsWith('\n')) text += '\n'
-    return text + markers.join('\n')
+    return sections.join('\n')
   }
 
   tools.register({
-    name: 'git_commit',
+    name: 'git',
     description:
-      'Commit every project change: run `git add -A`, then `git commit -m <fixed message>` at the project root,'
-      + ' and return git output.',
-    // 零参数：模型没有任何可注入的入口，这是本工具的设计前提。
-    parameters: { type: 'object', properties: {}, additionalProperties: false },
-    output: textOutput(),
-    async execute(_args, exec) {
-      const root = sessionRoot(exec, 'git_commit')
-      const results = await runCommit(root, exec.signal)
-      throwIfAborted(exec.signal)
-      return { output: renderResult(results) }
+      'Run git in the project root: `action` = commit (`git add -A`, then `git commit -m <fixed message>`),'
+      + ' push (`git push -u origin HEAD`, the current branch), or c&p (commit, then push).'
+      + ' Stops at the first failing step and returns git output verbatim.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['commit', 'push', 'c&p'],
+          description: 'commit: stage and commit every change. push: push the current branch. c&p: commit then push.'
+        }
+      },
+      required: ['action'],
+      additionalProperties: false
     },
-    // UI 呈现：提交就是一条命令，按终端卡片呈现。
-    presentCall: () => ({
-      card: 'terminal',
-      title: 'git commit',
-      description: '提交项目的所有更改'
-    }),
+    output: textOutput(),
+    async execute(args, exec) {
+      const root = sessionRoot(exec, 'git')
+      // 会话回放或手工调用可能带来 schema 之外的值：当场报错，而不是默默跑一条命令。
+      const sequence = typeof args.action === 'string' && Object.hasOwn(STEP_SEQUENCES, args.action)
+        ? STEP_SEQUENCES[args.action]
+        : undefined
+      if (sequence === undefined) {
+        throw new Error(`git 的 action 只能是 commit / push / c&p，收到 ${JSON.stringify(args.action)}`)
+      }
+      const runs = await runSequence(root, sequence, exec.signal)
+      throwIfAborted(exec.signal)
+      return { output: renderResults(runs) }
+    },
+    // UI 呈现：一次动作就是一条（或两条）命令，按终端卡片呈现；回放时参数未经校验。
+    presentCall: (args) => {
+      const action = args !== null && typeof args === 'object' ? args.action : undefined
+      if (action === 'commit') return { card: 'terminal', title: 'git commit', description: '提交项目的所有更改' }
+      if (action === 'push') return { card: 'terminal', title: 'git push', description: '推送当前分支到远端' }
+      if (action === 'c&p') return { card: 'terminal', title: 'git commit && git push', description: '提交项目的所有更改并推送' }
+      return { card: 'terminal', title: 'git …', description: '提交或推送项目仓库' }
+    },
     presentResult: terminalResult
   })
 }
@@ -592,7 +641,7 @@ function defineGitCommit(tools) {
  * 执行顺序与中断：按参数顺序、每个路径内按名称排序深度优先，逐个执行；遇到第一个
  * 问题（路径不存在 / 无 .js 脚本 / 起不来子进程 / 非零退出 / 超时）就停下，不再执行
  * 后面的脚本——后面的脚本多半依赖前面的结果，继续跑只会把同一条错误重复一遍
- * （与 git_commit 里 `add` 失败就不再 `commit` 同因）。
+ * （与 git 里 `add` 失败就不再 `commit` 同因）。
  * @param {object} tools - dsh-tools 注册表。
  */
 function defineNode(tools) {
@@ -837,7 +886,7 @@ function defineDelete(tools) {
    * 依次删除每个路径项，遇到第一个问题就停下。
    *
    * 停下而不是跳过继续：路径写错时后面的删除多半也建立在同一个错误理解上，
-   * 继续删只会把不该删的东西删掉（与 node / git_commit 同因）。
+   * 继续删只会把不该删的东西删掉（与 node / git 同因）。
    * @param {string} root - 会话工作区根目录。
    * @param {string[]} items - 模型给出的路径项。
    * @returns {{removed: object[], failure: string | null}}
@@ -1120,7 +1169,7 @@ function defineBrowser(tools) {
       let settled = false
       // 先声明后赋值：spawn 同步抛错时 settle 会立刻执行，此时这两个变量必须已存在。
       let timer
-      let onAbort = () => {}
+      let onAbort = () => { }
       const cleanup = () => {
         try { fs.closeSync(outFd) } catch { /* 已关闭 */ }
         try { fs.closeSync(errFd) } catch { /* 已关闭 */ }
@@ -1272,7 +1321,7 @@ function defineBrowser(tools) {
 const DEFINITIONS = {
   typecheck: defineTypecheck,
   test: defineTest,
-  git_commit: defineGitCommit,
+  git: defineGit,
   node: defineNode,
   delete: defineDelete,
   browser: defineBrowser

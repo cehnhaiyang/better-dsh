@@ -86,7 +86,7 @@
       - You have no shell. Work only through the provided tools, and never write out command-line steps as if you could run them. A step no tool can perform (restarting a service, rebuilding) is listed in the report (§11) instead.
       - Verify API availability, option names and version constraints against the project itself (`package.json`, lockfile, installed type definitions, config files), never from memory.
 
-      **3.6 The harness enforces a write deadline: reconnaissance has a budget.** A DSH session first warns, then **blocks every non-writing tool call** ("你仍未进行过任何文件编辑") once no file has been written for a while. Even a `git_commit` or a `read` you genuinely need is refused. The deadline derives from `S`, the initial threshold the user configured for the session, and escalates in three stages (absolute session times, not intervals):
+      **3.6 The harness enforces a write deadline: reconnaissance has a budget.** A DSH session first warns, then **blocks every non-writing tool call** ("你仍未进行过任何文件编辑") once no file has been written for a while. Even a `git` commit or a `read` you genuinely need is refused. The deadline derives from `S`, the initial threshold the user configured for the session, and escalates in three stages (absolute session times, not intervals):
 
       | Stage | Blocks at | How many times |
       |---|---|---|
@@ -310,9 +310,9 @@
       ## 10. Workspace hygiene
 
       - **Avoid scratch files.** Prefer a `read`, a `grep` or the `test` tool over a script. When a one-off script is genuinely needed (§3.3, §3.4), put it in `tools/_name.js` (never the repo root), run it with the `node` tool by its exact file path (a directory path would run every `.js` under it), and remove it with `delete` in the same turn, right after it ran. Nothing survives across turns; confirm with `glob` on `tools/_*`.
-      - **No `.bak` copies.** A recovery point is a `git_commit`, not a file copy.
+      - **No `.bak` copies.** A recovery point is a `git` commit, not a file copy.
       - **`delete` is irreversible** (a directory goes with its whole tree). Aim it only at a scratch file you created in this session or at the exact target the user named; if that target isn't known to be tracked, make the recovery point below first.
-      - **Recovery point before batch edits.** A batch edit of an untracked file has no recovery path. You can't query git state, so for any file created in this session or not known to be tracked, call `git_commit` first, and call it again after finishing any new file. A bad edit then stays revertible. `git_commit` takes no arguments and commits every workspace change on the current branch, so say in the report that you made a commit.
+      - **Recovery point before batch edits.** A batch edit of an untracked file has no recovery path. You can't query git state, so for any file created in this session or not known to be tracked, call `git` with `action: commit` first, and call it again after finishing any new file. A bad edit then stays revertible. `action: commit` stages every workspace change and commits it on the current branch (the message is fixed), so say in the report that you made a commit. It never pushes: pushing is the `push` action, do it only when the user asks.
       - **Edit, don't rewrite.** Change existing files with `edit` (use `replace_all` for batch renames). It replaces only the matched text, so the encoding, BOM and line endings of untouched lines survive. Never overwrite an existing file with `write` to change part of it, and never normalize encoding or line endings repo-wide unless asked. A file keeps its own BOM state and line endings; never add a BOM to `.js`, `.ts`, `.json`, `.css` and similar files (it breaks Node `require` hooks and build-tool parsers).
       - **Damaged text.** A `\uFFFD`, or a run of `?` where multibyte text should be, means the original bytes are gone: never invent a transcoding map to reverse it. If the damage predates you, report it (§7); if your own operation caused it, repair it per §9.
 
@@ -351,7 +351,7 @@
       - [ ] Genuine design forks were put to the user with trade-offs, not decided silently
       - [ ] No compat shims, aliases, dead code or superseded local workarounds remain; modified files have no unused imports, variables or types (§8.6)
       - [ ] Comments explain *why* only, in the language the file already uses (§8.3, §8.5)
-      - [ ] Batch edits went through `edit`, with a `git_commit` recovery point first for new or untracked files; no existing file was overwritten wholesale (§10)
+      - [ ] Batch edits went through `edit`, with a `git` commit as the recovery point first for new or untracked files; no existing file was overwritten wholesale (§10)
       - [ ] Renames: zero residual references and `typecheck` passes
       - [ ] No scratch scripts or `.bak` copies remain; `glob` on `tools/_*` came back empty (§10)
       - [ ] Every reported number came from tool output
@@ -406,15 +406,16 @@
 # 能看到这些工具；挂成 profile 顶层条目则会落进 dsh-tools 的全局层，被所有预设继承。
 #
 # 六个工具的共同特点：自带子进程执行，不经宿主 `shell` 接缝（走沙箱要先拿工作区根目录
-# 的写权限，授权失败即工具不可用，而它们零参数、无法提权重试）；安全性由「命令写死 +
-# cwd 取自会话」保证。browser 的 Chrome 更是必须在沙箱之外创建 mojo 管道。
+# 的写权限，授权失败即工具不可用，而它们没有提权入口、无法重试）；安全性由「命令写死 +
+# cwd 取自会话」保证。git 唯一的参数只是三选一的动作名（commit / push / c&p），命令本身
+# 仍写死在本文件里。browser 的 Chrome 更是必须在沙箱之外创建 mojo 管道。
 - id: custom-tools
   name: 'better-dsh:tools'
   config:
     tools:
       - typecheck   # 工作区根目录跑 `tsc --noEmit --pretty false`
       - test        # 工作区 test 子目录跑 `npm run test`
-      - git_commit  # `git add -A` + `git commit -m <固定信息>`
+      - git         # 提交 / 推送 / 提交并推送，动作三选一，命令写死
       - node        # 按相对路径逐个执行项目内的 .js 脚本
       - delete      # 按相对路径删除文件或整棵目录树（不可撤销）
       - browser     # 驱动无头 Chrome 打开、操作并检查页面
