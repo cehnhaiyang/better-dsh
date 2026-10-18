@@ -426,6 +426,13 @@
 - id: tool-delete
   name: './delete.js'
 
+# browser：驱动一个真实的无头 Chrome 打开、操作并检查页面。
+# action 取 open / snapshot / click / fill / press / wait / get / eval /
+# screenshot / close，命令由本插件拼装，模型只能填参数值。
+# 浏览器在多次调用之间保持运行，用完必须 close。截图默认落在工作区的 .browser/ 下。
+- id: tool-browser
+  name: './browser.js'
+
 # ── 目标（Goals）：人类命令与模型侧工具 ───────────────────────────────────
 
 # 目标领域（`goals`）与续行驱动器留在宿主平面：网关以 Remote 端点提供目标领域，

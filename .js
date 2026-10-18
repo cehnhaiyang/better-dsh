@@ -38,7 +38,8 @@
 //      `~/.dsh/settings.yaml` 不再是生效源（dsh 只在启动时一次性导入，且只接受
 //      volatile 字段）；本脚本用同一套旧名映射把「有同名条目」的 section 直接写进
 //      profile patch（静态 config 不受 volatile 限制，覆盖面更全）。补丁里已有同名
-//      条目的 section 一律跳过，不覆盖网页端的修改。
+//      条目的 section 一律跳过，不覆盖网页端的修改。只解析 settings.yaml 本身，
+//      不读 settings.yaml.imported；该文件不存在时整段跳过并保留既有区块。
 //
 //   4. 配置自动注入与挂载：
 //      - 自动检查并更新 `~/.dsh/profiles/web/cordis.patch.yml`，
@@ -2775,11 +2776,9 @@ function buildPresetDeclarationsBlock() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 3.5 旧版 settings.yaml 迁移（「设置」改存 profile 补丁）
 //
-// dsh-settings 只在启动时把 ~/.dsh/settings.yaml 一次性导入——先改名为
-// settings.yaml.imported，再逐 section 写进「同名 Loader 条目」的 config；且它只接受
-// 声明为 volatile 的字段（write() 里三道拒绝：无同名条目 / 无 volatile 字段 /
-// 该字段非 volatile）。导入不成的 section 只打一条警告，值就永远留在 .imported 里，
-// 网页端自然读不到。
+// 只解析 ~/.dsh/settings.yaml 本身。`settings.yaml.imported` 是官方 dsh-settings
+// 导入后留下的归档，里面的值可能早已被网页端改过，拿它当迁移源会把旧值写回补丁层
+// 覆盖现行设置，因此不再读取。
 //
 // 本阶段用同一套旧名映射把「补丁层能表达」的部分直接写进 profile patch：
 //   - 有同名条目的 section → 生成 `- id: <条目>` + `config:` 行。补丁层不区分
@@ -2787,11 +2786,13 @@ function buildPresetDeclarationsBlock() {
 //     因此覆盖面比官方导入更全（例如 ui-theme 的 preference 也能落回来）；
 //   - 无同名条目的 section → 打印丢弃原因，值仍保留在 legacy 文件里，不静默消失。
 // 幂等：补丁里已存在同名顶层条目的 section 一律跳过，网页端后续的修改不会被覆盖。
+//
+// 没有 settings.yaml 时整段跳过，并把上一版生成的区块原样保留：托管区块在重建前
+// 已被摘除，若此时返回空区块，那段配置就会从补丁里静默消失。
 // ─────────────────────────────────────────────────────────────────────────────
 
 const LEGACY_SETTINGS_SOURCES = [
     path.join(DSH_ROOT, 'settings.yaml'),
-    path.join(DSH_ROOT, 'settings.yaml.imported'),
 ]
 // 官方 dsh-settings 的 LEGACY_SECTION_ENTRIES：旧 section 名 → 现行 Loader 条目 id。
 const LEGACY_SECTION_ENTRIES = {
@@ -2865,7 +2866,15 @@ function normalizeLegacySections(document) {
     }))
 }
 
-/** 读取 legacy 设置文档；settings.yaml 优先，其次 .imported。 */
+/**
+ * 读取 legacy 设置文档。
+ *
+ * 只认 settings.yaml 本身。`settings.yaml.imported` 是官方 dsh-settings 导入后
+ * 留下的归档文件——它记录的是「官方已经处理过、且只处理了一部分」的旧值，
+ * 拿它当迁移源会把早已被网页端改过的字段重新写回补丁层，覆盖用户的现行设置。
+ * 该文件不存在或不再更新时，这里返回 undefined，调用方据此跳过整段迁移。
+ * @returns {{source: string | undefined, items: unknown[] | undefined}}
+ */
 function readLegacySettings() {
     const source = LEGACY_SETTINGS_SOURCES.find((file) => fs.existsSync(file))
     if (source === undefined) return { source: undefined, items: undefined }
@@ -2988,9 +2997,11 @@ const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
  * @returns 区块文本与三段清单（已迁移 / 跳过 / 丢弃）。
  */
 function buildLegacySettingsBlock(patchContent, profileName) {
-    const empty = { text: '', imported: [], skipped: [], dropped: [], unavailable: false }
+    const empty = { text: '', imported: [], skipped: [], dropped: [], unavailable: false, noSource: false }
     const legacy = readLegacySettings()
-    if (legacy.items === undefined) return empty
+    // 没有 settings.yaml 时不是「没有可迁移项」，而是「本次无从判断」：
+    // 返回 noSource，让调用方保留上一版区块原文，而不是把它当成空区块删掉。
+    if (legacy.items === undefined) return { ...empty, noSource: legacy.source === undefined }
     if (legacy.items.length === 0) return empty
 
     const entryIds = loadProfileEntryIds(profileName)
@@ -3162,10 +3173,15 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     if (legacySettings.text.length > 0) {
         patchContent += `\n\n${legacySettings.text.trim()}`
         console.log(`  [settings] 已迁移 ${legacySettings.imported.length} 个 legacy section: ${legacySettings.imported.join('、')}`)
-    } else if (legacySettings.unavailable === true && existingLegacyBlock !== undefined) {
-        // 重建不可用（多半是 --dump-config 失败），原样回填，绝不让设置凭空消失。
+    } else if ((legacySettings.unavailable === true || legacySettings.noSource === true) && existingLegacyBlock !== undefined) {
+        // 重建不可用（没有 settings.yaml，或 --dump-config 失败），原样回填，绝不让设置凭空消失。
         patchContent += `\n\n${existingLegacyBlock}`
-        console.warn('  [settings] 无法重建 legacy 设置区块（--dump-config 不可用），已原样保留现有内容，未做改动')
+        const why = legacySettings.noSource === true ? '未检测到 settings.yaml' : '--dump-config 不可用'
+        console.warn(`  [settings] 跳过 legacy 设置迁移（${why}），已原样保留现有内容，未做改动`)
+    } else if (legacySettings.noSource === true) {
+        console.log('  [settings] 未检测到 settings.yaml，跳过 legacy 设置迁移')
+    } else if (legacySettings.unavailable === true) {
+        console.warn('  [settings] 无法重建 legacy 设置区块（--dump-config 不可用），本次不写入该区块')
     } else {
         console.log('  [settings] 无待迁移的 legacy section')
     }
