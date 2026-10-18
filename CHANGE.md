@@ -13,6 +13,87 @@
 
 ---
 
+## 自定义工具集归一到一份实现，使用范围仍由各预设声明
+
+六个自定义工具（typecheck / test / git_commit / node / delete / browser）原先以
+「每个预设自带一份本地插件」的形式存在：`test` 与 `ts-build` 两个预设目录里各有一份
+**逐字节相同**的五个文件（typecheck / test / git-commit / node / delete），`browser`
+只存在于 `test`。同一份实现存两份，改一处忘一处就是静默的行为分裂。
+
+### 改法
+
+- 六个工具合并为**一个**根目录文件 `~/.dsh/tools.js`（手写资源，脚本只校验不生成）。
+- 预设仍然自己声明要用哪几个工具，只是不再带插件文件：
+
+  ```yaml
+  - id: custom-tools
+    name: 'better-dsh:tools'
+    config:
+      tools: [typecheck, test, git_commit, node, delete, browser]
+  ```
+
+  `better-dsh:tools` 是占位名，`.js` 在生成预设声明时把它改写成 `tools.js` 的本机
+  `file://` 绝对路径（DSH_ROOT 可被 `DSH_HOME` 覆盖，写死路径换台机器就静默失效）。
+  `config.tools` 是**该预设**要用的工具名，`tools.js` 的 `apply(ctx, config)` 只注册
+  这些。于是：实现只有一份，而每个预设的工具集仍由自己说了算。
+- `.js` 新增 `verifyToolsBundle()`：改写前核对 `tools.js` 能否加载、是否导出 `apply()`、
+  `inject` 是否含 `tools`、`TOOL_NAMES` 里每个工具名是否真的出现在注册调用中；另有
+  `checkDeclaredTools()` 核对各预设声明的工具名是否存在（写错名字只会让工具静默变少，
+  很难查，所以在部署时就点出来）。
+
+### 为什么必须是「预设声明」而不是「宿主平面全局挂载」
+
+`tools.register()` 把注册写进 `dsh-tools` 的分层作用域表，写进哪一层由**调用方上下文**
+决定（`ScopedLayers.effect` → `scopeOf(ctx)`，即 `ctx[kScope]`）：
+
+- 声明在预设 `plugins` 列表里的行，在**那个预设的作用域**里挂载 ——
+  `dsh-agent-preset-registry.activate()` 给每个预设铸一个独立的 `createScope`，
+  预设的行就挂在这个作用域下。因此该预设的会话看得到，别的预设看不到；
+- 挂成 profile 顶层条目（ctx 不带作用域标签）则进入 **global 层**，而
+  `ToolRuntime.view(scope)` 以 `this.layers.global.tools.entries()` 为起点组装可见集，
+  于是**每个**预设的会话都会继承它。
+
+后一种形态曾在本轮尝试中被采用，是错的：它把 `node` / `delete` / `git_commit` 这类
+执行能力强加给所有预设，包括设计上完全不给命令行的文学类预设；而且那样一来「预设声明
+自己用什么工具」这句话本身就失去了意义。官方工具走的正是前一条路 —— tool-fs /
+tool-goal / tool-ask-user 都是逐个声明在各预设的 `plugins` 里的。
+
+（若真要全局生效，正确写法是 `tools.restrict({ allow/deny })`，但它只在 agent 作用域内
+合法、会被 `dsh-tools` 拒于全局调用，且本部署用不上。）
+
+### 附带修掉的两处陈旧残留
+
+- `profiles/web/preset-assets/` 原先只做「缺什么补什么」的增量复制：来源里删掉的资源
+  会一直留在 profile 里。现在该目录在生成预设声明前**整棵重建** —— 它完全由
+  `.agent-presets/<id>/` 推导得出，删除是安全的。
+- `.js` 里新增一段清理：移除历史上曾写进 profile patch 的顶层 `custom-tools` 挂载
+  （按「顶层 insert + 2 空格 id」的精确形态摘除，不会误伤预设内那条同级缩进的声明）。
+
+### 验证方式与结论
+
+- **等价性**：以假 `ctx` 分别加载 git HEAD 里的六个旧插件与新的 `tools.js`，逐项比对
+  `description` / `parameters` / `output.schema` / `output.render` /
+  `presentCall`（含 null、undefined、`{}`、错类型参数等回放输入）/ `presentResult`
+  （正常、isError、非对象值）——全部逐字节一致。
+- **真实执行**：两套实现分别在临时工作区跑 `execute` 并比对输出——真跑 `tsc`
+  （伪造 `node_modules/typescript/bin/tsc`，退出码 0 与 2 两路，含 300KB 输出触发截断
+  提示）与 PATH 兜底报错、真跑 `npm run test`（通过 / 非零退出 / test 目录不存在三路）、
+  真 `git add -A` + `commit`（比对输出并确认两边工作区都变干净）、`node` 的 10 个场景
+  （单文件 / 目录递归 / 非零退出 / 不存在 / `..` 越界 / 根目录本身 / 绝对路径 / 非 .js /
+  单脚本超限截断 / 多脚本整段封顶）、`delete` 的 5 个场景（含删除后目录内容一致）、
+  `browser` 的 10 个场景（缺参、未知 action、截图越界与缺省路径等，含真跑
+  agent-browser 截图）。
+- **声明式选择**：子集只注册子集；无 `config.tools` 一个都不注册；未知名被跳过并报错。
+- **部署**：`node .js --apply` 连跑两次，补丁 md5 不变、历史顶层条目被正确清除、
+  `preset-assets/` 只剩三个预设自己的 `inject-filezone.js`。
+- **运行时（关键的那条）**：以临时 overlay 挂探针插件真实启动 web profile，逐个读
+  注册表里**真实挂载的预设修订**作用域：`test` 声明六个 -> 可见六个、`ts-build` 声明
+  五个 -> 可见五个、十个未声明的预设（含六个文学类与四个官方预设）-> 一个都不可见；
+  全局层为空。另单独验证：作用域销毁后注册随之注销；未知工具名报错且不注册。
+
+
+---
+
 ## 0.2.1-alpha.4 → 0.2.1-rc.2
 
 先逐项复核 0.2.1-rc.2 的安装目录，再按结论修改脚本。**rc.2 未改动脚本依赖的任何公开契约**，

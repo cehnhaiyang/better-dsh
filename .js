@@ -29,12 +29,21 @@
 //        （预设声明更新后把已运行会话重绑到新修订；上下文明细投影矫正部分已移除，见插件内注释）
 //      - 自动生成 `~/.dsh/plugins/explore-command.js`
 //        （/explore：全面探索工作区项目的架构与实现，产出一份完善的 PROJECT.md）
+//      - 挂载 `~/.dsh/tools.js`（手写资源，脚本只校验不生成）：自定义工具集的唯一
+//        实现（typecheck / test / git_commit / node / delete / browser）。工具**不是**
+//        在这里全局挂载的：预设用占位名 `better-dsh:tools` + `config: { tools: [...] }`
+//        声明自己要用哪几个，脚本在生成预设声明时把占位名改写成本机的 file:// 绝对
+//        路径。这样预设仍各自掌握自己的工具集，而实现只有一份、不再逐预设拷贝。
+//        契约（能否加载、六个工具是否真的注册）在改写前核对。
 //
 //   2. 自建预设迁移与落地：
 //      扫描 `~/.dsh/.agent-presets/<id>/`，把每个目录转成一条
 //      `@deepseek-ai/dsh-agent-preset` 声明行（id 取目录名，name/description/order 取
-//      preset.yml，plugins 为 agent.cordis.yml 的原样内联）；相对资源复制到
-//      `profiles/web/preset-assets/<id>/` 并改写引用。声明段以固定标记整段重建，幂等。
+//      preset.yml，plugins 为 agent.cordis.yml 的原样内联）；预设自己的相对资源
+//      （目前只有文件区注入插件）复制到 `profiles/web/preset-assets/<id>/` 并改写
+//      引用，该目录每次整棵重建，来源里删掉的资源不会在 profile 里留下过期拷贝。
+//      声明里的占位名 `better-dsh:tools` 改写成 `~/.dsh/tools.js` 的绝对 URL
+//      （预设因此不必写死机器相关路径，见第 1 节的说明）。声明段整段重建，幂等。
 //
 //   3. 旧版 settings.yaml 迁移：
 //      `~/.dsh/settings.yaml` 不再是生效源（dsh 只在启动时一次性导入，且只接受
@@ -86,6 +95,9 @@ const DSH_ROOT = process.env.DSH_HOME || path.join(HOME, '.dsh')
 // 本脚本面向 Web profile（WEB_PROFILE_DIR 与它必须一致，故集中成一个常量）。
 const PROFILE_NAME = 'web'
 const PLUGINS_DIR = path.join(DSH_ROOT, 'plugins')
+// 自定义工具集：typecheck / test / git_commit / node / delete / browser 六个工具的
+// 唯一实现，放在仓库根、由人手写维护（脚本只挂载与校验，不生成也不覆盖）。
+const TOOLS_FILE = path.join(DSH_ROOT, 'tools.js')
 const WEB_PROFILE_DIR = path.join(DSH_ROOT, 'profiles', PROFILE_NAME)
 const CORDIS_PATCH_FILE = path.join(WEB_PROFILE_DIR, 'cordis.patch.yml')
 
@@ -2667,6 +2679,51 @@ function verifyIdleArmBundle() {
     return problems
 }
 
+/**
+ * 校验自定义工具集（`tools.js`）的契约。
+ *
+ * 只检查文件存在是不够的：一个语法错误，或某个工具从注册列表里漏掉，结果都是
+ * 「工具静默不见了」——模型调不到它时才发现，而脚本照样打印部署成功。这里把契约
+ * 逐条对上：能加载、导出 apply()、inject 里带 `tools`，以及 TOOL_NAMES 声明的每个
+ * 工具名在源码里都真的出现在注册调用的位置。
+ * @returns {{problems: string[], names: string[]}} 问题列表与声明注册的工具名。
+ */
+function verifyToolsBundle() {
+    const problems = []
+    if (!fs.existsSync(TOOLS_FILE)) {
+        problems.push(`缺少 ${TOOLS_FILE}`)
+        return { problems, names: [] }
+    }
+    const source = fs.readFileSync(TOOLS_FILE, 'utf8')
+    let plugin
+    try {
+        plugin = require(TOOLS_FILE)
+    } catch (error) {
+        problems.push(`${TOOLS_FILE} 无法加载: ${error.message}`)
+        return { problems, names: [] }
+    }
+    if (typeof plugin.apply !== 'function') problems.push(`${TOOLS_FILE} 没有导出 apply()`)
+    if (!Array.isArray(plugin.inject) || !plugin.inject.includes('tools')) {
+        problems.push(`${TOOLS_FILE} 的 inject 里必须包含 'tools'（否则拿不到注册表，工具一个都装不上）`)
+    }
+    const names = Array.isArray(plugin.TOOL_NAMES) ? plugin.TOOL_NAMES.filter((name) => typeof name === 'string') : []
+    if (names.length === 0) problems.push(`${TOOLS_FILE} 未导出 TOOL_NAMES，无从核对注册契约`)
+    for (const name of names) {
+        // 只声明不注册等于没装：注册调用一律写成 `name: '<工具名>',`。
+        if (!source.includes(`name: '${name}',`)) problems.push(`TOOL_NAMES 声明了 ${name}，但源码里没有注册它的调用`)
+    }
+    return { problems, names }
+}
+
+const toolsBundle = verifyToolsBundle()
+if (toolsBundle.problems.length > 0) {
+    for (const problem of toolsBundle.problems) console.error(`  [tools] ${problem}`)
+    console.error(`  [tools] 自定义工具集不完整：六个工具都不会出现在任何会话里。请从仓库恢复 ${TOOLS_FILE}。`)
+    process.exitCode = 1
+} else {
+    console.log(`[tools] 自定义工具集就位: ${TOOLS_FILE}（${toolsBundle.names.join(' / ')}，由各预设按需声明）`)
+}
+
 const idleArmProblems = verifyIdleArmBundle()
 if (idleArmProblems.length > 0) {
     for (const problem of idleArmProblems) console.error(`  [idle-arm] ${problem}`)
@@ -2728,6 +2785,79 @@ function relocateRelativeAssets(presetId, presetDir, body) {
     })
 }
 
+// 预设声明里引用自定义工具集的占位名。预设不能写死 file:// 绝对路径：DSH_HOME
+// 可被覆盖、仓库可能换位置，写死的路径会在别的机器上静默失效。因此约定一个占位名，
+// 由这里改写成当前 TOOLS_FILE 的绝对 URL。
+const TOOLS_PLACEHOLDER = 'better-dsh:tools'
+
+// 把预设声明里的工具集占位名改写成本机绝对路径。与 relocateRelativeAssets 分开：
+// 那条处理的是「拷贝资源」，这条只是改写一个名字，不搬文件。
+function rewriteToolsPlaceholder(presetId, body) {
+    const pattern = new RegExp(`^([ \\t]*-?[ \\t]*name:[ \\t]*)(['"]?)${TOOLS_PLACEHOLDER.replace(/[:]/g, '\\:')}(\\2)[ \\t]*$`, 'gm')
+    const url = pathToFileURL(TOOLS_FILE).href
+    return body.replace(pattern, (match, head, quote) => {
+        if (toolsBundle.problems.length > 0) {
+            console.warn(`  [presets] 预设「${presetId}」声明了自定义工具集，但工具集不可用（见上方 [tools] 报文），该行保持占位名不动`)
+            return match
+        }
+        console.log(`  [presets] 预设「${presetId}」引用自定义工具集: ${url}`)
+        return `${head}${quote}${url}${quote}`
+    })
+}
+
+// 核对预设声明的工具名是否都真实存在。写错一个名字不会让部署失败（tools.js 只会
+// 跳过它），结果是模型调不到那个工具却没有别处报错，因此在这里就点出来。
+//
+// 从 custom-tools 那一行开始解析，而不是扫全文的 `tools:`：别的插件完全可能也有一个
+// 叫 tools 的配置键，按名字扫会把它当成工具清单读。
+function checkDeclaredTools(presetId, body) {
+    const names = new Set(toolsBundle.names)
+    if (names.size === 0) return
+    const lines = body.split('\n')
+    // name 行此时已由 rewriteToolsPlaceholder 改写为绝对 URL（工具集不可用时仍是占位名），
+    // 两种写法都要认。
+    const anchor = lines.findIndex((line) => /^[ \t]*-?[ \t]*name:[ \t]*['"]?(better-dsh:tools|file:\/\/)/.test(line)
+        && line.includes(TOOLS_PLACEHOLDER) || /^[ \t]*-?[ \t]*name:[ \t]*['"]?file:\/\/.*tools\.js/.test(line))
+    if (anchor < 0) return
+
+    const declared = []
+    let inTools = false
+    let listIndent = -1
+    for (let index = anchor + 1; index < lines.length; index += 1) {
+        const line = lines[index]
+        if (/^[ \t]*-?[ \t]*id:/.test(line)) break // 下一个插件行，说明本行没有 config.tools
+        const key = /^([ \t]*)tools:[ \t]*(.*)$/.exec(line)
+        if (key !== null) {
+            inTools = true
+            listIndent = key[1].length
+            // 行内写法 `tools: [a, b]` 与块列表共用同一套切分。
+            for (const item of key[2].replace(/^\[|\]$/g, '').split(',')) {
+                const name = item.trim().replace(/^['"]|['"]$/g, '')
+                if (name.length > 0) declared.push(name)
+            }
+            continue
+        }
+        if (!inTools) continue
+        const item = /^([ \t]*)-[ \t]+([^#\s]+)/.exec(line)
+        // 列表项必须比 tools: 更深（块列表），否则说明列表已经结束、这是同级的下一行。
+        if (item !== null && item[1].length > listIndent) {
+            declared.push(item[2].replace(/^['"]|['"]$/g, ''))
+            continue
+        }
+        if (line.trim().length > 0) break
+    }
+
+    if (declared.length === 0) {
+        console.warn(`  [presets] 预设「${presetId}」声明了自定义工具集，但没有 config.tools：该预设不会获得任何自定义工具`)
+        return
+    }
+    const unknown = declared.filter((name) => !names.has(name))
+    if (unknown.length > 0) {
+        console.warn(`  [presets] 预设「${presetId}」声明了不存在的工具 ${unknown.map((n) => `'${n}'`).join('、')}；`
+            + `可用的有：${toolsBundle.names.join(' / ')}`)
+    }
+}
+
 // 生成完整的预设声明段（含起始标记），供 profile patch 整段替换。
 function buildPresetDeclarationsBlock() {
     if (!fs.existsSync(LEGACY_PRESETS_DIR)) return { text: '', count: 0, ids: [] }
@@ -2739,12 +2869,19 @@ function buildPresetDeclarationsBlock() {
         .sort()
     if (ids.length === 0) return { text: '', count: 0, ids: [] }
 
+    // 资源目录每次整棵重建，而不是「缺什么补什么」：来源里删掉的资源必须跟着从
+    // profile 里消失，否则 preset-assets 会一直留着过期拷贝（工具插件改成共享实现后
+    // 就正是这种情况），将来 grep 到还会以为工具是它提供的。该目录是纯生成物，
+    // 内容完全由上面这些目录推导得出，可以放心删。
+    fs.rmSync(PRESET_ASSETS_DIR, { recursive: true, force: true })
+
     const blocks = []
     for (const id of ids) {
         const presetDir = path.join(LEGACY_PRESETS_DIR, id)
         const meta = readPresetMeta(path.join(presetDir, 'preset.yml'))
         const rawBody = fs.readFileSync(path.join(presetDir, 'agent.cordis.yml'), 'utf8').replace(/\r\n/g, '\n')
-        const body = relocateRelativeAssets(id, presetDir, rawBody)
+        const body = rewriteToolsPlaceholder(id, relocateRelativeAssets(id, presetDir, rawBody))
+        checkDeclaredTools(id, body)
 
         const lines = [
             `    - id: preset-${id}`,
@@ -3081,6 +3218,18 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
         console.log('  [profile] 已移除旧的 host 层 compaction-basic 启用行（压缩后端由 agent preset 提供）')
     }
 
+    // 清除曾经挂过的顶层 custom-tools 条目。自定义工具集只在预设自己的声明里出现
+    // （见第 5 步前的说明），而顶层条目的注册会落进 dsh-tools 的全局层、被所有预设
+    // 继承——正是要避免的形态。顶层的 insert 形如：
+    //     - insert:\n    - id: custom-tools\n      name: file:///...
+    // 它与预设内那一条的缩进不同（预设内是 10 空格下的 4 空格层级，且带 config），
+    // 因此按「顶层 insert + 2 空格 id」这一精确形态整段摘除，不会误伤预设内的声明。
+    const legacyToolsMountPattern = /(^|\n)- insert:\n    - id: custom-tools\n      name: [^\n]*\n?/
+    if (legacyToolsMountPattern.test(patchContent)) {
+        patchContent = patchContent.replace(legacyToolsMountPattern, '\n').replace(/\n{3,}/g, '\n\n').trim()
+        console.log('  [profile] 已移除旧的顶层 custom-tools 挂载（工具集改由各预设按需声明）')
+    }
+
     // 挂载位置：托管区块（legacy 设置 / 预设声明）必须固定位于文件末尾，因此新条目
     // 一律插到第一个托管标记之前，绝不能 append 到末尾 —— 第 5 步会从第一个托管标记
     // 处整体截断重建，追加到末尾的新条目会被那一步直接抹掉（表现为新插件静默不生效，
@@ -3141,6 +3290,13 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     } else {
         patchContent = patchContent.replace(/(- id: idle-arm\n      name:\s*)['"]?[^'"\n]*['"]?/, `$1${absIdleArm}`)
     }
+
+    // 注意：自定义工具集**不**在这里挂载。tools.js 只提供实现，一个预设能用哪几个
+    // 工具由该预设自己的声明决定（见 buildPresetDeclarationsBlock 里的占位名改写）。
+    // 挂成这里的顶层条目会把注册写进 dsh-tools 的全局层，而 ToolRuntime.view() 以
+    // 全局层为起点组装可见集，于是**每个**预设都会继承——包括设计上不给命令行的
+    // 文学类预设，也会凭空多出 node / delete / git_commit。官方工具走的正是预设声明
+    // 这条路（tool-fs / tool-goal / tool-ask-user 都是逐预设声明的）。
 
     // 5. 重建托管区块（legacy 设置迁移 + 自建预设声明）：两段都固定位于文件末尾，
     //    先按标记整体截断、再按固定顺序重建，因此天然幂等。
