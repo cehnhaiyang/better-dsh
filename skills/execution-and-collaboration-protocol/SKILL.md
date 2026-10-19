@@ -281,29 +281,9 @@ In every file you modified, remove unused imports, dead code, unused variables a
 
 ## 9. Workspace hygiene
 
-- Avoid writing temp files. When a script is needed, feed it through stdin (§10.2) so nothing touches disk. Otherwise put it in `tools/` (never the repo root) and delete it in the same tool batch that ran it; same for `.bak` files. Nothing survives across turns; confirm with `Test-Path` and a listing of `tools/_*`.
-- **Before any batch edit, the file must be git-tracked:** `git ls-files --error-unmatch <file>`. Untracked has no recovery path: `git add <that file>` first (never `git add -A`, which stages unrelated work) or don't batch-edit it. `git add` costs a second and turns irreversible loss into a one-line revert; also do it after finishing any new file.
+- When a script is needed, feed it through stdin (§10.2) so nothing touches disk. Otherwise put it in `tools/` (never the repo root) and delete it in the same tool batch that ran it; same for `.bak` files. Nothing survives across turns; confirm with `Test-Path` and a listing of `tools/_*`.
 - Prefer the built-in `edit` tool (with `replace_all`) over a script: it does the same batch rename without touching encoding.
-- **Never commit without an explicit user instruction, not during the task and not after it.** The user reviews diffs; an unasked commit removes their review point. When the user does instruct a commit, remember the commit tool stages *everything* (`git add -A` semantics): foreign working-tree changes (the user's own edits, deletions, untracked files) get swept in. If the tree contains changes you did not make, name them and let the user decide before committing.
-- **The `write` tool intermittently rejects a brand-new filename** with "file no longer exists — re-read the file, then retry", while accepting a sibling name moments later. Re-reading cannot fix it (the file never existed); pick a different filename for the scratch file.
-
-### 9.1 Two ways `edit` silently merges or duplicates lines
-
-Both produce a file that still parses and looks plausible.
-
-**A trailing newline in `old_string` swallows the line break.** If `old_string` ends with `\n` and `new_string` does not, the next line is pulled up into the replaced text:
-
-```
-old_string: "# ...the world is falling.\n"     <- trailing newline included
-new_string: "# ...the world is falling."       <- no trailing newline
-result:     "# ...the world is falling.# Bells and scraping are..."   <- merged
-```
-
-Rule: **make `new_string` end the same way `old_string` does.** When in doubt, anchor on whole lines and leave the trailing newline out of both.
-
-**Re-including surrounding lines duplicates them.** When edit 2 uses the *output* of edit 1 as its `old_string`, the lines just outside the matched region are still there; putting them back into `new_string` (a title line, say) duplicates them.
-
-Rule: **before each edit in a sequence, re-read the current region.** Build the next `old_string` from the file, never from memory of what you just wrote. After any multi-edit pass on one file, `read` the touched regions back and check that the line count changed by roughly what you intended.
+- **Never commit without an explicit user instruction, not during the task and not after it.** The user reviews diffs; an unasked commit removes their review point.
 
 ## 10. Windows PowerShell 5.1 / CP936 text safety
 

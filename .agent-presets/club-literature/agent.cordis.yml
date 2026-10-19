@@ -78,12 +78,6 @@
 
        设定/法典.md的内容即法典全文，它是实时动态更新的。
 
-# 代理指令容器：承载会话级附加指令，上限 64KB（防止无限膨胀）。
-- id: agent-instructions
-  name: '@deepseek-ai/dsh-agent-instructions'
-  config:
-    maxBytes: 65536
-
 # 文学创作模式不提供 Shell 工具：文件读写与检索由 `tool-fs`/`tool-fs-search`
 # 覆盖，保持工具目录专注于创作。需要时再从此处恢复 `tool-bash`/`tool-pwsh`。
 
