@@ -29,6 +29,11 @@
 //        （预设声明更新后把已运行会话重绑到新修订；上下文明细投影矫正部分已移除，见插件内注释）
 //      - 自动生成 `~/.dsh/plugins/explore-command.js`
 //        （/explore：全面探索工作区项目的架构与实现，产出一份完善的 PROJECT.md）
+//      - 挂载 `~/.dsh/plugins/prompt-forge/`（手写资源，脚本只校验不生成）：
+//        提示词锻造双面插件。宿主半边注册 /forge 命令、forge_prompt 工具与
+//        /api/forge/* 路由；客户端半边在输入框右侧挂一个「改写」按钮与面板。
+//        三种强度共用一份内核：rewrite（只重述）/ augment（保守增量）/
+//        structure（七段结构化）。模型调用走 ctx.llm，不引入第二套凭据。
 //      - 挂载 `~/.dsh/tools.js`（手写资源，脚本只校验不生成）：自定义工具集的唯一
 //        实现（typecheck / test / git / node / delete / browser）。工具**不是**
 //        在这里全局挂载的：预设用占位名 `better-dsh:tools` + `config: { tools: [...] }`
@@ -2631,6 +2636,18 @@ fs.mkdirSync(path.join(IDLE_ARM_DIR, 'lib'), { recursive: true })
 // 早已不存在的 /idle-arm 命令——生成物一旦有「只在缺失时写」的守卫就会这样悄悄漂移。
 fs.writeFileSync(IDLE_ARM_HOST, IDLE_ARM_HOST_CODE, 'utf8')
 
+// prompt-forge 与 idle-arm 同样是「宿主半边 + 客户端半边」的双面插件，理由完全一致：
+// dsh-client-modules 靠 package.json 的 exports["./client"] 定位客户端 bundle，而
+// nearestPackage 是向上找最近的 package.json，所以声明只能放在自己的子目录里。
+//
+// 与其它插件不同，它是**手写资源**：lib/ 下五个模块（index / client / prompt /
+// forge-prompts / templates）全部在仓库里维护，脚本既不生成也不覆盖 —— 那些文件里的
+// 提示词与渲染规则是逐字校对过的，生成器覆写只会把它们悄悄改回旧版本。
+const PROMPT_FORGE_DIR = path.join(PLUGINS_DIR, 'prompt-forge')
+const PROMPT_FORGE_PKG = path.join(PROMPT_FORGE_DIR, 'package.json')
+const PROMPT_FORGE_HOST = path.join(PROMPT_FORGE_DIR, 'lib', 'index.js')
+const PROMPT_FORGE_CLIENT = path.join(PROMPT_FORGE_DIR, 'lib', 'client.js')
+
 /**
  * 校验 idle-arm 的双面声明是否真的成立。
  *
@@ -2677,6 +2694,78 @@ function verifyIdleArmBundle() {
     problems.push(`bundle 注册 id「${registered[1]}」与 package.json name「${name}」不一致（client-modules 会拒绝装配）`)
   }
   return problems
+}
+
+/**
+ * 校验 prompt-forge 的双面声明与模块完整性。
+ *
+ * 与 idle-arm 同一套契约检查（package.json 的 dsh.client + exports["./client"] +
+ * bundle 注册 id 等于包名），额外多两条它独有的：
+ *   · 宿主半边必须导出 apply / inject / name，且 inject 里带 tools 与 commands；
+ *   · lib/ 下五个模块一个都不能少 —— 少一个的后果是 import 期 ERR_MODULE_NOT_FOUND，
+ *     fiber 停在未激活且不报错（ESM 的失败不会冒泡到部署脚本）。
+ * @returns {string[]} 问题列表（空数组表示全部通过）。
+ */
+function verifyPromptForgeBundle() {
+  const problems = []
+  if (!fs.existsSync(PROMPT_FORGE_PKG)) {
+    problems.push(`缺少 ${PROMPT_FORGE_PKG}`)
+    return problems
+  }
+  for (const file of [PROMPT_FORGE_HOST, PROMPT_FORGE_CLIENT]) {
+    if (!fs.existsSync(file)) problems.push(`缺少 ${file}`)
+  }
+  for (const name of ['prompt.js', 'templates.js', 'forge-prompts.js']) {
+    const file = path.join(PROMPT_FORGE_DIR, 'lib', name)
+    if (!fs.existsSync(file)) problems.push(`缺少 ${file}（宿主半边 import 它，缺失会让整个插件静默不激活）`)
+  }
+  let manifest
+  try {
+    manifest = JSON.parse(fs.readFileSync(PROMPT_FORGE_PKG, 'utf8'))
+  } catch (error) {
+    problems.push(`${PROMPT_FORGE_PKG} 不是合法 JSON: ${error.message}`)
+    return problems
+  }
+  const pkgName = manifest.name
+  if (typeof pkgName !== 'string' || pkgName.length === 0) problems.push(`${PROMPT_FORGE_PKG} 缺少 name`)
+  if (manifest?.dsh?.client?.platform !== 'web') problems.push(`${PROMPT_FORGE_PKG} 的 dsh.client.platform 必须是 'web'`)
+  const clientExport = manifest?.exports?.['./client']
+  const clientRel = typeof clientExport === 'string' ? clientExport : clientExport?.default
+  if (typeof clientRel !== 'string' || clientRel.length === 0) {
+    problems.push(`${PROMPT_FORGE_PKG} 的 exports["./client"] 未指向客户端 bundle`)
+  } else if (!fs.existsSync(path.join(PROMPT_FORGE_DIR, clientRel))) {
+    problems.push(`${PROMPT_FORGE_PKG} 的 exports["./client"] 指向不存在的文件: ${clientRel}`)
+  }
+  // bundle 注册的 id 必须与包名一致，否则 client-modules 直接判为「loaded without registering」。
+  if (fs.existsSync(PROMPT_FORGE_CLIENT)) {
+    const registered = /__ModuleLoader__\.load\(\{\s*id:\s*['"]([^'"]+)['"]/.exec(fs.readFileSync(PROMPT_FORGE_CLIENT, 'utf8'))
+    if (registered === null) {
+      problems.push(`${PROMPT_FORGE_CLIENT} 未按 window.__ModuleLoader__.load({ id, factory }) 形式注册`)
+    } else if (typeof pkgName === 'string' && registered[1] !== pkgName) {
+      problems.push(`bundle 注册 id「${registered[1]}」与 package.json name「${pkgName}」不一致（client-modules 会拒绝装配）`)
+    }
+  }
+  // 宿主半边的导出契约：ESM 下用文本匹配，避免在这里引入动态 import（顶层 await 会
+  // 把整个部署脚本变成异步模块，而它现在是同步 CommonJS）。
+  if (fs.existsSync(PROMPT_FORGE_HOST)) {
+    const host = fs.readFileSync(PROMPT_FORGE_HOST, 'utf8')
+    for (const symbol of ['export function apply', 'export const inject', 'export const name']) {
+      if (!host.includes(symbol)) problems.push(`${PROMPT_FORGE_HOST} 缺少 ${symbol}`)
+    }
+    if (!/'tools'/.test(host) || !/'commands'/.test(host)) {
+      problems.push(`${PROMPT_FORGE_HOST} 的 inject 必须同时包含 'tools' 与 'commands'`)
+    }
+  }
+  return problems
+}
+
+const promptForgeProblems = verifyPromptForgeBundle()
+if (promptForgeProblems.length > 0) {
+  for (const problem of promptForgeProblems) console.error(`  [prompt-forge] ${problem}`)
+  console.error('  [prompt-forge] 双面声明不完整：输入框右侧的改写按钮不会出现。请从仓库恢复 plugins/prompt-forge/。')
+  process.exitCode = 1
+} else {
+  console.log(`[plugins] prompt-forge 双面插件就位: ${PROMPT_FORGE_DIR}`)
 }
 
 /**
@@ -3199,6 +3288,7 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
   const absExplore = pathToFileURL(exploreCommandPath).href
   const absIdleGuard = pathToFileURL(idleGuardPath).href
   const absIdleArm = pathToFileURL(IDLE_ARM_HOST).href
+  const absPromptForge = pathToFileURL(PROMPT_FORGE_HOST).href
 
   // 1. 不在 host 层启用 compaction-basic（同时自愈：删除旧版本脚本注入的那一行）。
   //    dsh-web-app bundle 明确把该 host 行置为 disabled，压缩后端整体下沉到
@@ -3289,6 +3379,20 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     patchContent = spliceBeforeManaged(`- insert:\n    - id: idle-arm\n      name: ${absIdleArm}`)
   } else {
     patchContent = patchContent.replace(/(- id: idle-arm\n      name:\s*)['"]?[^'"\n]*['"]?/, `$1${absIdleArm}`)
+  }
+
+  // 4.8 挂载 prompt-forge 双面插件（宿主半边注册工具/命令/路由；客户端半边提供
+  //     输入框右侧的「改写」按钮与面板）。
+  //     与 idle-arm 同一套理由：name 用 file:// 指向宿主半边，client-modules 的
+  //     locatePkgJson 对 path-like 行名走 nearestPackage，会从该文件向上找到
+  //     prompt-forge/package.json，从而拿到 exports["./client"]。因此行名不必等于
+  //     包名，包目录位置也不受 node_modules 限制。
+  //     幂等判据用条目 id `prompt-forge`（不能用包名：插入的是 file:// 路径，
+  //     不含包名，会导致每次运行都重复插入一条）。
+  if (!patchContent.includes('- id: prompt-forge')) {
+    patchContent = spliceBeforeManaged(`- insert:\n    - id: prompt-forge\n      name: ${absPromptForge}`)
+  } else {
+    patchContent = patchContent.replace(/(- id: prompt-forge\n      name:\s*)['"]?[^'"\n]*['"]?/, `$1${absPromptForge}`)
   }
 
   // 注意：自定义工具集**不**在这里挂载。tools.js 只提供实现，一个预设能用哪几个

@@ -1,0 +1,29 @@
+{
+  "name": "dsh-plugin-prompt-forge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "提示词锻造：结构化表单 + 模型改写 + 提示词库，三条入口共用一份渲染内核",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "lib/prompt.js",
+    "lib/templates.js",
+    "lib/forge-prompts.js"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  }
+}
