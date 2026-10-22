@@ -2,22 +2,6 @@
   name: "@deepseek-ai/dsh-llm-pi-ai"
   config:
     providers:
-      cline:
-        displayName: cline
-        apiKeyEnv: CLINE_API_KEY
-        api: openai-completions
-        baseURL: https://api.cline.bot/api/v1/
-        models:
-          - id: deepseek/deepseek-4.1-falsh
-            name: deepseek/deepseek-4.1-falsh
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              high: high
-              max: max
-            contextWindow: 1000000
       gcli2api:
         displayName: gcli2api
         apiKeyEnv: GCLI2API_API_KEY
@@ -31,8 +15,6 @@
             input:
               - text
               - image
-          - id: claude-sonnet-4-6
-            name: claude-sonnet-4-6
       agent2api:
         displayName: agent2api
         apiKeyEnv: AGENT2API_API_KEY
@@ -69,10 +51,33 @@
               low: low
               high: high
               max: max
-          - id: glm-5.3
-            name: glm-5.3
+          - id: tc:glm-5.3
+            name: tc:glm-5.3
             contextWindow: 1000000
+            input:
+              - text
+              - image
             reasoningEfforts:
               low: low
               high: high
+              max: max
+          - id: step-5-preview
+            name: step-5-preview
+            reasoningEfforts:
+              off: null
+              low: low
+              high: high
+              max: max
+          - id: kimi-k3
+            name: kimi-k3
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              minimal: minimal
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
               max: max

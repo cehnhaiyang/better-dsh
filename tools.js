@@ -3,14 +3,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // tools.js —— better-dsh 自定义工具集的唯一实现（由各预设按需声明使用）
 //
-// 本文件是 typecheck / test / git / node / delete / browser 六个工具的
+// 本文件是 js / git / delete / browser 四个工具的
 // 唯一实现，放在仓库根。**哪个预设能用哪几个工具，由那个预设自己在
 // agent.cordis.yml 里声明**，不再各存一份插件拷贝：
 //
 //     - id: custom-tools
 //       name: 'better-dsh:tools'
 //       config:
-//         tools: [typecheck, test, git, node, delete, browser]
+//         tools: [js, git, delete, browser]
 //
 // 其中 `better-dsh:tools` 是一个占位标记，由 `~/.dsh/.js` 在生成预设声明时改写成本
 // 文件的 file:// 绝对路径（DSH_ROOT 可被 DSH_HOME 覆盖，因此不能把绝对路径写死在
@@ -25,7 +25,7 @@
 //     - 挂成 profile 顶层条目的行 → 进入 dsh-tools 的**全局层**，而
 //       ToolRuntime.view(scope) 以全局层为起点组装可见集，于是**每个**预设的会话
 //       都会继承它。
-//   后者会把 node / delete / git 这类执行能力强加给所有预设，包括设计上完全
+//   后者会把 js / delete / git 这类执行能力强加给所有预设，包括设计上完全
 //   不给命令行的文学类预设；而且那样一来「预设声明自己用什么工具」这句话本身就失去
 //   了意义。因此本文件只提供实现，注册范围一律由预设声明决定。
 //
@@ -44,19 +44,19 @@
 //   「必须拿到写权限」的前置条件：
 //     - 授权失败时工具直接不可用（实测 D:\the-play：SetNamedSecurityInfoW Win32 5
 //       ACCESS_DENIED，命令根本没跑）；
-//     - typecheck / test 是零参数工具，git 的参数只是三选一的动作名；它们的 schema 里
-//       都没有 sandbox_permissions 与 justification，模型无法提权重试，只能卡死。
+//     - js 的 check / test 只给出一个动作名，git 的参数只是三选一的动作名；它们的
+//       schema 里都没有 sandbox_permissions 与 justification，模型无法提权重试，只能卡死。
 //   一个只读检查、一次测试、一次提交，不该以写权限为前提。browser 更是如此：Chrome
 //   要在沙箱之外创建 mojo 管道（沙箱内实测 platform_channel Check failed）。
 //
 //   因此统一用 child_process 直接执行，安全性由「不可注入」保证，而不是由沙箱保证：
 //     - 命令、参数与提交信息是本文件的常量，模型触及不到、拼接不了；
 //     - cwd 固定为会话工作区根（或其中写死的子目录），不取自模型输入；
-//     - 带自由参数的 node / delete / browser 各有一道边界：路径必须落在会话工作区
-//       之内（绝对路径与 `..` 穿越一律拒绝，见 resolveInside）；git 的参数则限定在
-//       三个写死的动作名里，连路径都进不来。
+//     - 带自由参数的 js（node / build 的路径）/ delete / browser 各有一道边界：路径必须
+//       落在会话工作区之内（绝对路径与 `..` 穿越一律拒绝，见 resolveInside）；git 的
+//       参数则限定在三个写死的动作名里，连路径都进不来。
 //
-// 结构：共用基础设施 → 六个工具（各自一个 define 函数，内部符号互不污染）→ 按声明注册。
+// 结构：共用基础设施 → 四个工具（各自一个 define 函数，内部符号互不污染）→ 按声明注册。
 // ─────────────────────────────────────────────────────────────────────────────
 
 const fs = require('node:fs')
@@ -72,7 +72,7 @@ const { spawn } = require('node:child_process')
 /** 单流、以及整段最终文本的捕获上限；超出即截断并附提示，避免输出打爆上下文。 */
 const MAX_OUTPUT_BYTES = 262144
 
-/** 六个工具的输出契约完全一致：一段纯文本。 */
+/** 四个工具的输出契约完全一致：一段纯文本。 */
 const textOutput = () => ({
     schema: {
         type: 'object',
@@ -84,7 +84,7 @@ const textOutput = () => ({
 })
 
 /**
- * presentResult 的终端卡片半边（六个工具完全一致）。
+ * presentResult 的终端卡片半边（四个工具完全一致）。
  *
  * 会话回放时 value 可能是任意东西，取值一律防御性处理。
  */
@@ -113,7 +113,7 @@ function sessionRoot(exec, tool) {
     return root
 }
 
-/** 取消不是执行结果，按工具中断上报（六个工具同一口径）。 */
+/** 取消不是执行结果，按工具中断上报（四个工具同一口径）。 */
 function throwIfAborted(signal) {
     if (!signal.aborted) return
     const error = new Error('tool call aborted')
@@ -205,6 +205,24 @@ function runPiped(file, args, { cwd, timeoutMs, signal }) {
 }
 
 /**
+ * 起一条外部命令；Windows 上的 .cmd 垫片（npm、node_modules/.bin 里的 tsc）无法直接
+ * spawn，必须借 cmd.exe。
+ *
+ * 刻意 spawn cmd.exe 本身（shell: false），而不是用 spawn 的 shell: true —— 后者会把
+ * 参数直接拼进命令行且不做转义（Node 对此有 DEP0190 警告），而 cmd.exe 由 Node 按
+ * 参数数组逐项加引号，安全面更清楚。
+ * @param {string} file - 可执行文件名（PATH 解析）。
+ * @param {string[]} args - 参数表（常量，模型无法触及）。
+ * @param {object} options - cwd、超时预算与取消信号。
+ * @returns {Promise<object>} runPiped 的结果。
+ */
+function runShellCommand(file, args, options) {
+    if (process.platform !== 'win32') return runPiped(file, args, options)
+    // /d 跳过 AutoRun，/s 保留引号语义，/c 执行后退出。
+    return runPiped(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', file, ...args], options)
+}
+
+/**
  * 一条固定命令的渲染口径：stdout，非空 stderr 追加其后，最后是退出码标记。
  *
  * 与 pwsh 工具一致——非零退出才追加 `[exit code: N]`，干净的退出不加任何标记；
@@ -249,14 +267,15 @@ function splitPaths(raw) {
 /**
  * 把一项相对路径解析成工作区内的绝对路径。
  *
- * 这是 node / delete / browser 三个工具的信任边界：模型输入不可信，「以项目根目录
+ * 这是 js / delete / browser 三个工具的信任边界：模型输入不可信，「以项目根目录
  * 为基准」由这里强制，而不是靠模型自觉。绝对路径与 `..` 穿越都会解析到工作区之外，
  * 一律拒绝。
  * @param {string} root - 会话工作区根目录。
  * @param {string} item - 模型给出的一项路径。
  * @param {object} [options] - allowRoot：是否允许解析到工作区根目录本身。
- *   node / delete 不允许：删掉或跑遍整个项目几乎不会是本意。browser 放宽——截图
- *   路径只是 CLI 的落盘位置，`path: "."` 由 CLI 自己报错即可。
+ *   js 的 node 动作与 delete 不允许：删掉或跑遍整个项目几乎不会是本意。js 的 build
+ *   与 browser 放宽——前者省略 project 就是构建本体，后者的截图路径只是 CLI 的落盘
+ *   位置，`path: "."` 由 CLI 自己报错即可。
  * @returns {{ok: true, absolute: string} | {ok: false, reason: string}}
  */
 function resolveInside(root, item, { allowRoot = false } = {}) {
@@ -269,6 +288,9 @@ function resolveInside(root, item, { allowRoot = false } = {}) {
     return { ok: true, absolute }
 }
 
+/** 参数里是否真的给了一个非空字符串（会话回放时可能是任何东西）。 */
+const hasText = (value) => typeof value === 'string' && value.trim().length > 0
+
 /** presentCall 在会话回放时会收到未经校验的参数，取值一律防御性处理。 */
 function pathsTitle(args) {
     const paths = args !== null && typeof args === 'object' ? args.paths : undefined
@@ -276,24 +298,41 @@ function pathsTitle(args) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// typecheck —— 不给予命令行前提下的「检查语法」按钮
+// js —— 不给予命令行前提下的「检查 / 跑脚本 / 跑测试 / 构建」按钮
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * 在会话工作区根目录跑一次 `tsc --noEmit --pretty false`，把结果原样返回。
+ * 在会话工作区里执行 JavaScript 相关的四类任务，按 `action` 分派：
  *
- * 零参数：模型无法指定命令、参数或工作目录，没有可注入的入口；命令写死在本文件里。
- * `--noEmit` 保证不产出任何文件，因此这是纯只读检查。优先使用项目本地安装的
- * TypeScript（向上找 node_modules/typescript/bin/tsc），找不到才退回 .bin 垫片与 PATH。
+ *   check —— 工作区根目录跑 `tsc --noEmit --pretty false`
+ *   node  —— 按 paths 逐个执行项目内的 .js 脚本
+ *   test  —— 工作区 test 子目录跑 `npm run test`
+ *   build —— 工作区根目录（或 project 指定的子项目目录）跑 `npm run build`
+ *
+ * 为什么四件事共用一个工具而不是四个：它们共用同一套东西——会话工作区解析、子进程
+ * 捕获与截断、渲染口径，以及 Windows 上 .cmd 垫片必须借 cmd.exe 的那道处理。分成四个
+ * 工具时这些要么各存一份（原先的 typecheck 与 test 就各自实现了一遍 cmd.exe 分支），
+ * 要么互相 import；合起来之后命令与参数仍然是本文件的常量，模型能给的只有「做哪件事」
+ * 与「对哪个路径」，可注入面没有变大。
  * @param {object} tools - dsh-tools 注册表。
  */
-function defineTypecheck(tools) {
-    /** 单次检查的超时预算。 */
-    const TIMEOUT_MS = 300000
+function defineJs(tools) {
+    /** 类型检查的超时预算。 */
+    const CHECK_TIMEOUT_MS = 300000
+    /** 跑测试 / 构建的超时预算：它们比类型检查慢得多。 */
+    const TASK_TIMEOUT_MS = 600000
+    /** 单个脚本的超时预算：脚本可能是构建、生成或迁移，给足 5 分钟。 */
+    const SCRIPT_TIMEOUT_MS = 300000
+
+    /** 写死的编译器参数：只检查、不产出文件，且关掉彩色输出。 */
+    const TSC_ARGS = ['--noEmit', '--pretty', 'false']
     /** 向上查找 node_modules/typescript 的最大层数，覆盖 monorepo 依赖提升。 */
     const SEARCH_DEPTH = 8
-    /** 写死的编译器参数：只检查、不产出文件，且关掉彩色输出。 */
-    const TSC_ARGS = '--noEmit --pretty false'
+    /** 测试命令所在的子目录（相对会话工作区根）。 */
+    const TEST_DIR_NAME = 'test'
+    /** 写死的 npm 参数：跑该目录 package.json 的 test / build 脚本。 */
+    const NPM_TEST_ARGS = ['run', 'test']
+    const NPM_BUILD_ARGS = ['run', 'build']
 
     /** 判断路径是否为存在的普通文件（失败一律视为不存在）。 */
     const isFile = (candidate) => {
@@ -304,13 +343,21 @@ function defineTypecheck(tools) {
         }
     }
 
+    /** 判断路径是否为存在的目录（失败一律视为不存在）。 */
+    const isDirectory = (candidate) => {
+        try {
+            return fs.statSync(candidate).isDirectory()
+        } catch {
+            return false
+        }
+    }
+
     /**
      * 从工作区根目录向上查找 TypeScript 编译器。
      *
      * 优先取 node_modules/typescript/bin/tsc：它是以 node 直接执行的 JS 入口，
      * 用 process.execPath 起子进程即可，不经任何 shell，路径无需转义。
-     * 其次退回 node_modules/.bin 下的垫片（.cmd 在 Windows 上需经 cmd.exe，交给
-     * spawn 的 shell 选项处理），最后交给 PATH 上的 tsc。
+     * 其次退回 node_modules/.bin 下的垫片，最后交给 PATH 上的 tsc。
      * @param {string} root - 会话工作区根目录。
      * @returns {{kind: 'node' | 'bin' | 'path', file?: string}} 编译器来源描述。
      */
@@ -329,135 +376,311 @@ function defineTypecheck(tools) {
     }
 
     /**
-     * 把编译器来源摊成 spawn 的 (file, args)。
+     * 在指定目录执行一条写死的 npm 脚本。
      *
-     * 主路径（node）完全不经过 shell：用 process.execPath 跑 tsc 的 JS 入口，参数是
-     * 常量数组，路径里的空格、`$`、反引号都不会被任何解释器处理。
-     *
-     * 兜底路径（.bin 垫片 / PATH 上的 tsc）在 Windows 上是 .cmd，无法直接执行，
-     * 必须借 cmd.exe。这里刻意 spawn cmd.exe 本身（shell: false），而不是用
-     * spawn 的 shell: true —— 后者会把参数直接拼进命令行且不做转义（Node 对此有
-     * DEP0190 警告），而 cmd.exe 由 Node 按参数数组逐项加引号，安全面更清楚。
-     * @param {{kind: string, file?: string}} compiler - resolveCompiler 的结果。
-     * @returns {{file: string, args: string[]}} spawn 参数。
+     * 先确认目录在：否则 spawn 会把「cwd 不存在」报成 `spawn cmd.exe ENOENT`，
+     * 让模型以为缺的是 cmd.exe 而不是那个目录。
+     * @param {string} cwd - 执行目录（工作区内的绝对路径）。
+     * @param {string[]} npmArgs - 写死的 npm 参数。
+     * @param {AbortSignal} signal - 工具调用的取消信号。
+     * @returns {Promise<object>} runPiped 的结果；目录不存在时按失败返回。
      */
-    function spawnSpecFor(compiler) {
-        const args = TSC_ARGS.split(' ')
-        if (compiler.kind === 'node' && compiler.file !== undefined) {
-            return { file: process.execPath, args: [compiler.file, ...args] }
+    function runNpm(cwd, npmArgs, signal) {
+        if (!isDirectory(cwd)) {
+            return Promise.resolve({
+                stdout: '', stderr: '', exitCode: null, timedOut: false,
+                spawnError: `目录不存在：${cwd}`, truncated: false,
+            })
         }
-        const target = compiler.kind === 'bin' && compiler.file !== undefined ? compiler.file : 'tsc'
-        if (process.platform === 'win32') {
-            // /d 跳过 AutoRun，/s 保留引号语义，/c 执行后退出。
-            return { file: process.env.ComSpec ?? 'cmd.exe', args: ['/d', '/s', '/c', target, ...args] }
-        }
-        return { file: target, args }
+        return runShellCommand('npm', npmArgs, { cwd, timeoutMs: TASK_TIMEOUT_MS, signal })
     }
 
-    /** 在会话工作区根目录执行一次编译器（不走 ctx.shell，原因见文件头）。 */
-    function runCompiler(root, signal) {
-        const spec = spawnSpecFor(resolveCompiler(root))
-        return runPiped(spec.file, spec.args, { cwd: root, timeoutMs: TIMEOUT_MS, signal })
+    /**
+     * check：在会话工作区根目录跑一次类型检查，结果原样返回。
+     * @param {string} root - 会话工作区根目录。
+     * @param {AbortSignal} signal - 工具调用的取消信号。
+     * @returns {Promise<string>} 模型可见的文本。
+     */
+    async function actionCheck(root, signal) {
+        const compiler = resolveCompiler(root)
+        const options = { cwd: root, timeoutMs: CHECK_TIMEOUT_MS, signal }
+        // 主路径完全不经过 shell：process.execPath 跑 tsc 的 JS 入口，参数是常量数组，
+        // 路径里的空格、`$`、反引号都不会被任何解释器处理。
+        const result = compiler.kind === 'node'
+            ? await runPiped(process.execPath, [compiler.file, ...TSC_ARGS], options)
+            : await runShellCommand(compiler.kind === 'bin' ? compiler.file : 'tsc', TSC_ARGS, options)
+        return renderCommandResult(result, { timeoutMs: CHECK_TIMEOUT_MS, spawnFail: '无法启动 TypeScript 编译器' })
     }
 
-    tools.register({
-        name: 'typecheck',
-        description:
-            'Type-check the project: run `tsc --noEmit --pretty false` at the project root and return the'
-            + " compiler's syntax and type errors.",
-        // 零参数：模型没有任何可注入的入口，这是本工具的设计前提。
-        parameters: { type: 'object', properties: {}, additionalProperties: false },
-        output: textOutput(),
-        async execute(_args, exec) {
-            const root = sessionRoot(exec, 'typecheck')
-            const result = await runCompiler(root, exec.signal)
-            throwIfAborted(exec.signal)
-            return { output: renderCommandResult(result, { timeoutMs: TIMEOUT_MS, spawnFail: '无法启动 TypeScript 编译器' }) }
-        },
-        // UI 呈现：检查就是一条命令，按终端卡片呈现。
-        presentCall: () => ({
-            card: 'terminal',
-            title: `tsc ${TSC_ARGS}`,
-            description: '运行 TypeScript 类型检查'
-        }),
-        presentResult: terminalResult
-    })
-}
+    /**
+     * test：在工作区的 test 子目录跑 `npm run test`。
+     * @param {string} root - 会话工作区根目录。
+     * @param {AbortSignal} signal - 工具调用的取消信号。
+     * @returns {Promise<string>} 模型可见的文本。
+     */
+    async function actionTest(root, signal) {
+        const result = await runNpm(path.join(root, TEST_DIR_NAME), NPM_TEST_ARGS, signal)
+        return renderCommandResult(result, { timeoutMs: TASK_TIMEOUT_MS, spawnFail: '无法执行 npm run test' })
+    }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// test —— 不给予命令行前提下的「跑测试」按钮
-// ─────────────────────────────────────────────────────────────────────────────
+    /**
+     * build：构建项目本体，或 project 指定的子项目。
+     *
+     * project 是模型给的相对路径，因此过 resolveInside：必须落在工作区之内。省略即
+     * 构建项目本体（工作区根目录），所以允许解析到根目录本身。
+     * @param {string} root - 会话工作区根目录。
+     * @param {object} args - 已通过 schema 校验的参数。
+     * @param {AbortSignal} signal - 工具调用的取消信号。
+     * @returns {Promise<string>} 模型可见的文本。
+     */
+    async function actionBuild(root, args, signal) {
+        let cwd = root
+        if (hasText(args.project)) {
+            const resolved = resolveInside(root, args.project.trim(), { allowRoot: true })
+            if (!resolved.ok) return `[失败] ${resolved.reason}`
+            cwd = resolved.absolute
+        }
+        const result = await runNpm(cwd, NPM_BUILD_ARGS, signal)
+        return renderCommandResult(result, { timeoutMs: TASK_TIMEOUT_MS, spawnFail: '无法执行 npm run build' })
+    }
 
-/**
- * 在会话工作区的 test 子目录下跑一次 `npm run test`，把结果原样返回。
- *
- * 零参数：命令与工作目录都写死在本文件里，模型无法指定。超时给足 10 分钟——
- * 测试可能比类型检查慢得多。
- * @param {object} tools - dsh-tools 注册表。
- */
-function defineTest(tools) {
-    /** 单次执行的超时预算。 */
-    const TIMEOUT_MS = 600000
-    /** 写死的命令参数：在 test 目录里跑该目录 package.json 的 test 脚本。 */
-    const NPM_ARGS = ['run', 'test']
-    /** 测试命令所在的子目录（相对会话工作区根）。 */
-    const TEST_DIR_NAME = 'test'
+    /** 递归时是否跳过该目录：依赖树与隐藏目录都不是项目自己的脚本。 */
+    const isSkippedDir = (name) => name === 'node_modules' || name.startsWith('.')
 
-    /** 判断路径是否为存在的目录（失败一律视为不存在）。 */
-    const isDirectory = (candidate) => {
-        try {
-            return fs.statSync(candidate).isDirectory()
-        } catch {
-            return false
+    /**
+     * 深度优先收集目录下的 .js 脚本，同一层按名称排序，保证顺序稳定可预期。
+     * @param {string} dir - 已在工作区内的目录绝对路径。
+     * @param {string[]} out - 收集结果，按访问顺序追加。
+     */
+    function walk(dir, out) {
+        const entries = fs.readdirSync(dir, { withFileTypes: true })
+            .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+        for (const entry of entries) {
+            if (entry.isDirectory()) {
+                if (!isSkippedDir(entry.name)) walk(path.join(dir, entry.name), out)
+            } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.js')) {
+                out.push(path.join(dir, entry.name))
+            }
+            // 其余（符号链接、junction、设备文件等）不进递归：Dirent 对链接不报
+            // isDirectory，天然既不被跟随也不会成环。点名的链接另当别论，见 collectScripts。
         }
     }
 
     /**
-     * 执行 `npm run test` 并收齐输出。
+     * 收集一个路径下的所有 .js 脚本。
      *
-     * Windows 上 npm 是 npm.cmd，无法直接 spawn，必须借 cmd.exe。这里刻意 spawn
-     * cmd.exe 本身（shell: false），而不是用 spawn 的 shell: true —— 后者会把参数
-     * 直接拼进命令行且不做转义（Node 对此有 DEP0190 警告），而 cmd.exe 由 Node 按
-     * 参数数组逐项加引号，安全面更清楚。
-     * @param {string} root - 会话工作区根目录。
-     * @param {AbortSignal} signal - 工具调用的取消信号。
-     * @returns {Promise<object>} runPiped 的结果。
+     * 「一个路径下没有任何 .js 脚本」按失败返回而不是返回空数组：模型多半是路径
+     * 写错了，静默跳过会让它以为脚本跑过了。
+     * @param {string} target - 已在工作区内的绝对路径。
+     * @returns {{scripts: string[], reason: string | null}}
      */
-    function runTests(root, signal) {
-        const cwd = path.join(root, TEST_DIR_NAME)
-        // 先确认目录在：否则 spawn 会把「cwd 不存在」报成 `spawn cmd.exe ENOENT`，
-        // 让模型以为缺的是 cmd.exe 而不是 test 目录。
-        if (!isDirectory(cwd)) {
-            return Promise.resolve({
-                stdout: '', stderr: '', exitCode: null, timedOut: false,
-                spawnError: `test 目录不存在：${cwd}`, truncated: false,
-            })
+    function collectScripts(target) {
+        let stat
+        try {
+            stat = fs.statSync(target)
+        } catch {
+            return { scripts: [], reason: '路径不存在' }
         }
-        return process.platform === 'win32'
-            // /d 跳过 AutoRun，/s 保留引号语义，/c 执行后退出。
-            ? runPiped(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'npm', ...NPM_ARGS], { cwd, timeoutMs: TIMEOUT_MS, signal })
-            : runPiped('npm', NPM_ARGS, { cwd, timeoutMs: TIMEOUT_MS, signal })
+        if (stat.isFile()) {
+            return path.extname(target).toLowerCase() === '.js'
+                ? { scripts: [target], reason: null }
+                : { scripts: [], reason: '不是 .js 脚本' }
+        }
+        if (!stat.isDirectory()) return { scripts: [], reason: '既不是文件也不是目录' }
+
+        const scripts = []
+        walk(target, scripts)
+        return { scripts, reason: scripts.length === 0 ? '目录下没有 .js 脚本' : null }
+    }
+
+    /**
+     * 用 node 执行一个脚本。
+     *
+     * 用 process.execPath 而不是 'node'：那就是当前 harness 进程自己在跑的那个解释器，
+     * 不依赖 PATH。返回值在共用字段之外多带 script（供渲染命令行）与 aborted（供序列
+     * 中断判定）。
+     * @param {string} root - 会话工作区根目录（作为 cwd，不取自模型输入）。
+     * @param {string} script - 脚本的绝对路径。
+     * @param {AbortSignal} signal - 工具调用的取消信号。
+     * @returns {Promise<object>} 见上。
+     */
+    async function runScript(root, script, signal) {
+        const idle = { script, stdout: '', stderr: '', exitCode: null, timedOut: false, spawnError: null, truncated: false, aborted: false }
+        // 信号若已中止，监听器不会再触发（abort 只派发一次），必须在这里挡住，
+        // 否则取消之后仍会把后面的脚本一个个跑完。
+        if (signal.aborted) return { ...idle, aborted: true }
+        const result = await runPiped(process.execPath, [script], { cwd: root, timeoutMs: SCRIPT_TIMEOUT_MS, signal })
+        return { script, ...result, aborted: false }
+    }
+
+    /**
+     * 依次处理每个路径项，逐个执行收集到的脚本。
+     *
+     * 遇到第一个问题（路径不存在 / 无 .js 脚本 / 起不来子进程 / 非零退出 / 超时）就
+     * 停下，不再执行后面的脚本——后面的脚本多半依赖前面的结果，继续跑只会把同一条
+     * 错误重复一遍（与 git 里 `add` 失败就不再 `commit` 同因）。
+     * @param {string} root - 会话工作区根目录。
+     * @param {string[]} items - 模型给出的路径项。
+     * @param {AbortSignal} signal - 工具调用的取消信号。
+     * @returns {Promise<{runs: object[], failure: string | null}>} runs 为已执行的脚本结果，
+     *   failure 为让序列停下的那个问题（正常跑完为 null）。
+     */
+    async function runScripts(root, items, signal) {
+        const runs = []
+        let failure = null
+        for (const item of items) {
+            const resolved = resolveInside(root, item)
+            if (!resolved.ok) {
+                failure = resolved.reason
+                break
+            }
+            const collected = collectScripts(resolved.absolute)
+            if (collected.reason !== null) {
+                failure = `${item}：${collected.reason}`
+                break
+            }
+            let stopped = false
+            for (const script of collected.scripts) {
+                const run = await runScript(root, script, signal)
+                runs.push(run)
+                if (run.aborted || run.spawnError !== null || run.timedOut || run.exitCode !== 0) {
+                    stopped = true
+                    break
+                }
+            }
+            if (stopped) break
+        }
+        return { runs, failure }
+    }
+
+    /**
+     * 单个脚本一段：标题行是等价的命令行，正文是它的输出。
+     * @param {string} root - 会话工作区根目录。
+     * @param {object} run - runScript 的返回值。
+     * @returns {string} 该脚本的正文。
+     */
+    function renderScriptRun(root, run) {
+        const lines = [`$ node ${toDisplay(root, run.script)}`]
+        if (run.spawnError !== null) {
+            lines.push(`无法执行：${run.spawnError}`)
+            return lines.join('\n')
+        }
+        const out = streamText(run.stdout, run.truncated, '字符')
+        if (out.length > 0) lines.push(out)
+        if (run.stderr.length > 0) lines.push(`[stderr]\n${streamText(run.stderr, run.truncated, '字符')}`)
+        // 无输出的脚本也可能是正常的（比如只做副作用），如实说一句，避免看起来像没跑。
+        if (lines.length === 1) lines.push('(no output)')
+        if (run.timedOut) lines.push(`[timed out after ${SCRIPT_TIMEOUT_MS}ms]`)
+        else if (run.exitCode !== 0) lines.push(`[exit code: ${run.exitCode}]`)
+        return lines.join('\n')
+    }
+
+    /**
+     * 各脚本的执行结果，原样返回：stdout、stderr、退出码标记。
+     *
+     * 整段文本封顶：脚本数量由模型决定，不封顶会把上下文打爆。
+     * @param {string} root - 会话工作区根目录。
+     * @param {object[]} runs - runScripts 返回的执行结果。
+     * @param {string | null} failure - 让序列停下的问题。
+     * @returns {string} 模型可见的文本。
+     */
+    function renderScriptResults(root, runs, failure) {
+        const blocks = runs.map((run) => renderScriptRun(root, run))
+        if (failure !== null) blocks.push(`[失败] ${failure}`)
+
+        const text = blocks.join('\n')
+        if (text.length <= MAX_OUTPUT_BYTES) return text
+        return `${text.slice(0, MAX_OUTPUT_BYTES)}\n[输出被截断，仅保留前 ${MAX_OUTPUT_BYTES} 字符]`
+    }
+
+    /**
+     * node：以项目根目录为基准解析 paths，把该路径下的所有 .js 脚本按顺序逐个执行。
+     *
+     * paths 可以是 .js 文件，也可以是目录；目录递归取其下所有 .js 文件（跳过
+     * node_modules 与以 . 开头的目录，否则 `node .` 会把整棵依赖树跑一遍）。递归不进入
+     * 链接：readdir 的 Dirent 对符号链接与 junction 都不报 isDirectory，因此它们既不被
+     * 跟随也不会成环；但【点名】一个链接仍然有效（statSync 会跟随）。
+     * @param {string} root - 会话工作区根目录。
+     * @param {object} args - 已通过 schema 校验的参数。
+     * @param {AbortSignal} signal - 工具调用的取消信号。
+     * @returns {Promise<string>} 模型可见的文本。
+     */
+    async function actionNode(root, args, signal) {
+        const items = splitPaths(args.paths)
+        if (items.length === 0) {
+            throw new Error('js 的 action=node 需要 paths 参数：以项目根目录为基准的相对路径，多个用英文逗号分隔')
+        }
+        const { runs, failure } = await runScripts(root, items, signal)
+        return renderScriptResults(root, runs, failure)
+    }
+
+    /** 四个动作的实现；键就是 schema 里 enum 的取值，也用于执行前的白名单校验。 */
+    const ACTIONS = {
+        check: (root, _args, signal) => actionCheck(root, signal),
+        node: (root, args, signal) => actionNode(root, args, signal),
+        test: (root, _args, signal) => actionTest(root, signal),
+        build: (root, args, signal) => actionBuild(root, args, signal)
     }
 
     tools.register({
-        name: 'test',
+        name: 'js',
         description:
-            'Run the project test suite: run `npm run test` in the `test` subdirectory and return its output.',
-        // 零参数：模型没有任何可注入的入口，这是本工具的设计前提。
-        parameters: { type: 'object', properties: {}, additionalProperties: false },
-        output: textOutput(),
-        async execute(_args, exec) {
-            const root = sessionRoot(exec, 'test')
-            const result = await runTests(root, exec.signal)
-            throwIfAborted(exec.signal)
-            return { output: renderCommandResult(result, { timeoutMs: TIMEOUT_MS, spawnFail: '无法执行 npm run test' }) }
+            'Run JavaScript tasks in the project, selected by `action`:'
+            + ' check = type-check with `tsc --noEmit --pretty false` at the project root;'
+            + ' node = run .js scripts given by `paths` (comma-separated, relative to the project root; a directory'
+            + ' contributes every .js file beneath it, skipping node_modules and dot-directories), stopping at the first failure;'
+            + ' test = run `npm run test` in the `test` subdirectory (takes no path);'
+            + ' build = run `npm run build` at the project root, or inside the sub-project named by `project`.',
+        parameters: {
+            type: 'object',
+            properties: {
+                action: {
+                    type: 'string',
+                    enum: ['check', 'node', 'test', 'build'],
+                    description: 'check: type-check the project. node: run the scripts in `paths`. test: run the test suite.'
+                        + ' build: build the project, or the sub-project named by `project`.'
+                },
+                paths: {
+                    type: 'string',
+                    description: 'node: comma-separated paths relative to the project root, e.g. scripts/build.js,src'
+                },
+                project: {
+                    type: 'string',
+                    description: 'build: sub-project path relative to the project root; omit to build the project itself.'
+                }
+            },
+            required: ['action'],
+            additionalProperties: false
         },
-        // UI 呈现：跑测试就是一条命令，按终端卡片呈现。
-        presentCall: () => ({
-            card: 'terminal',
-            title: 'npm run test',
-            description: '在 test 目录下运行测试'
-        }),
+        output: textOutput(),
+        async execute(args, exec) {
+            const root = sessionRoot(exec, 'js')
+            const action = args.action
+            // 会话回放或手工调用可能带来 schema 之外的值：当场报错，而不是默默跑一条命令。
+            if (typeof action !== 'string' || !Object.hasOwn(ACTIONS, action)) {
+                throw new Error(`js 的 action 只能是 ${Object.keys(ACTIONS).join(' / ')}，收到 ${JSON.stringify(action)}`)
+            }
+            // paths 只对 node 有意义、project 只对 build 有意义：给错动作就是理解错了，
+            // 当场报错，而不是默默换个目录或换个对象跑一遍。
+            if (action !== 'node' && hasText(args.paths)) throw new Error('js 的 paths 只对 action=node 有意义')
+            if (action !== 'build' && hasText(args.project)) throw new Error('js 的 project 只对 action=build 有意义')
+
+            const output = await ACTIONS[action](root, args, exec.signal)
+            throwIfAborted(exec.signal)
+            return { output }
+        },
+        // UI 呈现：每个动作等价于一条命令（node 动作是多条），按终端卡片呈现；回放时参数未经校验。
+        presentCall: (args) => {
+            const action = args !== null && typeof args === 'object' ? args.action : undefined
+            if (action === 'check') return { card: 'terminal', title: `tsc ${TSC_ARGS.join(' ')}`, description: '运行 TypeScript 类型检查' }
+            if (action === 'test') return { card: 'terminal', title: 'npm run test', description: '在 test 目录下运行测试' }
+            if (action === 'build') {
+                const where = hasText(args.project) ? ` (${args.project.trim()})` : ''
+                return { card: 'terminal', title: `npm run build${where}`, description: '构建项目' }
+            }
+            if (action === 'node') return { card: 'terminal', title: `node ${pathsTitle(args)}`, description: '依次运行项目内的 JavaScript 脚本' }
+            return { card: 'terminal', title: 'js …', description: '检查、跑脚本、跑测试或构建项目' }
+        },
         presentResult: terminalResult
     })
 }
@@ -621,213 +844,6 @@ function defineGit(tools) {
             if (action === 'c&p') return { card: 'terminal', title: 'git commit && git push', description: '提交项目的所有更改并推送' }
             return { card: 'terminal', title: 'git …', description: '提交或推送项目仓库' }
         },
-        presentResult: terminalResult
-    })
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// node —— 不给予命令行前提下的「跑脚本」按钮
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * 以项目根目录为基准解析 paths，把该路径下的所有 .js 脚本按顺序逐个用 node 执行。
- *
- * 参数：paths —— 相对路径，多个用英文逗号分隔；可以是 .js 文件，也可以是目录，
- * 目录递归取其下所有 .js 文件（跳过 node_modules 与以 . 开头的目录，否则 `node .`
- * 会把整棵依赖树跑一遍）。递归不进入链接：readdir 的 Dirent 对符号链接与 junction
- * 都不报 isDirectory，因此它们既不被跟随也不会成环；但【点名】一个链接仍然有效
- * （statSync 会跟随）。
- *
- * 执行顺序与中断：按参数顺序、每个路径内按名称排序深度优先，逐个执行；遇到第一个
- * 问题（路径不存在 / 无 .js 脚本 / 起不来子进程 / 非零退出 / 超时）就停下，不再执行
- * 后面的脚本——后面的脚本多半依赖前面的结果，继续跑只会把同一条错误重复一遍
- * （与 git 里 `add` 失败就不再 `commit` 同因）。
- * @param {object} tools - dsh-tools 注册表。
- */
-function defineNode(tools) {
-    /** 单个脚本的超时预算：脚本可能是构建、生成或迁移，给足 5 分钟。 */
-    const TIMEOUT_MS = 300000
-
-    /** 递归时是否跳过该目录：依赖树与隐藏目录都不是项目自己的脚本。 */
-    const isSkippedDir = (name) => name === 'node_modules' || name.startsWith('.')
-
-    /**
-     * 深度优先收集目录下的 .js 脚本，同一层按名称排序，保证顺序稳定可预期。
-     * @param {string} dir - 已在工作区内的目录绝对路径。
-     * @param {string[]} out - 收集结果，按访问顺序追加。
-     */
-    function walk(dir, out) {
-        const entries = fs.readdirSync(dir, { withFileTypes: true })
-            .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
-        for (const entry of entries) {
-            if (entry.isDirectory()) {
-                if (!isSkippedDir(entry.name)) walk(path.join(dir, entry.name), out)
-            } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.js')) {
-                out.push(path.join(dir, entry.name))
-            }
-            // 其余（符号链接、junction、设备文件等）不进递归：Dirent 对链接不报
-            // isDirectory，天然既不被跟随也不会成环。点名的链接另当别论，见 collectScripts。
-        }
-    }
-
-    /**
-     * 收集一个路径下的所有 .js 脚本。
-     *
-     * 「一个路径下没有任何 .js 脚本」按失败返回而不是返回空数组：模型多半是路径
-     * 写错了，静默跳过会让它以为脚本跑过了。
-     * @param {string} target - 已在工作区内的绝对路径。
-     * @returns {{scripts: string[], reason: string | null}}
-     */
-    function collectScripts(target) {
-        let stat
-        try {
-            stat = fs.statSync(target)
-        } catch {
-            return { scripts: [], reason: '路径不存在' }
-        }
-        if (stat.isFile()) {
-            return path.extname(target).toLowerCase() === '.js'
-                ? { scripts: [target], reason: null }
-                : { scripts: [], reason: '不是 .js 脚本' }
-        }
-        if (!stat.isDirectory()) return { scripts: [], reason: '既不是文件也不是目录' }
-
-        const scripts = []
-        walk(target, scripts)
-        return { scripts, reason: scripts.length === 0 ? '目录下没有 .js 脚本' : null }
-    }
-
-    /**
-     * 用 node 执行一个脚本。
-     *
-     * 用 process.execPath 而不是 'node'：那就是当前 harness 进程自己在跑的那个解释器，
-     * 不依赖 PATH。返回值在共用字段之外多带 script（供渲染命令行）与 aborted（供序列
-     * 中断判定）。
-     * @param {string} root - 会话工作区根目录（作为 cwd，不取自模型输入）。
-     * @param {string} script - 脚本的绝对路径。
-     * @param {AbortSignal} signal - 工具调用的取消信号。
-     * @returns {Promise<object>} 见上。
-     */
-    async function runScript(root, script, signal) {
-        const idle = { script, stdout: '', stderr: '', exitCode: null, timedOut: false, spawnError: null, truncated: false, aborted: false }
-        // 信号若已中止，监听器不会再触发（abort 只派发一次），必须在这里挡住，
-        // 否则取消之后仍会把后面的脚本一个个跑完。
-        if (signal.aborted) return { ...idle, aborted: true }
-        const result = await runPiped(process.execPath, [script], { cwd: root, timeoutMs: TIMEOUT_MS, signal })
-        return { script, ...result, aborted: false }
-    }
-
-    /**
-     * 依次处理每个路径项，逐个执行收集到的脚本。
-     * @param {string} root - 会话工作区根目录。
-     * @param {string[]} items - 模型给出的路径项。
-     * @param {AbortSignal} signal - 工具调用的取消信号。
-     * @returns {Promise<{runs: object[], failure: string | null}>} runs 为已执行的脚本结果，
-     *   failure 为让序列停下的那个问题（正常跑完为 null）。
-     */
-    async function runAll(root, items, signal) {
-        const runs = []
-        let failure = null
-        for (const item of items) {
-            const resolved = resolveInside(root, item)
-            if (!resolved.ok) {
-                failure = resolved.reason
-                break
-            }
-            const collected = collectScripts(resolved.absolute)
-            if (collected.reason !== null) {
-                failure = `${item}：${collected.reason}`
-                break
-            }
-            let stopped = false
-            for (const script of collected.scripts) {
-                const run = await runScript(root, script, signal)
-                runs.push(run)
-                if (run.aborted || run.spawnError !== null || run.timedOut || run.exitCode !== 0) {
-                    stopped = true
-                    break
-                }
-            }
-            if (stopped) break
-        }
-        return { runs, failure }
-    }
-
-    /**
-     * 单个脚本一段：标题行是等价的命令行，正文是它的输出。
-     * @param {string} root - 会话工作区根目录。
-     * @param {object} run - runScript 的返回值。
-     * @returns {string} 该脚本的正文。
-     */
-    function renderRun(root, run) {
-        const lines = [`$ node ${toDisplay(root, run.script)}`]
-        if (run.spawnError !== null) {
-            lines.push(`无法执行：${run.spawnError}`)
-            return lines.join('\n')
-        }
-        const out = streamText(run.stdout, run.truncated, '字符')
-        if (out.length > 0) lines.push(out)
-        if (run.stderr.length > 0) lines.push(`[stderr]\n${streamText(run.stderr, run.truncated, '字符')}`)
-        // 无输出的脚本也可能是正常的（比如只做副作用），如实说一句，避免看起来像没跑。
-        if (lines.length === 1) lines.push('(no output)')
-        if (run.timedOut) lines.push(`[timed out after ${TIMEOUT_MS}ms]`)
-        else if (run.exitCode !== 0) lines.push(`[exit code: ${run.exitCode}]`)
-        return lines.join('\n')
-    }
-
-    /**
-     * 各脚本的执行结果，原样返回：stdout、stderr、退出码标记。
-     *
-     * 整段文本封顶：脚本数量由模型决定，不封顶会把上下文打爆。
-     * @param {string} root - 会话工作区根目录。
-     * @param {object[]} runs - runAll 返回的执行结果。
-     * @param {string | null} failure - 让序列停下的问题。
-     * @returns {string} 模型可见的文本。
-     */
-    function renderResult(root, runs, failure) {
-        const blocks = runs.map((run) => renderRun(root, run))
-        if (failure !== null) blocks.push(`[失败] ${failure}`)
-
-        const text = blocks.join('\n')
-        if (text.length <= MAX_OUTPUT_BYTES) return text
-        return `${text.slice(0, MAX_OUTPUT_BYTES)}\n[输出被截断，仅保留前 ${MAX_OUTPUT_BYTES} 字符]`
-    }
-
-    tools.register({
-        name: 'node',
-        description:
-            'Run JavaScript files with node. `paths` is a comma-separated list of paths relative to the project root;'
-            + ' each may be a .js file or a directory, and a directory contributes every .js file beneath it'
-            + ' (node_modules and dot-directories are skipped). Scripts run in order, stopping at the first failure.',
-        parameters: {
-            type: 'object',
-            properties: {
-                paths: {
-                    type: 'string',
-                    description: 'Comma-separated paths relative to the project root, e.g. scripts/build.js,src'
-                }
-            },
-            required: ['paths'],
-            additionalProperties: false
-        },
-        output: textOutput(),
-        async execute(args, exec) {
-            const root = sessionRoot(exec, 'node')
-            const items = splitPaths(args.paths)
-            if (items.length === 0) {
-                throw new Error('node 需要 paths 参数：以项目根目录为基准的相对路径，多个用英文逗号分隔')
-            }
-
-            const { runs, failure } = await runAll(root, items, exec.signal)
-            throwIfAborted(exec.signal)
-            return { output: renderResult(root, runs, failure) }
-        },
-        // UI 呈现：跑脚本就是一条命令，按终端卡片呈现。
-        presentCall: (args) => ({
-            card: 'terminal',
-            title: `node ${pathsTitle(args)}`,
-            description: '依次运行项目内的 JavaScript 脚本'
-        }),
         presentResult: terminalResult
     })
 }
@@ -1221,7 +1237,7 @@ function defineBrowser(tools) {
     /**
      * 结果呈现：stdout 原样在前，stderr 与退出码标记在后。
      *
-     * 与 node / typecheck 同一口径——干净的退出不加任何标记，非零退出追加
+     * 与 js 同一口径——干净的退出不加任何标记，非零退出追加
      * `[exit code: N]`，不做归纳、不加结论。
      * @param {object} run - runCli 的返回值。
      * @param {string} display - 等价的命令摘要。
@@ -1319,10 +1335,8 @@ function defineBrowser(tools) {
  * 而不是静默少装一个工具（静默少装的表现是模型调不到工具，很难查）。
  */
 const DEFINITIONS = {
-    typecheck: defineTypecheck,
-    test: defineTest,
+    js: defineJs,
     git: defineGit,
-    node: defineNode,
     delete: defineDelete,
     browser: defineBrowser
 }

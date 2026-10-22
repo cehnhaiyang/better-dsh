@@ -35,11 +35,11 @@
 //        三种强度共用一份内核：rewrite（只重述）/ augment（保守增量）/
 //        structure（七段结构化）。模型调用走 ctx.llm，不引入第二套凭据。
 //      - 挂载 `~/.dsh/tools.js`（手写资源，脚本只校验不生成）：自定义工具集的唯一
-//        实现（typecheck / test / git / node / delete / browser）。工具**不是**
+//        实现（js / git / delete / browser）。工具**不是**
 //        在这里全局挂载的：预设用占位名 `better-dsh:tools` + `config: { tools: [...] }`
 //        声明自己要用哪几个，脚本在生成预设声明时把占位名改写成本机的 file:// 绝对
 //        路径。这样预设仍各自掌握自己的工具集，而实现只有一份、不再逐预设拷贝。
-//        契约（能否加载、六个工具是否真的注册）在改写前核对。
+//        契约（能否加载、每个工具是否真的注册）在改写前核对。
 //
 //   2. 自建预设迁移与落地：
 //      扫描 `~/.dsh/.agent-presets/<id>/`，把每个目录转成一条
@@ -100,7 +100,7 @@ const DSH_ROOT = process.env.DSH_HOME || path.join(HOME, '.dsh')
 // 本脚本面向 Web profile（WEB_PROFILE_DIR 与它必须一致，故集中成一个常量）。
 const PROFILE_NAME = 'web'
 const PLUGINS_DIR = path.join(DSH_ROOT, 'plugins')
-// 自定义工具集：typecheck / test / git / node / delete / browser 六个工具的
+// 自定义工具集：js / git / delete / browser 四个工具的
 // 唯一实现，放在仓库根、由人手写维护（脚本只挂载与校验，不生成也不覆盖）。
 const TOOLS_FILE = path.join(DSH_ROOT, 'tools.js')
 const WEB_PROFILE_DIR = path.join(DSH_ROOT, 'profiles', PROFILE_NAME)
@@ -2807,7 +2807,7 @@ function verifyToolsBundle() {
 const toolsBundle = verifyToolsBundle()
 if (toolsBundle.problems.length > 0) {
   for (const problem of toolsBundle.problems) console.error(`  [tools] ${problem}`)
-  console.error(`  [tools] 自定义工具集不完整：六个工具都不会出现在任何会话里。请从仓库恢复 ${TOOLS_FILE}。`)
+  console.error(`  [tools] 自定义工具集不完整：这些工具都不会出现在任何会话里。请从仓库恢复 ${TOOLS_FILE}。`)
   process.exitCode = 1
 } else {
   console.log(`[tools] 自定义工具集就位: ${TOOLS_FILE}（${toolsBundle.names.join(' / ')}，由各预设按需声明）`)

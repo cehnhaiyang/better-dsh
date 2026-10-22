@@ -13,6 +13,34 @@
 
 ---
 
+## typecheck / test / node 合并为单一 `js` 工具，新增 build 动作
+
+### 改法
+
+- `tools.js` 里的 `typecheck`、`test`、`node` 三个工具合并为一个 `js` 工具，用
+  `action` 四选一：`check` / `node` / `test` / `build`。命令、参数与工作目录仍是本文件
+  的常量，模型能给的只有「做哪件事」与「对哪个路径」，可注入面没有变大。
+- `build` 是新动作：在工作区根目录跑 `npm run build`；`project` 传相对路径则改在该
+  子项目目录里跑。路径过 `resolveInside`（`allowRoot: true`，省略即构建本体）。
+- `paths` 只对 `action=node` 有效，`project` 只对 `action=build` 有效；给错动作当场
+  报错，而不是默默换个对象跑一遍。
+- 三处重复的「Windows 上 .cmd 垫片必须借 cmd.exe」抽成共用基础设施
+  `runShellCommand`（原先 `typecheck` 的兜底路径与 `test` 各写了一遍）。
+- `TOOL_NAMES` 因此从六个变成四个（`js` / `git` / `delete` / `browser`）；三个声明了
+  自定义工具集的预设（`test`、`ts-build`、`dark-adaptation`）同步改写 `config.tools`，
+  `.js` 的校验文案不再写死工具个数。
+
+### 验证方式与结论
+
+以假 `ctx` 收注册项，在临时工作区实跑：`node`（单文件）、`test`、`build`（本体）、
+`build`（`project: sub` 子项目）、`build`（`project: ..` 越界拒绝）、`check`（伪造
+`node_modules/typescript/bin/tsc`，确认走 `process.execPath` 主路径且参数为
+`--noEmit --pretty false`）、`node` 缺 `paths`、`node` 路径不存在、未知 `action`、
+`paths` 配给 `test`——十项输出均符合预期。`node .js --apply` 重跑后，profile patch 里
+三处 `config.tools` 均为新的四个工具名，9 个预设声明照常生成。
+
+---
+
 ## 自定义工具集归一到一份实现，使用范围仍由各预设声明
 
 六个自定义工具（typecheck / test / git_commit / node / delete / browser）原先以

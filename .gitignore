@@ -11,3 +11,6 @@ new
 # 前导斜杠是必需的：无斜杠的 `prompt-forge` 会匹配任意层级，把
 # plugins/prompt-forge/ 这棵源码树也一起忽略掉（插件会从仓库里消失）。
 /prompt-forge
+cache
+tools
+llm-deepseek
