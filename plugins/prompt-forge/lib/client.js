@@ -8,7 +8,7 @@
 // 契约要点（每条都对应一个会静默失败的坑）：
 //
 // · 草稿读 props.useInput((s) => s).draft，写 props.inputActions.setDraft(text)。
-//   会话级槽位不再提供 props.session / props.input，必须用注入的选择器 hook；
+//   会话级槽位只提供注入的选择器 hook（没有 props.session / props.input）；
 //   但 hook 不能条件调用 —— 所以「有没有这个 hook」必须由 props 上是否存在函数
 //   决定，且在所有分支里 hook 调用序保持一致。
 //

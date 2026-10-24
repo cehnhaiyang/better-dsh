@@ -3,14 +3,18 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // tools.js —— better-dsh 自定义工具集的唯一实现（由各预设按需声明使用）
 //
-// 本文件是 js / git / delete / browser 四个工具的
+// 本文件是 js / delete / browser / soup 四个工具的
 // 唯一实现，放在仓库根。**哪个预设能用哪几个工具，由那个预设自己在
-// agent.cordis.yml 里声明**，不再各存一份插件拷贝：
+// agent.cordis.yml 里声明**：
 //
 //     - id: custom-tools
 //       name: 'better-dsh:tools'
 //       config:
-//         tools: [js, git, delete, browser]
+//         tools: [js, delete, browser, soup]
+//
+// git 的提交 / 推送不在这里：它是**由用户手动触发的斜杠命令**（`/git c|p|c&p`），
+// 实现见 plugins/git-command.js 的生成模板（~/.dsh/.js 里的 GIT_COMMAND_CODE）。
+// 用户仓库的写操作发起时机属于用户，交到模型手里就等于模型可以自行提交与推送。
 //
 // 其中 `better-dsh:tools` 是一个占位标记，由 `~/.dsh/.js` 在生成预设声明时改写成本
 // 文件的 file:// 绝对路径（DSH_ROOT 可被 DSH_HOME 覆盖，因此不能把绝对路径写死在
@@ -25,7 +29,7 @@
 //     - 挂成 profile 顶层条目的行 → 进入 dsh-tools 的**全局层**，而
 //       ToolRuntime.view(scope) 以全局层为起点组装可见集，于是**每个**预设的会话
 //       都会继承它。
-//   后者会把 js / delete / git 这类执行能力强加给所有预设，包括设计上完全
+//   后者会把 js / delete / browser 这类执行能力强加给所有预设，包括设计上完全
 //   不给命令行的文学类预设；而且那样一来「预设声明自己用什么工具」这句话本身就失去
 //   了意义。因此本文件只提供实现，注册范围一律由预设声明决定。
 //
@@ -44,17 +48,17 @@
 //   「必须拿到写权限」的前置条件：
 //     - 授权失败时工具直接不可用（实测 D:\the-play：SetNamedSecurityInfoW Win32 5
 //       ACCESS_DENIED，命令根本没跑）；
-//     - js 的 check / test 只给出一个动作名，git 的参数只是三选一的动作名；它们的
-//       schema 里都没有 sandbox_permissions 与 justification，模型无法提权重试，只能卡死。
+//     - js 的 check / test 只给出一个动作名，schema 里也没有 sandbox_permissions 与
+//       justification，模型无法提权重试，只能卡死。
 //   一个只读检查、一次测试、一次提交，不该以写权限为前提。browser 更是如此：Chrome
 //   要在沙箱之外创建 mojo 管道（沙箱内实测 platform_channel Check failed）。
 //
 //   因此统一用 child_process 直接执行，安全性由「不可注入」保证，而不是由沙箱保证：
 //     - 命令、参数与提交信息是本文件的常量，模型触及不到、拼接不了；
 //     - cwd 固定为会话工作区根（或其中写死的子目录），不取自模型输入；
-//     - 带自由参数的 js（node / build 的路径）/ delete / browser 各有一道边界：路径必须
-//       落在会话工作区之内（绝对路径与 `..` 穿越一律拒绝，见 resolveInside）；git 的
-//       参数则限定在三个写死的动作名里，连路径都进不来。
+//     - 带自由参数的 js（node 的 paths）/ delete / browser 各有一道边界：路径必须
+//       落在会话工作区之内（绝对路径与 `..` 穿越一律拒绝，见 resolveInside）；js 的
+//       check / test / build 只有一个动作名。
 //
 // 结构：共用基础设施 → 四个工具（各自一个 define 函数，内部符号互不污染）→ 按声明注册。
 // ─────────────────────────────────────────────────────────────────────────────
@@ -72,7 +76,7 @@ const { spawn } = require('node:child_process')
 /** 单流、以及整段最终文本的捕获上限；超出即截断并附提示，避免输出打爆上下文。 */
 const MAX_OUTPUT_BYTES = 262144
 
-/** 四个工具的输出契约完全一致：一段纯文本。 */
+/** js / delete / browser 的输出契约完全一致：一段纯文本。soup 同此口径。 */
 const textOutput = () => ({
     schema: {
         type: 'object',
@@ -113,7 +117,7 @@ function sessionRoot(exec, tool) {
     return root
 }
 
-/** 取消不是执行结果，按工具中断上报（四个工具同一口径）。 */
+/** 取消不是执行结果，按工具中断上报（所有执行外部命令的工具同一口径）。 */
 function throwIfAborted(signal) {
     if (!signal.aborted) return
     const error = new Error('tool call aborted')
@@ -273,9 +277,8 @@ function splitPaths(raw) {
  * @param {string} root - 会话工作区根目录。
  * @param {string} item - 模型给出的一项路径。
  * @param {object} [options] - allowRoot：是否允许解析到工作区根目录本身。
- *   js 的 node 动作与 delete 不允许：删掉或跑遍整个项目几乎不会是本意。js 的 build
- *   与 browser 放宽——前者省略 project 就是构建本体，后者的截图路径只是 CLI 的落盘
- *   位置，`path: "."` 由 CLI 自己报错即可。
+ *   js 的 node 动作与 delete 不允许：删掉或跑遍整个项目几乎不会是本意。browser 放宽
+ *   ——它的截图路径只是 CLI 的落盘位置，`path: "."` 由 CLI 自己报错即可。
  * @returns {{ok: true, absolute: string} | {ok: false, reason: string}}
  */
 function resolveInside(root, item, { allowRoot = false } = {}) {
@@ -307,13 +310,16 @@ function pathsTitle(args) {
  *   check —— 工作区根目录跑 `tsc --noEmit --pretty false`
  *   node  —— 按 paths 逐个执行项目内的 .js 脚本
  *   test  —— 工作区 test 子目录跑 `npm run test`
- *   build —— 工作区根目录（或 project 指定的子项目目录）跑 `npm run build`
+ *   build —— 工作区根目录跑 `npm run build`
+ *
+ * 四个动作都不接受额外参数：跑什么由该目录 package.json 的脚本决定，能构建出什么
+ * 也由那份脚本里的显式配置决定（例如 `vite build --config <路径>`）。工具这一侧
+ * 只回答「在哪跑」，不回答「构建谁」。
  *
  * 为什么四件事共用一个工具而不是四个：它们共用同一套东西——会话工作区解析、子进程
  * 捕获与截断、渲染口径，以及 Windows 上 .cmd 垫片必须借 cmd.exe 的那道处理。分成四个
- * 工具时这些要么各存一份（原先的 typecheck 与 test 就各自实现了一遍 cmd.exe 分支），
- * 要么互相 import；合起来之后命令与参数仍然是本文件的常量，模型能给的只有「做哪件事」
- * 与「对哪个路径」，可注入面没有变大。
+ * 工具时这些要么各存一份，要么互相 import；合起来之后命令与参数仍然是本文件的常量，
+ * 模型能给的只有「做哪件事」与「对哪个路径」，可注入面没有变大。
  * @param {object} tools - dsh-tools 注册表。
  */
 function defineJs(tools) {
@@ -424,23 +430,16 @@ function defineJs(tools) {
     }
 
     /**
-     * build：构建项目本体，或 project 指定的子项目。
+     * build：在工作区根目录跑一次 `npm run build`。
      *
-     * project 是模型给的相对路径，因此过 resolveInside：必须落在工作区之内。省略即
-     * 构建项目本体（工作区根目录），所以允许解析到根目录本身。
+     * 不接受任何路径或参数：要构建的东西必须写进根 package.json 的 build 脚本里。
+     * 这样「构建什么」只有一处定义（package.json），工具无法另开一条绕过它的路径。
      * @param {string} root - 会话工作区根目录。
-     * @param {object} args - 已通过 schema 校验的参数。
      * @param {AbortSignal} signal - 工具调用的取消信号。
      * @returns {Promise<string>} 模型可见的文本。
      */
-    async function actionBuild(root, args, signal) {
-        let cwd = root
-        if (hasText(args.project)) {
-            const resolved = resolveInside(root, args.project.trim(), { allowRoot: true })
-            if (!resolved.ok) return `[失败] ${resolved.reason}`
-            cwd = resolved.absolute
-        }
-        const result = await runNpm(cwd, NPM_BUILD_ARGS, signal)
+    async function actionBuild(root, signal) {
+        const result = await runNpm(root, NPM_BUILD_ARGS, signal)
         return renderCommandResult(result, { timeoutMs: TASK_TIMEOUT_MS, spawnFail: '无法执行 npm run build' })
     }
 
@@ -518,7 +517,7 @@ function defineJs(tools) {
      *
      * 遇到第一个问题（路径不存在 / 无 .js 脚本 / 起不来子进程 / 非零退出 / 超时）就
      * 停下，不再执行后面的脚本——后面的脚本多半依赖前面的结果，继续跑只会把同一条
-     * 错误重复一遍（与 git 里 `add` 失败就不再 `commit` 同因）。
+     * 错误重复一遍。
      * @param {string} root - 会话工作区根目录。
      * @param {string[]} items - 模型给出的路径项。
      * @param {AbortSignal} signal - 工具调用的取消信号。
@@ -619,7 +618,7 @@ function defineJs(tools) {
         check: (root, _args, signal) => actionCheck(root, signal),
         node: (root, args, signal) => actionNode(root, args, signal),
         test: (root, _args, signal) => actionTest(root, signal),
-        build: (root, args, signal) => actionBuild(root, args, signal)
+        build: (root, _args, signal) => actionBuild(root, signal)
     }
 
     tools.register({
@@ -630,7 +629,8 @@ function defineJs(tools) {
             + ' node = run .js scripts given by `paths` (comma-separated, relative to the project root; a directory'
             + ' contributes every .js file beneath it, skipping node_modules and dot-directories), stopping at the first failure;'
             + ' test = run `npm run test` in the `test` subdirectory (takes no path);'
-            + ' build = run `npm run build` at the project root, or inside the sub-project named by `project`.',
+            + ' build = run `npm run build` at the project root (takes no path).'
+            + ' Build targets are defined only by the build script in the root package.json.',
         parameters: {
             type: 'object',
             properties: {
@@ -638,15 +638,11 @@ function defineJs(tools) {
                     type: 'string',
                     enum: ['check', 'node', 'test', 'build'],
                     description: 'check: type-check the project. node: run the scripts in `paths`. test: run the test suite.'
-                        + ' build: build the project, or the sub-project named by `project`.'
+                        + ' build: run the root package.json build script.'
                 },
                 paths: {
                     type: 'string',
                     description: 'node: comma-separated paths relative to the project root, e.g. scripts/build.js,src'
-                },
-                project: {
-                    type: 'string',
-                    description: 'build: sub-project path relative to the project root; omit to build the project itself.'
                 }
             },
             required: ['action'],
@@ -660,10 +656,11 @@ function defineJs(tools) {
             if (typeof action !== 'string' || !Object.hasOwn(ACTIONS, action)) {
                 throw new Error(`js 的 action 只能是 ${Object.keys(ACTIONS).join(' / ')}，收到 ${JSON.stringify(action)}`)
             }
-            // paths 只对 node 有意义、project 只对 build 有意义：给错动作就是理解错了，
-            // 当场报错，而不是默默换个目录或换个对象跑一遍。
+            // paths 只对 node 有意义：给错动作就是理解错了，当场报错，而不是默默换个对象跑一遍。
             if (action !== 'node' && hasText(args.paths)) throw new Error('js 的 paths 只对 action=node 有意义')
-            if (action !== 'build' && hasText(args.project)) throw new Error('js 的 project 只对 action=build 有意义')
+            // build 不接受路径：构建目标只写在 package.json 的 build 脚本里。参数里带 project
+            // 必须报错：静默忽略会让调用方以为构建了子项目，实际构建的是本体。
+            if (hasText(args.project)) throw new Error('js 不接受 project：构建目标只能写在根 package.json 的 build 脚本里')
 
             const output = await ACTIONS[action](root, args, exec.signal)
             throwIfAborted(exec.signal)
@@ -674,175 +671,9 @@ function defineJs(tools) {
             const action = args !== null && typeof args === 'object' ? args.action : undefined
             if (action === 'check') return { card: 'terminal', title: `tsc ${TSC_ARGS.join(' ')}`, description: '运行 TypeScript 类型检查' }
             if (action === 'test') return { card: 'terminal', title: 'npm run test', description: '在 test 目录下运行测试' }
-            if (action === 'build') {
-                const where = hasText(args.project) ? ` (${args.project.trim()})` : ''
-                return { card: 'terminal', title: `npm run build${where}`, description: '构建项目' }
-            }
+            if (action === 'build') return { card: 'terminal', title: 'npm run build', description: '构建项目' }
             if (action === 'node') return { card: 'terminal', title: `node ${pathsTitle(args)}`, description: '依次运行项目内的 JavaScript 脚本' }
             return { card: 'terminal', title: 'js …', description: '检查、跑脚本、跑测试或构建项目' }
-        },
-        presentResult: terminalResult
-    })
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// git —— 不给予命令行前提下的「提交 / 推送」按钮
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * 在会话工作区根目录执行一组写死的 git 命令：提交、推送，或两者连着做。
- *
- * 唯一的参数是 `action`，三选一（commit / push / c&p）。模型依然给不出命令行：每个
- * 动作背后的子命令、参数与提交信息都是本文件的常量，action 只是在这几条写死的命令
- * 序列里挑一条，模型既改不了命令，也拼不进任何东西。
- *
- * 为什么提交是两步 git 而不是一步（别改成 `git commit -a`）：
- *   `commit -a` 只覆盖【已跟踪】文件的改动，新建的文件不在其中，而「项目的所有更改」
- *   必须包含它们。因此先 `add -A` 暂存全部改动（新文件、修改、删除），再 commit。
- *
- * 为什么推送写死成 `push -u origin HEAD` 而不是裸 `push`：
- *   裸 `push` 依赖当前分支已有 upstream，新建分支上会直接失败——而本工具没有命令行
- *   可补救（模型跑不了 `git push --set-upstream`）。`origin HEAD` 明确表示「把当前
- *   分支推到远端同名分支」，首次推送也能一次成功；`-u` 顺手把 upstream 设好，之后
- *   用户自己在终端里裸 `git push` 也能用。远端名固定为 origin：仓库若用了别的远端
- *   名，git 自己的报错会原样返回给模型。
- *
- * 失败即止：序列里任何一步失败（起不来子进程、非零退出、超时）都不再执行后面的
- * 步骤——没暂存完整的提交、没提交成功的推送，再跑一次只会把同一条错误重复一遍。
- * 注意由此带来的一个副作用：工作区干净时 c&p 会停在 commit 的「nothing to commit」，
- * 不会继续推送；此时再调一次 action=push 即可。
- * @param {object} tools - dsh-tools 注册表。
- */
-function defineGit(tools) {
-    /** 单次执行的超时预算：提交可能触发 pre-commit 钩子（格式化、测试），推送可能很慢。 */
-    const TIMEOUT_MS = 300000
-    /** 写死的提交信息：模型无法指定，避免为此开出可注入的入口。 */
-    const COMMIT_MESSAGE = '更新'
-    /** 写死的暂存参数：-A 覆盖新文件、修改与删除，即「项目的所有更改」。 */
-    const GIT_ADD_ARGS = ['add', '-A']
-    /** 写死的提交参数：-m 让 git 不打开编辑器。 */
-    const GIT_COMMIT_ARGS = ['commit', '-m', COMMIT_MESSAGE]
-    /** 写死的推送参数：见上方注释，`-u origin HEAD` 让没有 upstream 的分支也能一次推成功。 */
-    const GIT_PUSH_ARGS = ['push', '-u', 'origin', 'HEAD']
-
-    /** 三个动作各自的命令序列；键就是 schema 里 enum 的取值，也用于执行前的白名单校验。 */
-    const STEP_SEQUENCES = {
-        commit: [GIT_ADD_ARGS, GIT_COMMIT_ARGS],
-        push: [GIT_PUSH_ARGS],
-        'c&p': [GIT_ADD_ARGS, GIT_COMMIT_ARGS, GIT_PUSH_ARGS]
-    }
-
-    /**
-     * 执行一次 git。
-     *
-     * git 在 Windows 上是可直接执行的 git.exe，无需像 npm 那样借 cmd.exe；
-     * 参数以数组交给 spawn（shell: false），提交信息里的空格不会被任何解释器处理。
-     * @param {string} root - 会话工作区根目录（作为 cwd，不取自模型输入）。
-     * @param {string[]} args - 写死的 git 参数。
-     * @param {AbortSignal} signal - 工具调用的取消信号。
-     * @returns {Promise<object>} runPiped 的结果。
-     */
-    function runGit(root, args, signal) {
-        return runPiped('git', args, { cwd: root, timeoutMs: TIMEOUT_MS, signal })
-    }
-
-    /**
-     * 按顺序执行一串命令，遇到第一个失败就停。
-     *
-     * 暂存失败（不在 git 仓库、index.lock 被占、超时）时不再 commit：此时提交必然
-     * 不完整。push 同理——没有暂存完整的提交，推出去的东西是错的。
-     * @param {string} root - 会话工作区根目录。
-     * @param {string[][]} argsList - 本次动作的命令序列。
-     * @param {AbortSignal} signal - 工具调用的取消信号。
-     * @returns {Promise<Array<{args: string[], result: object}>>} 已执行的命令及其结果。
-     */
-    async function runSequence(root, argsList, signal) {
-        const runs = []
-        for (const args of argsList) {
-            const result = await runGit(root, args, signal)
-            runs.push({ args, result })
-            if (result.spawnError !== null || result.exitCode !== 0) break
-        }
-        return runs
-    }
-
-    /** 单次 git 调用的正文：stdout，非空 stderr 追加在其后。 */
-    function bodyOf(result) {
-        const out = streamText(result.stdout, result.truncated)
-        if (result.stderr.length === 0) return out
-        const err = streamText(result.stderr, result.truncated)
-        if (out.length > 0 && !out.endsWith('\n')) return `${out}\n[stderr]\n${err}`
-        return `${out}[stderr]\n${err}`
-    }
-
-    /**
-     * 每条命令一段：先回显 `$ git <参数>`，再是 stdout（非空 stderr 追加其后），
-     * 最后是这一步自己的退出码 / 超时标记，原样返回、不做归纳。
-     *
-     * 为什么逐条回显命令、逐条给标记：同一个工具现在有三种动作、最多三条命令，输出不
-     * 带命令行就分不清哪段来自 add、哪段来自 commit、哪段来自 push；标记若统一追加在
-     * 末尾，会让人误以为整条序列都失败了。
-     * @param {Array<{args: string[], result: object}>} runs - runSequence 的返回值。
-     * @returns {string} 模型可见的文本。
-     */
-    function renderResults(runs) {
-        const sections = []
-        for (const { args, result } of runs) {
-            const lines = [`$ git ${args.join(' ')}`]
-            // 起不来子进程（git 缺失等）本身就是结果，原样报出，不当异常抛。
-            if (result.spawnError !== null) {
-                lines.push(`无法执行 git：${result.spawnError}`)
-            } else {
-                const body = bodyOf(result)
-                // 暂存成功时 git add 无输出；「没说话」也是结果的一部分。
-                lines.push(body.length > 0 ? body : '(no output)')
-                if (result.timedOut) lines.push(`[timed out after ${TIMEOUT_MS}ms]`)
-                else if (result.exitCode !== 0) lines.push(`[exit code: ${result.exitCode}]`)
-            }
-            sections.push(lines.join('\n'))
-        }
-        return sections.join('\n')
-    }
-
-    tools.register({
-        name: 'git',
-        description:
-            'Run git in the project root: `action` = commit (`git add -A`, then `git commit -m <fixed message>`),'
-            + ' push (`git push -u origin HEAD`, the current branch), or c&p (commit, then push).'
-            + ' Stops at the first failing step and returns git output verbatim.',
-        parameters: {
-            type: 'object',
-            properties: {
-                action: {
-                    type: 'string',
-                    enum: ['commit', 'push', 'c&p'],
-                    description: 'commit: stage and commit every change. push: push the current branch. c&p: commit then push.'
-                }
-            },
-            required: ['action'],
-            additionalProperties: false
-        },
-        output: textOutput(),
-        async execute(args, exec) {
-            const root = sessionRoot(exec, 'git')
-            // 会话回放或手工调用可能带来 schema 之外的值：当场报错，而不是默默跑一条命令。
-            const sequence = typeof args.action === 'string' && Object.hasOwn(STEP_SEQUENCES, args.action)
-                ? STEP_SEQUENCES[args.action]
-                : undefined
-            if (sequence === undefined) {
-                throw new Error(`git 的 action 只能是 commit / push / c&p，收到 ${JSON.stringify(args.action)}`)
-            }
-            const runs = await runSequence(root, sequence, exec.signal)
-            throwIfAborted(exec.signal)
-            return { output: renderResults(runs) }
-        },
-        // UI 呈现：一次动作就是一条（或两条）命令，按终端卡片呈现；回放时参数未经校验。
-        presentCall: (args) => {
-            const action = args !== null && typeof args === 'object' ? args.action : undefined
-            if (action === 'commit') return { card: 'terminal', title: 'git commit', description: '提交项目的所有更改' }
-            if (action === 'push') return { card: 'terminal', title: 'git push', description: '推送当前分支到远端' }
-            if (action === 'c&p') return { card: 'terminal', title: 'git commit && git push', description: '提交项目的所有更改并推送' }
-            return { card: 'terminal', title: 'git …', description: '提交或推送项目仓库' }
         },
         presentResult: terminalResult
     })
@@ -902,7 +733,7 @@ function defineDelete(tools) {
      * 依次删除每个路径项，遇到第一个问题就停下。
      *
      * 停下而不是跳过继续：路径写错时后面的删除多半也建立在同一个错误理解上，
-     * 继续删只会把不该删的东西删掉（与 node / git 同因）。
+     * 继续删只会把不该删的东西删掉（与 js 的 node 动作同因）。
      * @param {string} root - 会话工作区根目录。
      * @param {string[]} items - 模型给出的路径项。
      * @returns {{removed: object[], failure: string | null}}
@@ -1325,6 +1156,154 @@ function defineBrowser(tools) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// soup —— 汤底封存：模型可见、界面不可见
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 把一局海龟汤的汤面与汤底封存到磁盘，按会话分文件；另提供取回与结束。
+ *
+ * 为什么要落盘：一局会拖很久，历史迟早被压缩折叠，模型会忘记自己编的汤底。
+ * 汤底若只活在上下文里，「被压缩后重述汤底」必然重述出一个新的，与之前的答案
+ * 自相矛盾——这是这类游戏唯一会真正翻车的地方。因此汤底必须有一份不随上下文
+ * 消失的副本，`recall` 就是取回它的唯一入口。
+ *
+ * 为什么不写在会话工作区：汤底不属于任何项目，落到工作区里既污染目录、又会
+ * 被 git 或构建脚本带上。因此存在本文件旁边的 `storages/turtle-soup/` 下。
+ *
+ * 界面为什么看不见：本工具的返回值（含汤底）进模型上下文，同时也进会话日志，
+ * 而 Web 端渲染的是同一份内容。**隐藏靠客户端半边**——`plugins/soup-view` 用
+ * `tool.call.toolview` 的 key `soup` 顶替通用行，因此参数与结果都不上屏。宿主
+ * 这一侧只负责「汤底在哪儿」，不负责「怎么藏」。
+ *
+ * @param {object} tools - dsh-tools 注册表。
+ */
+function defineSoup(tools) {
+    /** 汤底档案目录：与会话日志同级的持久区，不随工作区走。 */
+    const STORE_DIR = path.join(__dirname, 'storages', 'turtle-soup')
+    /** 会话 id 直接做文件名，因此只接受不需要转义的字符。 */
+    const SAFE_SESSION_ID = /^[A-Za-z0-9._-]+$/
+
+    /**
+     * 本会话的汤底档案路径。
+     * @param {object} exec - 工具执行上下文。
+     * @returns {string} 档案文件的绝对路径。
+     */
+    function storeFile(exec) {
+        const agent = exec.agent
+        if (agent === undefined) throw new Error('soup 需要 agent 会话')
+        const id = agent.session.header.id
+        if (typeof id !== 'string' || !SAFE_SESSION_ID.test(id)) {
+            throw new Error(`soup 无法为会话 ${JSON.stringify(id)} 建立汤底档案`)
+        }
+        return path.join(STORE_DIR, `${id}.json`)
+    }
+
+    /**
+     * 读回本会话已封存的汤底。
+     * @param {string} file - 档案路径。
+     * @returns {{face: string, base: string} | null} 记录，或 null（尚未开过局）。
+     */
+    function loadRecord(file) {
+        let text
+        try {
+            text = fs.readFileSync(file, 'utf8')
+        } catch {
+            return null
+        }
+        try {
+            const parsed = JSON.parse(text)
+            return typeof parsed?.face === 'string' && typeof parsed?.base === 'string' ? parsed : null
+        } catch {
+            // 档案损坏按「没有档案」处理：宁可让模型重开一局，也不要抛一个它无法修复的错误。
+            return null
+        }
+    }
+
+    /**
+     * 覆盖写入本会话的汤底档案。
+     * @param {string} file - 档案路径。
+     * @param {{face: string, base: string}} record - 本局记录。
+     */
+    function saveRecord(file, record) {
+        fs.mkdirSync(STORE_DIR, { recursive: true })
+        fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, 'utf8')
+    }
+
+    /**
+     * 汤面 + 汤底的统一呈现。汤底一定排在汤面之后，避免模型顺手把汤底写进回复。
+     * @param {string} lead - 首行结论。
+     * @param {{face: string, base: string}} record - 本局记录。
+     * @returns {string} 模型可见的文本。
+     */
+    function renderRecord(lead, record) {
+        return `${lead}\n\n【汤面】\n${record.face}\n\n【汤底】\n${record.base}\n\n（汤底只存在于本工具结果里，回复用户时只写汤面。）`
+    }
+
+    /** 三个动作的实现；键就是 schema 里 enum 的取值，也用于执行前的白名单校验。 */
+    const ACTIONS = {
+        open(args, exec) {
+            const face = typeof args.face === 'string' ? args.face.trim() : ''
+            const base = typeof args.base === 'string' ? args.base.trim() : ''
+            if (face.length === 0 || base.length === 0) throw new Error('soup 的 action=open 需要 face（汤面）与 base（汤底）两项都非空')
+            const record = { face, base }
+            saveRecord(storeFile(exec), record)
+            return renderRecord('已封存。之后按汤底答问，上下文被压缩后用 action=recall 取回。', record)
+        },
+        recall(_args, exec) {
+            const record = loadRecord(storeFile(exec))
+            if (record === null) throw new Error('本会话还没有封存的汤底：先调用 action=open 开一局')
+            return renderRecord('已取回。', record)
+        },
+        close(_args, exec) {
+            const file = storeFile(exec)
+            if (loadRecord(file) === null) throw new Error('本会话没有可结束的汤底档案')
+            fs.rmSync(file, { force: true })
+            return '本局已结束，汤底档案已删除。'
+        }
+    }
+
+    tools.register({
+        name: 'soup',
+        description:
+            'Seal one turtle-soup round: `action` = open (needs `face` = the riddle text and `base` = the full truth),'
+            + ' recall (read the sealed truth back after context compaction), or close (end the round and delete it).'
+            + ' The tool result carries the truth for YOU only; the user interface never shows it.'
+            + ' Open a round before answering any question, and recall instead of retelling the truth from memory.',
+        parameters: {
+            type: 'object',
+            properties: {
+                action: {
+                    type: 'string',
+                    enum: ['open', 'recall', 'close'],
+                    description: 'open: seal this round. recall: read the sealed truth back. close: end the round.'
+                },
+                face: { type: 'string', description: 'open: the riddle text shown to the user.' },
+                base: { type: 'string', description: 'open: the complete truth. Never repeated in your reply text.' }
+            },
+            required: ['action'],
+            additionalProperties: false
+        },
+        output: textOutput(),
+        async execute(args, exec) {
+            const action = args.action
+            if (typeof action !== 'string' || !Object.hasOwn(ACTIONS, action)) {
+                throw new Error(`soup 的 action 只能是 ${Object.keys(ACTIONS).join(' / ')}，收到 ${JSON.stringify(action)}`)
+            }
+            // face / base 只对 open 有意义：给错动作就是理解错了，当场报错而不是默默丢掉。
+            if (action !== 'open' && (hasText(args.face) || hasText(args.base))) {
+                throw new Error('soup 的 face / base 只对 action=open 有意义')
+            }
+            return { output: ACTIONS[action](args, exec) }
+        },
+        // 卡片只写动作名：presentCall 拿不到返回值，但参数里就有汤底，绝不能进 rawInput。
+        presentCall: (args) => {
+            const action = args !== null && typeof args === 'object' ? args.action : undefined
+            return { card: 'generic', title: `soup ${typeof action === 'string' ? action : '…'}`, kind: 'other' }
+        }
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 注册
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1336,16 +1315,16 @@ function defineBrowser(tools) {
  */
 const DEFINITIONS = {
     js: defineJs,
-    git: defineGit,
     delete: defineDelete,
-    browser: defineBrowser
+    browser: defineBrowser,
+    soup: defineSoup
 }
 
 /** 本文件提供的全部工具名，按声明顺序（也是注册顺序）。 */
 const TOOL_NAMES = Object.keys(DEFINITIONS)
 
 module.exports = {
-    // 与 profile patch / 预设声明里的条目 id 同名（其余五个自建插件同此约定），日志里好对号。
+    // 与 profile patch / 预设声明里的条目 id 同名（与其余自建插件的条目 id 同一约定），日志里好对号。
     name: 'custom-tools',
     // 只依赖 tools 注册表：所有工具都自带子进程或直接用 fs，不需要 shell 接缝（见文件头）。
     inject: ['tools'],

@@ -18,8 +18,8 @@ module.exports = {
     const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 
     // ── 1. 预设热重载 ───────────────────────────────────────────────────────────
-    // 预设不再是 ~/.dsh/.agent-presets/<id>/ 目录，而是 patch 层里的
-    // @deepseek-ai/dsh-agent-preset 声明行；dsh-hmr 会监听下列 patch 文件，并在
+    // 预设是 patch 层里的 @deepseek-ai/dsh-agent-preset 声明行，来源目录为
+    // ~/.dsh/.agent-presets/<id>/；dsh-hmr 会监听下列 patch 文件，并在
     // 变更时重放整层（行 dispose 后重新 init，注册表随之拿到新修订）。
     // 官方语义是「已有会话保持启动时的修订」，所以本插件只补最后一步：
     // 把已运行的会话重绑到重放后的新修订，使改动无需重启、也无需新建会话即可生效。
@@ -152,7 +152,7 @@ module.exports = {
     }, { global: true })
 
     // ── 2. 上下文计量说明 ───────────────────────────────────────────────────────
-    // 此处原有一段覆盖 contextBreakdown 投影的代码，已移除。原因：
+    // 本插件不注册 contextBreakdown 投影，原因：
     //   (a) SessionProjectionRegistry.register() 为「先注册者胜」—— dsh-token-meter
     //       在构造时就注册了 contextBreakdown，插件后注册只增加引用计数，
     //       其 apply/view 会被直接丢弃，属于死代码；

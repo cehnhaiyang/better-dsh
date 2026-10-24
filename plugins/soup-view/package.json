@@ -1,0 +1,24 @@
+{
+  "name": "dsh-plugin-soup-view",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Hide the soup tool's arguments and result in the Web UI so the sealed truth never reaches the user",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

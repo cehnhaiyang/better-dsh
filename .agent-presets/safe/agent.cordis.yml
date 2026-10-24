@@ -1,0 +1,53 @@
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    prefix: |-
+      Your sole purpose is to perfectly complete the tasks requested by the user.
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false  # 结果超出上限时不抽样、如实返回（溢出部分落盘）
+
+- id: command-goal
+  name: '@deepseek-ai/dsh-command-goal'
+
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    # 基础压缩器：达到阈值时折叠历史上下文。
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    # 人类命令 `/compact`：在自动阈值之下手动做一次有意义的精简。
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    # 工具结果修剪器：整体压缩器运行前，先把超大的工具结果压缩到预算内。
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192  # 工具结果超过此字符数才修剪
+        headChars: 4096       # 修剪时保留头部字符数
+        tailChars: 1024       # 修剪时保留尾部字符数
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+- id: custom-tools
+  name: 'better-dsh:tools'
+  config:
+    tools:
+      - js          # 检查 / 跑脚本 / 跑测试 / 构建，action 四选一，命令写死
+      - delete      # 按相对路径删除文件或整棵目录树（不可撤销）
+      - browser     # 驱动无头 Chrome 打开、操作并检查页面

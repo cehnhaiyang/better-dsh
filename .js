@@ -3,7 +3,7 @@
 //
 // 用法：
 //   node .js            进入维护台菜单：1 管理会话 / 2 应用补丁 / q 退出
-//   node .js --apply    直接执行全部补丁（等价旧版行为，便于脚本化）
+//   node .js --apply    直接执行全部补丁（便于脚本化，不进入菜单）
 //   node .js --list     非交互列出工作区目录（目录名反解为可读路径）
 //   node .js --list <目录名|路径片段|序号>   列出该目录下的会话（含标题）
 //
@@ -12,34 +12,33 @@
 //   在任何时候运行（`node .js`），会自动全量构建并注入全部改进：
 //
 //   0. 基线版本：本脚本按 dsh 0.2.1-rc.2 的结构维护。
-//      版本沿革、历次迁移的核对结论与已执行的迁移动作，全部记录在同目录的
-//      `CHANGE.md` 里；本头部只描述当前行为，不再复述历史。
-//      与 0.2.1-alpha.4 相比，公开契约没有任何变化（会话格式 v4、projectKey/
-//      encodeSegment、workspace 域 v2、`agent.status` / `agent.whenIdle()`、
-//      agent-preset schema、四个补丁锚点逐字节一致），因此本轮只修掉一个与版本
-//      无关的缺陷：4.2 的多行锚点带 CRLF，与 LF 的 bundle 永不相等，导致会话头部
-//      的预设下拉从未真正注入（补丁函数现统一按 LF 读取目标文件）。
 //
-//   1. 插件自动创建与落地（直接写在 `~/.dsh/plugins/` 下，不再套一层 custom/）：
+//   1. 插件自动创建与落地（直接写在 `~/.dsh/plugins/` 下）：
 //      - 自动生成 `~/.dsh/plugins/reflect-command.js`
 //        （/reflect：自省会话复盘工程经验与偏好，沉淀为 Skill，并自动联动执行会话压缩）
 //      - 自动生成 `~/.dsh/plugins/creative-workflow.js`
 //        （创作工作流模式插件：动态从工作区装配准则与模式提示词）
 //      - 自动生成 `~/.dsh/plugins/preset-hotreload-and-meter.js`
-//        （预设声明更新后把已运行会话重绑到新修订；上下文明细投影矫正部分已移除，见插件内注释）
+//        （预设声明更新后把已运行会话重绑到新修订）
 //      - 自动生成 `~/.dsh/plugins/explore-command.js`
 //        （/explore：全面探索工作区项目的架构与实现，产出一份完善的 PROJECT.md）
+//      - 自动生成 `~/.dsh/plugins/git-command.js`
+//        （/git：用户手动触发的提交 / 推送，参数 c / p / c&p）。提交与推送是对用户
+//        仓库的写操作，时机由用户判断，因此它是斜杠命令而不是给模型的工具。
 //      - 挂载 `~/.dsh/plugins/prompt-forge/`（手写资源，脚本只校验不生成）：
 //        提示词锻造双面插件。宿主半边注册 /forge 命令、forge_prompt 工具与
 //        /api/forge/* 路由；客户端半边在输入框右侧挂一个「改写」按钮与面板。
 //        三种强度共用一份内核：rewrite（只重述）/ augment（保守增量）/
 //        structure（七段结构化）。模型调用走 ctx.llm，不引入第二套凭据。
 //      - 挂载 `~/.dsh/tools.js`（手写资源，脚本只校验不生成）：自定义工具集的唯一
-//        实现（js / git / delete / browser）。工具**不是**
+//        实现（js / delete / browser / soup）。工具**不是**
 //        在这里全局挂载的：预设用占位名 `better-dsh:tools` + `config: { tools: [...] }`
 //        声明自己要用哪几个，脚本在生成预设声明时把占位名改写成本机的 file:// 绝对
-//        路径。这样预设仍各自掌握自己的工具集，而实现只有一份、不再逐预设拷贝。
+//        路径。预设因此各自掌握自己的工具集，实现只有一份。
 //        契约（能否加载、每个工具是否真的注册）在改写前核对。
+//      - 挂载 `~/.dsh/plugins/soup-view/`（手写资源，脚本只校验不生成）：soup 工具的
+//        客户端半边。汤底进模型上下文，隐藏则全靠它把 soup 的调用行整个替换掉，
+//        因此它是「汤底用户不可见」的唯一实现点。
 //
 //   2. 自建预设迁移与落地：
 //      扫描 `~/.dsh/.agent-presets/<id>/`，把每个目录转成一条
@@ -50,9 +49,9 @@
 //      声明里的占位名 `better-dsh:tools` 改写成 `~/.dsh/tools.js` 的绝对 URL
 //      （预设因此不必写死机器相关路径，见第 1 节的说明）。声明段整段重建，幂等。
 //
-//   3. 旧版 settings.yaml 迁移：
-//      `~/.dsh/settings.yaml` 不再是生效源（dsh 只在启动时一次性导入，且只接受
-//      volatile 字段）；本脚本用同一套旧名映射把「有同名条目」的 section 直接写进
+//   3. settings.yaml 迁移：
+//      dsh 只在启动时一次性导入 `~/.dsh/settings.yaml`，且只接受 volatile 字段，
+//      因此它不作为生效源；本脚本用 LEGACY_SECTION_ENTRIES 的映射把「有同名条目」的 section 直接写进
 //      profile patch（静态 config 不受 volatile 限制，覆盖面更全）。补丁里已有同名
 //      条目的 section 一律跳过，不覆盖网页端的修改。只解析 settings.yaml 本身，
 //      不读 settings.yaml.imported；该文件不存在时整段跳过并保留既有区块。
@@ -66,9 +65,9 @@
 //   5. 底层增强补丁全量内嵌应用（幂等执行，一体化集成，无需外置脚本）：
 //      - preset-switch：解除非空白会话锁定（保留「有未闭合回合」这一硬锁），
 //        并把会话头部标签升级为可交互下拉（闸门未开时回退为原只读标签）；
-//      - compaction：压缩阈值改按 surface 计价，并让压缩指令忽略规则库与工作流。
-//        compact 后端已下沉到 agent preset，因此脚本不在 host 层强制启用
-//        compaction-basic，并会自动清理旧版本注入的那一行。
+//      - compaction：压缩阈值按 surface 计价，并让压缩指令忽略规则库与工作流。
+//        compact 后端由 agent preset 提供，因此脚本不在 host 层启用
+//        compaction-basic，并清除 host 层残留的该条目。
 //      各补丁的锚点与闸门条件见 applyCorePatches() 内的逐条注释。
 //
 //   6. 工作区与会话完整性内嵌自愈（仅在 --apply 流程内执行）：
@@ -100,7 +99,7 @@ const DSH_ROOT = process.env.DSH_HOME || path.join(HOME, '.dsh')
 // 本脚本面向 Web profile（WEB_PROFILE_DIR 与它必须一致，故集中成一个常量）。
 const PROFILE_NAME = 'web'
 const PLUGINS_DIR = path.join(DSH_ROOT, 'plugins')
-// 自定义工具集：js / git / delete / browser 四个工具的
+// 自定义工具集：js / delete / browser / soup 四个工具的
 // 唯一实现，放在仓库根、由人手写维护（脚本只挂载与校验，不生成也不覆盖）。
 const TOOLS_FILE = path.join(DSH_ROOT, 'tools.js')
 const WEB_PROFILE_DIR = path.join(DSH_ROOT, 'profiles', PROFILE_NAME)
@@ -568,8 +567,8 @@ function rewriteHeaderLine(headerLine, newCwd) {
 /**
  * 只替换日志第 0 帧（header）中的 cwd，其余帧逐字节原样保留。
  *
- * 每一代日志都要调用：低代是迁移前的残留，但官方按「版本最高的一代」取用，
- * 而校验路径时会比对 header.cwd，所以哪一代留了旧 cwd，哪一代就会成为隐患。
+ * 每一代日志都要调用：官方按「版本最高的一代」取用，而校验路径时会比对
+ * header.cwd，所以哪一代留了旧 cwd，哪一代就会成为隐患。
  * @param filePath - 某一代日志文件。
  * @param newCwd - 新的工作目录。
  * @returns 改写后的完整文件字节。
@@ -956,7 +955,7 @@ async function moveSessionInteractive(nextLine, session) {
  *
  * 不用 rl.question()：它只在提问的那一刻挂监听，若多行输入（无 TTY 的管道、一次性
  * 粘贴）在同一批到达，提问间歇内触发的 line 事件会被直接丢弃，命令就静默失效。
- * 这里改成先入队、按需取出，EOF 时以 undefined 表示结束。
+ * 因此先入队、按需取出，EOF 时以 undefined 表示结束。
  * @param rl - readline 接口。
  * @returns 取下一行的函数（返回去空白后的字符串，或 undefined 表示输入已结束）。
  */
@@ -1934,7 +1933,7 @@ module.exports = {
 //     重绑到旧修订（这正是 flush 要延迟 250ms 的原因）。
 //   - `agent.phase` 不是公开 API（公开面为 `agent.status` 与 `agent.whenIdle()`），
 //     本插件的空闲判据不读内部相位。
-//   - 上下文计量的呈现层修正由第 4.4 号补丁完成，本插件不再覆盖 contextBreakdown 投影。
+//   - 上下文计量的呈现层由第 4.4 号补丁负责，本插件不覆盖 contextBreakdown 投影。
 // ─────────────────────────────────────────────────────────────────────────────
 const PRESET_HOTRELOAD_AND_METER_CODE = `'use strict'
 
@@ -1956,8 +1955,8 @@ module.exports = {
     const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 
     // ── 1. 预设热重载 ───────────────────────────────────────────────────────────
-    // 预设不再是 ~/.dsh/.agent-presets/<id>/ 目录，而是 patch 层里的
-    // @deepseek-ai/dsh-agent-preset 声明行；dsh-hmr 会监听下列 patch 文件，并在
+    // 预设是 patch 层里的 @deepseek-ai/dsh-agent-preset 声明行，来源目录为
+    // ~/.dsh/.agent-presets/<id>/；dsh-hmr 会监听下列 patch 文件，并在
     // 变更时重放整层（行 dispose 后重新 init，注册表随之拿到新修订）。
     // 官方语义是「已有会话保持启动时的修订」，所以本插件只补最后一步：
     // 把已运行的会话重绑到重放后的新修订，使改动无需重启、也无需新建会话即可生效。
@@ -2090,7 +2089,7 @@ module.exports = {
     }, { global: true })
 
     // ── 2. 上下文计量说明 ───────────────────────────────────────────────────────
-    // 此处原有一段覆盖 contextBreakdown 投影的代码，已移除。原因：
+    // 本插件不注册 contextBreakdown 投影，原因：
     //   (a) SessionProjectionRegistry.register() 为「先注册者胜」—— dsh-token-meter
     //       在构造时就注册了 contextBreakdown，插件后注册只增加引用计数，
     //       其 apply/view 会被直接丢弃，属于死代码；
@@ -2247,7 +2246,227 @@ module.exports = {
 `
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 内嵌资源 E：idle-guard.js
+// 内嵌资源 E：git-command.js
+// ─────────────────────────────────────────────────────────────────────────────
+// 用户手动触发的 git 命令（/git c | p | c&p）。设计理由、写死的命令序列与输出口径
+// 全部写在插件内部注释里（随插件一起落盘到 ~/.dsh/plugins/git-command.js），此处不重复；
+// 脚本层面只需知道两点：
+//   1. 它注册的是 commands.register（斜杠命令），不是 tools.register——模型调不到它，
+//      只有用户在输入框敲 /git 才会执行。
+//   2. 挂载条目 id 是 command-git，与 command-reflect / command-explore 同一约定。
+const GIT_COMMAND_CODE = `'use strict'
+
+// git-command.js —— 用户手动触发的提交 / 推送命令 (/git)
+//
+// 为什么是斜杠命令而不是模型工具：提交与推送是对用户仓库的写操作，「什么时候提交、
+// 什么时候推送」属于用户的判断。作为工具时，模型可以自行决定把当前工作区提交并推到
+// 远端；作为命令后，只有用户在输入框里敲 /git 才会发生，模型既看不到也调不到它。
+//
+// 参数只有一个词，三选一：
+//   c    提交   git add -A → git commit -m <常量>
+//   p    推送   git push -u origin HEAD
+//   c&p  提交后再推送
+// 命令、参数与提交信息都是本文件的常量，用户输入只在这几条写死的序列里挑一条，
+// 既改不了命令，也拼不进任何东西。
+//
+// 为什么提交是两步而不是一步 \`git commit -a\`：\`-a\` 只覆盖【已跟踪】文件的改动，新建
+// 的文件不在其中，而「提交所有更改」必须包含它们。因此先 \`add -A\` 暂存全部改动
+// （新文件、修改、删除），再 commit。
+//
+// 为什么推送写死成 \`push -u origin HEAD\` 而不是裸 \`push\`：裸 \`push\` 依赖当前分支已有
+// upstream，新分支上会直接失败，而本命令没有命令行可补救。\`origin HEAD\` 表示「把当前
+// 分支推到远端同名分支」，首次推送也能一次成功；\`-u\` 顺手设好 upstream，之后用户在
+// 终端里裸 \`git push\` 也照样能用。远端名固定为 origin：仓库若用了别的远端名，git 自己
+// 的报错会原样返回。
+//
+// 失败即止：序列里任何一步失败（起不来子进程、非零退出、超时）都不再执行后面的步骤
+// ——没暂存完整的提交、没提交成功的推送，再跑一次只会把同一条错误重复一遍。由此带来
+// 一个副作用：工作区干净时 c&p 会停在 commit 的「nothing to commit」，此时敲 /git p
+// 就能直接推送（正文末尾也会给出这句提示）。
+const { spawn } = require('node:child_process')
+
+/** 单次执行的超时预算：提交可能触发 pre-commit 钩子（格式化、测试），推送可能很慢。 */
+const TIMEOUT_MS = 300000
+/** 单段输出的字符上限：git 正常输出远小于此，超限只可能是异常情形。 */
+const MAX_OUTPUT_CHARS = 262144
+/** 写死的提交信息：用户与模型都无法指定。 */
+const COMMIT_MESSAGE = '更新'
+/** 写死的暂存参数：-A 覆盖新文件、修改与删除，即「所有更改」。 */
+const GIT_ADD_ARGS = ['add', '-A']
+/** 写死的提交参数：-m 让 git 不打开编辑器。 */
+const GIT_COMMIT_ARGS = ['commit', '-m', COMMIT_MESSAGE]
+/** 写死的推送参数。 */
+const GIT_PUSH_ARGS = ['push', '-u', 'origin', 'HEAD']
+
+/** 三个动作各自的命令序列；键就是参数词。 */
+const STEP_SEQUENCES = {
+  c: [GIT_ADD_ARGS, GIT_COMMIT_ARGS],
+  p: [GIT_PUSH_ARGS],
+  'c&p': [GIT_ADD_ARGS, GIT_COMMIT_ARGS, GIT_PUSH_ARGS],
+}
+
+/** 输入词 → 动作。commit / push / cp 只是照顾手速的别名，语义与三个主参数一致。 */
+const INPUT_ACTIONS = new Map([
+  ['c', 'c'],
+  ['commit', 'c'],
+  ['p', 'p'],
+  ['push', 'p'],
+  ['c&p', 'c&p'],
+  ['cp', 'c&p'],
+])
+
+const USAGE = '用法：/git c（提交）· /git p（推送）· /git c&p（提交并推送）'
+
+/**
+ * 起一个 git 子进程，把输出收成 { stdout, stderr, exitCode, timedOut, spawnError }。
+ *
+ * git 在 Windows 上是可直接执行的 git.exe，无需借 cmd.exe；参数以数组交给 spawn
+ * （shell: false），提交信息里的空格不会被任何解释器处理。
+ * @param {string} root - 会话工作区根目录，作为 cwd。
+ * @param {string[]} args - 写死的 git 参数。
+ * @returns {Promise<object>} 见上。
+ */
+function runGit(root, args) {
+  return new Promise((resolve) => {
+    let child
+    try {
+      child = spawn('git', args, { cwd: root, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) {
+      resolve({ stdout: '', stderr: '', exitCode: null, timedOut: false, spawnError: error.message })
+      return
+    }
+
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let timedOut = false
+
+    const append = (current, chunk) => {
+      if (current.length >= MAX_OUTPUT_CHARS) return current
+      return (current + chunk).slice(0, MAX_OUTPUT_CHARS)
+    }
+
+    const timer = setTimeout(() => {
+      if (settled) return
+      timedOut = true
+      child.kill()
+    }, TIMEOUT_MS)
+
+    child.stdout.on('data', (chunk) => { stdout = append(stdout, chunk.toString('utf8')) })
+    child.stderr.on('data', (chunk) => { stderr = append(stderr, chunk.toString('utf8')) })
+
+    const finish = (exitCode, spawnError) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ stdout, stderr, exitCode, timedOut, spawnError })
+    }
+
+    child.on('error', (error) => finish(null, error.message))
+    child.on('close', (code) => finish(code, null))
+  })
+}
+
+/**
+ * 按顺序执行一串命令，遇到第一个失败就停。
+ * @param {string} root - 会话工作区根目录。
+ * @param {string[][]} argsList - 本次动作的命令序列。
+ * @returns {Promise<Array<{args: string[], result: object}>>} 已执行的命令及其结果。
+ */
+async function runSequence(root, argsList) {
+  const runs = []
+  for (const args of argsList) {
+    const result = await runGit(root, args)
+    runs.push({ args, result })
+    if (result.spawnError !== null || result.exitCode !== 0) break
+  }
+  return runs
+}
+
+/** 单条命令的正文：stdout，非空 stderr 追加在其后。 */
+function bodyOf(result) {
+  if (result.stderr.length === 0) return result.stdout
+  if (result.stdout.length > 0 && !result.stdout.endsWith('\\n')) {
+    return \`\${result.stdout}\\n[stderr]\\n\${result.stderr}\`
+  }
+  return \`\${result.stdout}[stderr]\\n\${result.stderr}\`
+}
+
+/**
+ * 每条命令一段：先回显 \`$ git <参数>\`，再是 stdout（非空 stderr 追加其后），最后是
+ * 这一步自己的退出码 / 超时标记，原样返回、不做归纳。
+ *
+ * 逐条回显、逐条给标记：一次 c&p 最多三条命令，不带命令行就分不清哪段来自 add、哪段
+ * 来自 commit、哪段来自 push；标记若统一追加在末尾，又会让人误以为整条序列都失败了。
+ * @param {Array<{args: string[], result: object}>} runs - runSequence 的返回值。
+ * @returns {string} 命令结果正文。
+ */
+function renderResults(runs) {
+  const sections = []
+  for (const { args, result } of runs) {
+    const lines = [\`$ git \${args.join(' ')}\`]
+    // 起不来子进程（git 缺失等）本身就是结果，原样报出，不当异常抛。
+    if (result.spawnError !== null) {
+      lines.push(\`无法执行 git：\${result.spawnError}\`)
+    } else {
+      const body = bodyOf(result).replace(/\\s+$/, '')
+      // 暂存成功时 git add 无输出；「没说话」也是结果的一部分。
+      lines.push(body.length > 0 ? body : '(no output)')
+      if (result.timedOut) lines.push(\`[timed out after \${TIMEOUT_MS}ms]\`)
+      else if (result.exitCode !== 0) lines.push(\`[exit code: \${result.exitCode}]\`)
+    }
+    sections.push(lines.join('\\n'))
+  }
+  return sections.join('\\n\\n')
+}
+
+module.exports = {
+  name: 'command-git',
+  inject: ['commands'],
+
+  apply(ctx) {
+    const commands = ctx.get('commands')
+    if (!commands) return
+
+    commands.register({
+      name: 'git',
+      description: '提交 / 推送当前会话工作区的仓库（c 提交，p 推送，c&p 提交并推送）',
+      input: { hint: 'c | p | c&p' },
+      handler: async ({ agent, rawInput }) => {
+        // 仓库位置取自会话头，不取自参数：用户输入只挑动作，改不了 cwd。
+        const root = agent && agent.session ? agent.session.header.cwd : undefined
+        if (typeof root !== 'string' || root.length === 0) {
+          return { kind: 'error', text: '当前会话没有工作目录，无法定位要操作的仓库。' }
+        }
+
+        const word = typeof rawInput === 'string' ? rawInput.replace(/\\s+/g, '').toLowerCase() : ''
+        const action = INPUT_ACTIONS.get(word)
+        if (action === undefined) {
+          return {
+            kind: 'error',
+            text: word.length === 0 ? \`缺少动作参数。\${USAGE}\` : \`无法识别的动作「\${word}」。\${USAGE}\`,
+          }
+        }
+
+        const runs = await runSequence(root, STEP_SEQUENCES[action])
+        const failed = runs.some(({ result }) => result.spawnError !== null || result.exitCode !== 0 || result.timedOut)
+        const parts = [renderResults(runs)]
+
+        const commitRun = runs.find(({ args }) => args[0] === 'commit')
+        const nothingToCommit = commitRun !== undefined
+          && commitRun.result.exitCode !== 0
+          && /nothing to commit|无文件要提交|工作区干净/.test(\`\${commitRun.result.stdout}\${commitRun.result.stderr}\`)
+        if (nothingToCommit) parts.push('工作区没有可提交的改动。若只想推送已有的提交，用 /git p。')
+
+        return { kind: failed ? 'error' : 'success', text: parts.join('\\n\\n') }
+      },
+    })
+  },
+}
+`
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 内嵌资源 F：idle-guard.js
 // ─────────────────────────────────────────────────────────────────────────────
 // 落盘拦截规则，两种模式：默认（普通提交键）不拦截任何调用；武装（界面按钮发起）
 // 由客户端先 POST /idle-arm/arm 置位，随后按检查点拦截非落盘调用，持续到回合结束。
@@ -2611,11 +2830,15 @@ console.log(`[plugins] 已生成复盘压缩插件: ${reflectCommandPath}`)
 
 const hotreloadMeterPath = path.join(PLUGINS_DIR, 'preset-hotreload-and-meter.js')
 fs.writeFileSync(hotreloadMeterPath, PRESET_HOTRELOAD_AND_METER_CODE, 'utf8')
-console.log(`[plugins] 已生成预设热重载插件（上下文计量投影部分已移除）: ${hotreloadMeterPath}`)
+console.log(`[plugins] 已生成预设热重载插件: ${hotreloadMeterPath}`)
 
 const exploreCommandPath = path.join(PLUGINS_DIR, 'explore-command.js')
 fs.writeFileSync(exploreCommandPath, EXPLORE_COMMAND_CODE, 'utf8')
 console.log(`[plugins] 已生成项目探索插件: ${exploreCommandPath}`)
+
+const gitCommandPath = path.join(PLUGINS_DIR, 'git-command.js')
+fs.writeFileSync(gitCommandPath, GIT_COMMAND_CODE, 'utf8')
+console.log(`[plugins] 已生成 git 命令插件: ${gitCommandPath}`)
 
 const idleGuardPath = path.join(PLUGINS_DIR, 'idle-guard.js')
 fs.writeFileSync(idleGuardPath, IDLE_GUARD_CODE, 'utf8')
@@ -2624,16 +2847,13 @@ console.log(`[plugins] 已生成闲置落盘警告插件: ${idleGuardPath}`)
 // idle-arm 是「宿主半边 + 客户端半边」的双面插件，因此必须是一个真正的包目录：
 // dsh-client-modules 靠 package.json 的 exports["./client"] 定位客户端 bundle，
 // 而 nearestPackage 是向上找最近的 package.json，所以这份声明只能放在自己的子目录里，
-// 不能放到 plugins/ 根（否则同级四个插件都会被误认为共用同一个客户端 bundle）。
+// 不能放到 plugins/ 根（否则 plugins/ 下所有插件都会被误认为共用同一个客户端 bundle）。
 const IDLE_ARM_DIR = path.join(PLUGINS_DIR, 'idle-arm')
-const IDLE_ARM_PKG = path.join(IDLE_ARM_DIR, 'package.json')
 const IDLE_ARM_HOST = path.join(IDLE_ARM_DIR, 'lib', 'index.js')
-const IDLE_ARM_CLIENT = path.join(IDLE_ARM_DIR, 'lib', 'client.js')
 fs.mkdirSync(path.join(IDLE_ARM_DIR, 'lib'), { recursive: true })
 // package.json 与客户端 bundle 是手写资源（内容在仓库里，见 plugins/idle-arm/），脚本不生成也不覆盖。
-// 宿主半边则相反：它的内容就在上面那个 IDLE_ARM_HOST_CODE 里，属于生成物，必须每次覆写。
-// 早先这里用的是 existsSync 守卫，结果模板改了、磁盘上那份没跟着改，注释里还留着
-// 早已不存在的 /idle-arm 命令——生成物一旦有「只在缺失时写」的守卫就会这样悄悄漂移。
+// 宿主半边则相反：它的内容就在上面那个 IDLE_ARM_HOST_CODE 里，属于生成物，必须每次覆写
+// ——生成物一旦有「只在缺失时写」的守卫，模板改了磁盘上那份也不会跟着改。
 fs.writeFileSync(IDLE_ARM_HOST, IDLE_ARM_HOST_CODE, 'utf8')
 
 // prompt-forge 与 idle-arm 同样是「宿主半边 + 客户端半边」的双面插件，理由完全一致：
@@ -2642,108 +2862,88 @@ fs.writeFileSync(IDLE_ARM_HOST, IDLE_ARM_HOST_CODE, 'utf8')
 //
 // 与其它插件不同，它是**手写资源**：lib/ 下五个模块（index / client / prompt /
 // forge-prompts / templates）全部在仓库里维护，脚本既不生成也不覆盖 —— 那些文件里的
-// 提示词与渲染规则是逐字校对过的，生成器覆写只会把它们悄悄改回旧版本。
+// 提示词与渲染规则是逐字校对过的，生成器覆写会把磁盘上的内容覆盖成模板里的版本。
 const PROMPT_FORGE_DIR = path.join(PLUGINS_DIR, 'prompt-forge')
-const PROMPT_FORGE_PKG = path.join(PROMPT_FORGE_DIR, 'package.json')
 const PROMPT_FORGE_HOST = path.join(PROMPT_FORGE_DIR, 'lib', 'index.js')
 const PROMPT_FORGE_CLIENT = path.join(PROMPT_FORGE_DIR, 'lib', 'client.js')
 
+// soup-view 与 idle-arm 同构：宿主半边空转，客户端半边靠 tool.call.toolview 顶替
+// soup 工具的通用行（汤底因此不上屏）。同样必须是一个带 package.json 的独立包目录。
+const SOUP_VIEW_DIR = path.join(PLUGINS_DIR, 'soup-view')
+
 /**
- * 校验 idle-arm 的双面声明是否真的成立。
+ * 校验一个「宿主半边 + 客户端半边」双面包的声明是否真的成立。
  *
  * 只检查文件存在是不够的：客户端半边要靠 package.json 的 dsh.client + exports["./client"]
  * 才会被 dsh-client-modules 装配，而 bundle 里 `__ModuleLoader__.load({ id })` 的 id
  * 又必须严格等于 package.json 的 name（client-modules 会拿 manifest 里的 id 去比对，
- * 不一致就报「loaded without registering」）。这两处任何一处错位，结果都是按钮
- * 静默不出现——脚本却照样打印「部署成功」。所以这里逐条验到契约层面，任一不满足即
- * 以非零码退出，绝不把「界面缺了一块」伪装成成功。
- * @returns 校验发现的问题列表（空数组表示全部通过）。
+ * 不一致就报「loaded without registering」）。这两处任何一处错位，结果都是界面上的
+ * 那块东西静默不出现——脚本却照样打印「部署成功」。所以这里逐条验到契约层面，任一
+ * 不满足即以非零码退出，绝不把「界面缺了一块」伪装成成功。
+ * @param {string} dir - 包目录。
+ * @returns {string[]} 校验发现的问题列表（空数组表示全部通过）。
  */
-function verifyIdleArmBundle() {
+function verifyClientBundle(dir) {
   const problems = []
-  if (!fs.existsSync(IDLE_ARM_PKG)) {
-    problems.push(`缺少 ${IDLE_ARM_PKG}`)
-    return problems
-  }
-  if (!fs.existsSync(IDLE_ARM_CLIENT)) {
-    problems.push(`缺少 ${IDLE_ARM_CLIENT}（客户端半边不存在，提交键旁的按钮不会出现）`)
+  const pkgFile = path.join(dir, 'package.json')
+  if (!fs.existsSync(pkgFile)) {
+    problems.push(`缺少 ${pkgFile}`)
     return problems
   }
   let manifest
   try {
-    manifest = JSON.parse(fs.readFileSync(IDLE_ARM_PKG, 'utf8'))
+    manifest = JSON.parse(fs.readFileSync(pkgFile, 'utf8'))
   } catch (error) {
-    problems.push(`${IDLE_ARM_PKG} 不是合法 JSON: ${error.message}`)
+    problems.push(`${pkgFile} 不是合法 JSON: ${error.message}`)
     return problems
   }
   const name = manifest.name
-  if (typeof name !== 'string' || name.length === 0) problems.push(`${IDLE_ARM_PKG} 缺少 name`)
-  if (manifest?.dsh?.client?.platform !== 'web') problems.push(`${IDLE_ARM_PKG} 的 dsh.client.platform 必须是 'web'`)
+  if (typeof name !== 'string' || name.length === 0) problems.push(`${pkgFile} 缺少 name`)
+  if (manifest?.dsh?.client?.platform !== 'web') problems.push(`${pkgFile} 的 dsh.client.platform 必须是 'web'`)
   const clientExport = manifest?.exports?.['./client']
   const clientRel = typeof clientExport === 'string' ? clientExport : clientExport?.default
   if (typeof clientRel !== 'string' || clientRel.length === 0) {
-    problems.push(`${IDLE_ARM_PKG} 的 exports["./client"] 未指向客户端 bundle`)
-  } else if (!fs.existsSync(path.join(IDLE_ARM_DIR, clientRel))) {
-    problems.push(`${IDLE_ARM_PKG} 的 exports["./client"] 指向不存在的文件: ${clientRel}`)
+    problems.push(`${pkgFile} 的 exports["./client"] 未指向客户端 bundle`)
+    return problems
+  }
+  const clientFile = path.join(dir, clientRel)
+  if (!fs.existsSync(clientFile)) {
+    problems.push(`${pkgFile} 的 exports["./client"] 指向不存在的文件: ${clientRel}`)
+    return problems
   }
   // bundle 注册的 id 必须与包名一致，否则 client-modules 直接判为「loaded without registering」。
-  const registered = /__ModuleLoader__\.load\(\{\s*id:\s*['"]([^'"]+)['"]/.exec(fs.readFileSync(IDLE_ARM_CLIENT, 'utf8'))
+  const registered = /__ModuleLoader__\.load\(\{\s*id:\s*['"]([^'"]+)['"]/.exec(fs.readFileSync(clientFile, 'utf8'))
   if (registered === null) {
-    problems.push(`${IDLE_ARM_CLIENT} 未按 window.__ModuleLoader__.load({ id, factory }) 形式注册`)
-  } else if (name !== undefined && registered[1] !== name) {
+    problems.push(`${clientFile} 未按 window.__ModuleLoader__.load({ id, factory }) 形式注册`)
+  } else if (typeof name === 'string' && registered[1] !== name) {
     problems.push(`bundle 注册 id「${registered[1]}」与 package.json name「${name}」不一致（client-modules 会拒绝装配）`)
   }
   return problems
 }
 
+/** 校验 idle-arm 的双面声明（提交键旁的落盘拦截按钮）。 */
+const verifyIdleArmBundle = () => verifyClientBundle(IDLE_ARM_DIR)
+
+/** 校验 soup-view 的双面声明（汤底不上屏的那一行）。 */
+const verifySoupViewBundle = () => verifyClientBundle(SOUP_VIEW_DIR)
+
 /**
  * 校验 prompt-forge 的双面声明与模块完整性。
  *
- * 与 idle-arm 同一套契约检查（package.json 的 dsh.client + exports["./client"] +
- * bundle 注册 id 等于包名），额外多两条它独有的：
+ * 与 idle-arm 同一套契约检查（复用 verifyClientBundle），额外多两条它独有的：
  *   · 宿主半边必须导出 apply / inject / name，且 inject 里带 tools 与 commands；
  *   · lib/ 下五个模块一个都不能少 —— 少一个的后果是 import 期 ERR_MODULE_NOT_FOUND，
  *     fiber 停在未激活且不报错（ESM 的失败不会冒泡到部署脚本）。
  * @returns {string[]} 问题列表（空数组表示全部通过）。
  */
 function verifyPromptForgeBundle() {
-  const problems = []
-  if (!fs.existsSync(PROMPT_FORGE_PKG)) {
-    problems.push(`缺少 ${PROMPT_FORGE_PKG}`)
-    return problems
-  }
+  const problems = verifyClientBundle(PROMPT_FORGE_DIR)
   for (const file of [PROMPT_FORGE_HOST, PROMPT_FORGE_CLIENT]) {
     if (!fs.existsSync(file)) problems.push(`缺少 ${file}`)
   }
   for (const name of ['prompt.js', 'templates.js', 'forge-prompts.js']) {
     const file = path.join(PROMPT_FORGE_DIR, 'lib', name)
     if (!fs.existsSync(file)) problems.push(`缺少 ${file}（宿主半边 import 它，缺失会让整个插件静默不激活）`)
-  }
-  let manifest
-  try {
-    manifest = JSON.parse(fs.readFileSync(PROMPT_FORGE_PKG, 'utf8'))
-  } catch (error) {
-    problems.push(`${PROMPT_FORGE_PKG} 不是合法 JSON: ${error.message}`)
-    return problems
-  }
-  const pkgName = manifest.name
-  if (typeof pkgName !== 'string' || pkgName.length === 0) problems.push(`${PROMPT_FORGE_PKG} 缺少 name`)
-  if (manifest?.dsh?.client?.platform !== 'web') problems.push(`${PROMPT_FORGE_PKG} 的 dsh.client.platform 必须是 'web'`)
-  const clientExport = manifest?.exports?.['./client']
-  const clientRel = typeof clientExport === 'string' ? clientExport : clientExport?.default
-  if (typeof clientRel !== 'string' || clientRel.length === 0) {
-    problems.push(`${PROMPT_FORGE_PKG} 的 exports["./client"] 未指向客户端 bundle`)
-  } else if (!fs.existsSync(path.join(PROMPT_FORGE_DIR, clientRel))) {
-    problems.push(`${PROMPT_FORGE_PKG} 的 exports["./client"] 指向不存在的文件: ${clientRel}`)
-  }
-  // bundle 注册的 id 必须与包名一致，否则 client-modules 直接判为「loaded without registering」。
-  if (fs.existsSync(PROMPT_FORGE_CLIENT)) {
-    const registered = /__ModuleLoader__\.load\(\{\s*id:\s*['"]([^'"]+)['"]/.exec(fs.readFileSync(PROMPT_FORGE_CLIENT, 'utf8'))
-    if (registered === null) {
-      problems.push(`${PROMPT_FORGE_CLIENT} 未按 window.__ModuleLoader__.load({ id, factory }) 形式注册`)
-    } else if (typeof pkgName === 'string' && registered[1] !== pkgName) {
-      problems.push(`bundle 注册 id「${registered[1]}」与 package.json name「${pkgName}」不一致（client-modules 会拒绝装配）`)
-    }
   }
   // 宿主半边的导出契约：ESM 下用文本匹配，避免在这里引入动态 import（顶层 await 会
   // 把整个部署脚本变成异步模块，而它现在是同步 CommonJS）。
@@ -2822,12 +3022,21 @@ if (idleArmProblems.length > 0) {
   console.log(`[plugins] idle-arm 双面插件就位: ${IDLE_ARM_DIR}`)
 }
 
-// 3. 自建预设迁移：把旧版目录预设转成声明式预设
+const soupViewProblems = verifySoupViewBundle()
+if (soupViewProblems.length > 0) {
+  for (const problem of soupViewProblems) console.error(`  [soup-view] ${problem}`)
+  console.error('  [soup-view] 双面声明不完整：soup 工具的调用行会退回通用行，汤底将直接显示在界面上。请从仓库恢复 plugins/soup-view/。')
+  process.exitCode = 1
+} else {
+  console.log(`[plugins] soup-view 双面插件就位: ${SOUP_VIEW_DIR}`)
+}
+
+// 3. 自建预设迁移：把目录预设转成声明式预设
 //    官方已彻底移除对 ~/.dsh/.agent-presets/<id>/ 目录的读取（官方 skill
 //    `editing-cordis-compositions` 原文：Nothing reads that directory any more）。
-//    现在一个预设就是一条 `@deepseek-ai/dsh-agent-preset` 声明行，config 为
-//    { id, name, description, order, plugins }，plugins 即旧 agent.cordis.yml 的条目列表。
-//    本阶段按官方迁移口径逐目录转换：
+//    一个预设就是一条 `@deepseek-ai/dsh-agent-preset` 声明行，config 为
+//    { id, name, description, order, plugins }，plugins 即 agent.cordis.yml 的条目列表。
+//    本阶段逐目录转换：
 //      - id                    ← 目录名（官方要求小写字母/数字/连字符）
 //      - name / description / order ← preset.yml
 //      - plugins               ← agent.cordis.yml 原样内联（逐行整体右移，
@@ -2959,9 +3168,8 @@ function buildPresetDeclarationsBlock() {
   if (ids.length === 0) return { text: '', count: 0, ids: [] }
 
   // 资源目录每次整棵重建，而不是「缺什么补什么」：来源里删掉的资源必须跟着从
-  // profile 里消失，否则 preset-assets 会一直留着过期拷贝（工具插件改成共享实现后
-  // 就正是这种情况），将来 grep 到还会以为工具是它提供的。该目录是纯生成物，
-  // 内容完全由上面这些目录推导得出，可以放心删。
+  // profile 里消失，否则 preset-assets 会一直留着过期拷贝，将来 grep 到还会以为
+  // 它仍然存在。该目录是纯生成物，内容完全由上面这些目录推导得出，可以放心删。
   fs.rmSync(PRESET_ASSETS_DIR, { recursive: true, force: true })
 
   const blocks = []
@@ -2994,7 +3202,7 @@ function buildPresetDeclarationsBlock() {
   const header = [
     PRESET_BLOCK_BEGIN,
     '# 本节由 ~/.dsh/.js 依据 ~/.dsh/.agent-presets/<id>/ 自动生成，请勿手改本段。',
-    '# 旧目录预设不再被读取：每个目录在此转成一条声明行，',
+    '# 每个目录在此转成一条声明行，',
     '# name/description/order 取自 preset.yml，plugins 为 agent.cordis.yml 的原样内联；',
     '# 相对资源已复制到 profiles/web/preset-assets/<id>/ 并改写引用。',
   ].join('\n')
@@ -3002,20 +3210,20 @@ function buildPresetDeclarationsBlock() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3.5 旧版 settings.yaml 迁移（「设置」改存 profile 补丁）
+// 3.5 settings.yaml 迁移（「设置」写进 profile 补丁）
 //
 // 只解析 ~/.dsh/settings.yaml 本身。`settings.yaml.imported` 是官方 dsh-settings
-// 导入后留下的归档，里面的值可能早已被网页端改过，拿它当迁移源会把旧值写回补丁层
-// 覆盖现行设置，因此不再读取。
+// 导入后留下的归档，里面的值可能已被网页端改过，拿它当迁移源会把过期值写回补丁层
+// 覆盖现行设置，因此不读取。
 //
-// 本阶段用同一套旧名映射把「补丁层能表达」的部分直接写进 profile patch：
+// 本阶段用 LEGACY_SECTION_ENTRIES 的映射把「补丁层能表达」的部分直接写进 profile patch：
 //   - 有同名条目的 section → 生成 `- id: <条目>` + `config:` 行。补丁层不区分
 //     volatile（volatile 只约束「不重挂就能改」的在线编辑），静态 config 一律生效，
 //     因此覆盖面比官方导入更全（例如 ui-theme 的 preference 也能落回来）；
-//   - 无同名条目的 section → 打印丢弃原因，值仍保留在 legacy 文件里，不静默消失。
+//   - 无同名条目的 section → 打印丢弃原因，值仍保留在 settings.yaml 里，不静默消失。
 // 幂等：补丁里已存在同名顶层条目的 section 一律跳过，网页端后续的修改不会被覆盖。
 //
-// 没有 settings.yaml 时整段跳过，并把上一版生成的区块原样保留：托管区块在重建前
+// 没有 settings.yaml 时整段跳过，并把补丁里现有的托管区块原样保留：托管区块在重建前
 // 已被摘除，若此时返回空区块，那段配置就会从补丁里静默消失。
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3055,17 +3263,17 @@ function yamlModule() {
 }
 
 /**
- * 把 legacy 文档归一化成「待迁移条目」清单。
+ * 把 settings 文档归一化成「待迁移条目」清单。
  *
  * 两种历史形状都必须认：
  *   - 顶层数组：每项已是一条完整的 Loader 条目 `{ id, name?, config? }`，
- *     条目 id 直接可用，不经旧名映射；
+ *     条目 id 直接可用，不经 LEGACY_SECTION_ENTRIES 映射；
  *   - 更早的 section 映射：`{ <section>: <values> }`，section 名经
  *     LEGACY_SECTION_ENTRIES 映射成现行条目 id。
  *
- * 只认数组会漏掉旧文件；只认映射则会把新文件解析成【名为 "0" 的 section】并整段
- * 丢弃——settings.yaml 里那份 provider（网关）配置因此从未被迁移过，而第 5 步又已
- * 把它从补丁里截掉，于是每次运行都净损失一段设置。
+ * 只认数组会漏掉映射形状的文件；只认映射则会把数组形状的文件解析成【名为 "0" 的
+ * section】并整段丢弃——settings.yaml 里那份 provider（网关）配置会被漏掉，而第 5 步
+ * 又已把它从补丁里截掉，于是每次运行都净损失一段设置。
  * @param {unknown} document - YAML 解析结果。
  * @returns {{origin: string, ns: string, name: string | undefined, values: unknown}[]} 归一化条目。
  */
@@ -3095,12 +3303,12 @@ function normalizeLegacySections(document) {
 }
 
 /**
- * 读取 legacy 设置文档。
+ * 读取 settings 迁移源文档。
  *
  * 只认 settings.yaml 本身。`settings.yaml.imported` 是官方 dsh-settings 导入后
- * 留下的归档文件——它记录的是「官方已经处理过、且只处理了一部分」的旧值，
- * 拿它当迁移源会把早已被网页端改过的字段重新写回补丁层，覆盖用户的现行设置。
- * 该文件不存在或不再更新时，这里返回 undefined，调用方据此跳过整段迁移。
+ * 留下的归档文件——它记录的是「官方已经处理过、且只处理了一部分」的值，
+ * 拿它当迁移源会把已被网页端改过的字段重新写回补丁层，覆盖用户的现行设置。
+ * 该文件不存在时，这里返回 undefined，调用方据此跳过整段迁移。
  * @returns {{source: string | undefined, items: unknown[] | undefined}}
  */
 function readLegacySettings() {
@@ -3108,7 +3316,7 @@ function readLegacySettings() {
   if (source === undefined) return { source: undefined, items: undefined }
   const yaml = yamlModule()
   if (yaml === null) {
-    console.warn('  [settings] 未找到可用的 YAML 实现（yaml / js-yaml），跳过 legacy 设置迁移')
+    console.warn('  [settings] 未找到可用的 YAML 实现（yaml / js-yaml），跳过设置迁移')
     return { source, items: undefined }
   }
   try {
@@ -3120,16 +3328,16 @@ function readLegacySettings() {
 }
 
 /**
- * 把补丁正文切成三段：托管区块之前的正文、托管区块之外的顶层条目、上一版 legacy 区块原文。
+ * 把补丁正文切成三段：托管区块之前的正文、托管区块之外的顶层条目、现有设置区块原文。
  *
  * 托管区块只包含本脚本生成的顶层条目，边界是确定的：
- *   - legacy 设置区块：`- id: <条目>` 若干条，止于预设标记或文件末尾；
+ *   - 设置区块：`- id: <条目>` 若干条，止于预设标记或文件末尾；
  *   - 预设声明区块：恰好一条 `- insert:`，正文全部缩进，止于下一个顶层行。
  *
  * 为什么必须单独摘出「托管区块之外的顶层条目」：官方设置编辑器
  * （dsh-settings 的 configEditor）把用户条目【追加到文件末尾】，即落在预设标记之后。
- * 旧实现「从第一个托管标记截断到文件末尾」会把这些条目一并抹掉，重建时又不会写回，
- * 于是每次运行都静默删除一段用户配置（实测：provider 网关配置被连删两次）。
+ * 若「从第一个托管标记截断到文件末尾」，这些条目会被一并抹掉，重建时又不会写回，
+ * 于是每次运行都静默删除一段用户配置。
  * @param {string} content - 补丁正文。
  * @returns {{head: string, foreign: string, legacy: string | undefined}} 三段内容。
  */
@@ -3203,7 +3411,7 @@ function loadProfileEntryIds(profileName) {
   if (!fs.existsSync(entry)) return undefined
   const result = spawnSync(process.execPath, [entry, '--profile', profileName, '--dump-config'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
   if (result.error !== undefined || typeof result.stdout !== 'string') {
-    console.warn(`  [settings] 无法读取 profile「${profileName}」的组合（--dump-config 失败），跳过 legacy 设置迁移`)
+    console.warn(`  [settings] 无法读取 profile「${profileName}」的组合（--dump-config 失败），跳过设置迁移`)
     return undefined
   }
   const ids = new Set()
@@ -3219,8 +3427,8 @@ const indentBlock = (text, prefix) => text.replace(/^(?!$)/gm, prefix).replace(/
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 /**
- * 生成 legacy 设置迁移区块（含起始标记）。
- * @param patchContent - 已摘除上一版托管区块的补丁正文。
+ * 生成设置迁移区块（含起始标记）。
+ * @param patchContent - 已摘除托管区块的补丁正文。
  * @param profileName - 目标 profile 名。
  * @returns 区块文本与三段清单（已迁移 / 跳过 / 丢弃）。
  */
@@ -3228,13 +3436,13 @@ function buildLegacySettingsBlock(patchContent, profileName) {
   const empty = { text: '', imported: [], skipped: [], dropped: [], unavailable: false, noSource: false }
   const legacy = readLegacySettings()
   // 没有 settings.yaml 时不是「没有可迁移项」，而是「本次无从判断」：
-  // 返回 noSource，让调用方保留上一版区块原文，而不是把它当成空区块删掉。
+  // 返回 noSource，让调用方保留补丁里现有的区块原文，而不是把它当成空区块删掉。
   if (legacy.items === undefined) return { ...empty, noSource: legacy.source === undefined }
   if (legacy.items.length === 0) return empty
 
   const entryIds = loadProfileEntryIds(profileName)
   // 拿不到条目清单 = 无法判断「profile 里有没有同名条目」，此时重建结果不可信。
-  // 显式标记出来，交给调用方决定回填旧内容而不是当成「没有可迁移项」。
+  // 显式标记出来，交给调用方决定回填现有区块而不是当成「没有可迁移项」。
   if (entryIds === undefined) return { ...empty, unavailable: true }
   const yaml = yamlModule()
 
@@ -3260,7 +3468,7 @@ function buildLegacySettingsBlock(patchContent, profileName) {
   const header = [
     LEGACY_SETTINGS_BLOCK_BEGIN,
     `# 由 ~/.dsh/.js 从 ${legacy.source} 迁移而来，请勿手改本段。`,
-    '# settings.yaml 不再是生效源：设置一律存在本 profile 补丁里。',
+    '# settings.yaml 不作为生效源：设置一律存在本 profile 补丁里。',
     '# 已在其他位置出现同名条目的 section 不会被覆盖（会打印在运行日志里）。',
   ].join('\n')
   return { text: `${header}\n${rows.join('\n\n')}\n`, imported, skipped, dropped }
@@ -3279,36 +3487,37 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
   // 落盘前的完整性校验要拿「本次运行开始时的条目清单」当基准，因此先留一份原文。
   const originalPatchContent = patchContent
 
-  // 清除旧的空数组占位符与废弃标记
+  // 清除空数组占位符与废弃标记
   patchContent = patchContent.replace(/^\s*\[\s*\]\s*$/gm, '').trim()
 
   const absCreative = pathToFileURL(creativeWorkflowPath).href
   const absReflect = pathToFileURL(reflectCommandPath).href
   const absHotreload = pathToFileURL(hotreloadMeterPath).href
   const absExplore = pathToFileURL(exploreCommandPath).href
+  const absGitCommand = pathToFileURL(gitCommandPath).href
   const absIdleGuard = pathToFileURL(idleGuardPath).href
   const absIdleArm = pathToFileURL(IDLE_ARM_HOST).href
   const absPromptForge = pathToFileURL(PROMPT_FORGE_HOST).href
+  const absSoupView = pathToFileURL(path.join(SOUP_VIEW_DIR, 'lib', 'index.js')).href
 
-  // 1. 不在 host 层启用 compaction-basic（同时自愈：删除旧版本脚本注入的那一行）。
-  //    dsh-web-app bundle 明确把该 host 行置为 disabled，压缩后端整体下沉到
+  // 1. host 层不启用 compaction-basic，并摘除该层残留的启用行。
+  //    dsh-web-app bundle 明确把该 host 行置为 disabled，压缩后端整体位于
   //    agent preset：standard 预设在自己的 isolate 组里挂载 compaction-basic /
   //    command-compact / tool-result-pruner。若 host 层再挂一个引擎，由于其 auto 默认为
   //    true（会注册 agent/pre-step 自动压缩），将与预设实例对同一会话重复触发压缩，
   //    抢占会话级压缩锁（busy）并重复消耗摘要 token。
   //    /reflect 的自动压缩不依赖 host 行：它通过 agentPresets.serviceFor(agent, 'compaction')
   //    解析到预设内的压缩实例。
-  //    匹配用「行首 + 2 空格缩进」精确锁定顶层条目：旧版脚本是 prepend，但文件自带的注释
-  //    行排在更前面，所以这一行并不在文件开头；而 insert 列表里的同名条目缩进为 4 空格，
-  //    不会被误删。
+  //    匹配用「行首 + 2 空格缩进」精确锁定顶层条目：文件自带的注释行排在更前面，
+  //    所以这一行并不在文件开头；而 insert 列表里的同名条目缩进为 4 空格，不会被误删。
   //    末尾的 \n? 是必需的：这一行可能是文件的最后一行（后面没有换行符）。
   const legacyCompactionPattern = /(^|\n)- id: compaction-basic\n  disabled: false\n?/
   if (legacyCompactionPattern.test(patchContent)) {
     patchContent = patchContent.replace(legacyCompactionPattern, '\n').replace(/\n{3,}/g, '\n\n').trim()
-    console.log('  [profile] 已移除旧的 host 层 compaction-basic 启用行（压缩后端由 agent preset 提供）')
+    console.log('  [profile] 已摘除 host 层 compaction-basic 启用行（压缩后端由 agent preset 提供）')
   }
 
-  // 清除曾经挂过的顶层 custom-tools 条目。自定义工具集只在预设自己的声明里出现
+  // 摘除顶层 custom-tools 条目。自定义工具集只在预设自己的声明里出现
   // （见第 5 步前的说明），而顶层条目的注册会落进 dsh-tools 的全局层、被所有预设
   // 继承——正是要避免的形态。顶层的 insert 形如：
   //     - insert:\n    - id: custom-tools\n      name: file:///...
@@ -3317,10 +3526,10 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
   const legacyToolsMountPattern = /(^|\n)- insert:\n    - id: custom-tools\n      name: [^\n]*\n?/
   if (legacyToolsMountPattern.test(patchContent)) {
     patchContent = patchContent.replace(legacyToolsMountPattern, '\n').replace(/\n{3,}/g, '\n\n').trim()
-    console.log('  [profile] 已移除旧的顶层 custom-tools 挂载（工具集改由各预设按需声明）')
+    console.log('  [profile] 已摘除顶层 custom-tools 挂载（工具集只由各预设按需声明）')
   }
 
-  // 挂载位置：托管区块（legacy 设置 / 预设声明）必须固定位于文件末尾，因此新条目
+  // 挂载位置：托管区块（设置 / 预设声明）必须固定位于文件末尾，因此新条目
   // 一律插到第一个托管标记之前，绝不能 append 到末尾 —— 第 5 步会从第一个托管标记
   // 处整体截断重建，追加到末尾的新条目会被那一步直接抹掉（表现为新插件静默不生效，
   // 而老插件因为恰好位于标记之前得以幸存）。
@@ -3348,7 +3557,7 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     patchContent = patchContent.replace(/name:\s*['"]?(\.\/plugins\/reflect-command\.js|.*reflect-command\.js)['"]?/, `name: ${absReflect}`)
   }
 
-  // 4. 挂载预设热重载与上下文计量修正插件
+  // 4. 挂载预设热重载插件
   if (!patchContent.includes('preset-hotreload-and-meter')) {
     patchContent = spliceBeforeManaged(`- insert:\n    - id: preset-hotreload-and-meter\n      name: ${absHotreload}`)
   } else {
@@ -3360,6 +3569,14 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     patchContent = spliceBeforeManaged(`- insert:\n    - id: command-explore\n      name: ${absExplore}`)
   } else {
     patchContent = patchContent.replace(/name:\s*['"]?(\.\/plugins\/explore-command\.js|.*explore-command\.js)['"]?/, `name: ${absExplore}`)
+  }
+
+  // 4.55 挂载 git 命令插件（/git c | p | c&p）。斜杠命令与 agent preset 无关：
+  //      任何会话里都由用户手动触发，因此挂在这一层。
+  if (!patchContent.includes('command-git')) {
+    patchContent = spliceBeforeManaged(`- insert:\n    - id: command-git\n      name: ${absGitCommand}`)
+  } else {
+    patchContent = patchContent.replace(/name:\s*['"]?(\.\/plugins\/git-command\.js|.*git-command\.js)['"]?/, `name: ${absGitCommand}`)
   }
 
   // 4.6 挂载闲置落盘警告插件（全局规则，独立于任何 agent preset）
@@ -3395,33 +3612,45 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     patchContent = patchContent.replace(/(- id: prompt-forge\n      name:\s*)['"]?[^'"\n]*['"]?/, `$1${absPromptForge}`)
   }
 
+  // 4.9 挂载 soup-view 双面插件（宿主半边空转；客户端半边顶替 soup 工具的通用行，
+  //     让汤底既不上屏、也不进可展开区）。
+  //     与 idle-arm 同一套理由：name 用 file:// 指向宿主半边，client-modules 的
+  //     locatePkgJson 对 path-like 行名走 nearestPackage，会从该文件向上找到
+  //     soup-view/package.json，从而拿到 exports["./client"]。
+  //     幂等判据用条目 id `soup-view`（不能用包名：插入的是 file:// 路径，不含包名）。
+  if (!patchContent.includes('- id: soup-view')) {
+    patchContent = spliceBeforeManaged(`- insert:\n    - id: soup-view\n      name: ${absSoupView}`)
+  } else {
+    patchContent = patchContent.replace(/(- id: soup-view\n      name:\s*)['"]?[^'"\n]*['"]?/, `$1${absSoupView}`)
+  }
+
   // 注意：自定义工具集**不**在这里挂载。tools.js 只提供实现，一个预设能用哪几个
   // 工具由该预设自己的声明决定（见 buildPresetDeclarationsBlock 里的占位名改写）。
   // 挂成这里的顶层条目会把注册写进 dsh-tools 的全局层，而 ToolRuntime.view() 以
   // 全局层为起点组装可见集，于是**每个**预设都会继承——包括设计上不给命令行的
-  // 文学类预设，也会凭空多出 node / delete / git。官方工具走的正是预设声明
+  // 文学类预设，也会凭空多出 node / delete / browser。官方工具走的正是预设声明
   // 这条路（tool-fs / tool-goal / tool-ask-user 都是逐预设声明的）。
 
-  // 5. 重建托管区块（legacy 设置迁移 + 自建预设声明）：两段都固定位于文件末尾，
+  // 5. 重建托管区块（设置迁移 + 自建预设声明）：两段都固定位于文件末尾，
   //    先按标记整体截断、再按固定顺序重建，因此天然幂等。
   //
-  //    注意：截断前必须先留存「现有的 legacy 区块原文」。因为 legacy 区块的重建依赖
+  //    注意：截断前必须先留存「现有的设置区块原文」。因为设置区块的重建依赖
   //    `dsh --dump-config`（用于确认 profile 里存在同名条目），而该调用在受限环境下
   //    可能失败（沙箱拒绝子进程、dsh 升级中、profile 损坏等）。一旦失败，
   //    buildLegacySettingsBlock() 会返回空文本——若此时已经把它截掉，这一段设置
   //    （provider 列表、默认模型、主题等）就会从补丁里凭空消失，属于静默数据丢失。
-  //    因此失败时原样回填，宁可保留旧内容也不丢。
+  //    因此失败时原样回填，宁可保留现有内容也不丢。
   //
   //    另一个必须守住的边界：托管区块【只包含本脚本生成的顶层条目】，而官方设置
   //    编辑器会把用户条目追加到文件末尾（即落在预设标记之后）。因此摘除必须按
   //    「区块」边界精确进行，绝不能从第一个标记一路截到文件末尾——那样会把用户
-  //    自己写/网页端写入的条目（例如 provider 网关配置）当成自己的旧版本删掉，
+  //    自己写/网页端写入的条目（例如 provider 网关配置）一并删掉，
   //    重建时又不会写回，于是每次运行净损失一段配置。
   const managed = splitManagedRegions(patchContent)
   const existingLegacyBlock = managed.legacy
   const foreignEntries = managed.foreign
   if (managed.legacy !== undefined || managed.foreign.length > 0) {
-    console.log('  [managed] 已摘除上一版生成的托管区块（legacy 设置 / 预设声明），准备重建')
+    console.log('  [managed] 已摘除托管区块（设置 / 预设声明），准备重建')
   }
   patchContent = managed.head
   if (foreignEntries.length > 0) {
@@ -3430,32 +3659,32 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     console.log(`  [managed] 保留托管区块之外的用户条目 ${foreignEntries.split('\n').filter((line) => /^- /.test(line)).length} 条`)
   }
 
-  // 5.1 旧版 settings.yaml 迁移（详见上方「4. 旧版 settings.yaml 迁移」一节）
+  // 5.1 settings.yaml 迁移（详见上方「3.5 settings.yaml 迁移」一节）
   const legacySettings = buildLegacySettingsBlock(patchContent, PROFILE_NAME)
   if (legacySettings.text.length > 0) {
     patchContent += `\n\n${legacySettings.text.trim()}`
-    console.log(`  [settings] 已迁移 ${legacySettings.imported.length} 个 legacy section: ${legacySettings.imported.join('、')}`)
+    console.log(`  [settings] 已迁移 ${legacySettings.imported.length} 个 section: ${legacySettings.imported.join('、')}`)
   } else if ((legacySettings.unavailable === true || legacySettings.noSource === true) && existingLegacyBlock !== undefined) {
     // 重建不可用（没有 settings.yaml，或 --dump-config 失败），原样回填，绝不让设置凭空消失。
     patchContent += `\n\n${existingLegacyBlock}`
     const why = legacySettings.noSource === true ? '未检测到 settings.yaml' : '--dump-config 不可用'
-    console.warn(`  [settings] 跳过 legacy 设置迁移（${why}），已原样保留现有内容，未做改动`)
+    console.warn(`  [settings] 跳过设置迁移（${why}），已原样保留现有内容，未做改动`)
   } else if (legacySettings.noSource === true) {
-    console.log('  [settings] 未检测到 settings.yaml，跳过 legacy 设置迁移')
+    console.log('  [settings] 未检测到 settings.yaml，跳过设置迁移')
   } else if (legacySettings.unavailable === true) {
-    console.warn('  [settings] 无法重建 legacy 设置区块（--dump-config 不可用），本次不写入该区块')
+    console.warn('  [settings] 无法重建设置区块（--dump-config 不可用），本次不写入该区块')
   } else {
-    console.log('  [settings] 无待迁移的 legacy section')
+    console.log('  [settings] 无待迁移的 section')
   }
   for (const item of legacySettings.skipped) console.log(`  [settings] 跳过（补丁已有同名条目）: ${item}`)
-  for (const item of legacySettings.dropped) console.log(`  [settings] 丢弃（目标 profile 无同名条目，值仍留在 legacy 文件）: ${item}`)
+  for (const item of legacySettings.dropped) console.log(`  [settings] 丢弃（目标 profile 无同名条目，值仍留在 settings.yaml）: ${item}`)
 
   // 5.2 自建预设声明段
   if (presetDeclarationBlock.text.length > 0) {
     patchContent += `\n\n${presetDeclarationBlock.text.trim()}`
     console.log(`  [presets] 已写入 ${presetDeclarationBlock.count} 个预设声明: ${presetDeclarationBlock.ids.join('、')}`)
   } else {
-    console.log('  [presets] 未发现可迁移的目录预设（~/.dsh/.agent-presets/<id>/agent.cordis.yml），跳过')
+    console.log('  [presets] 未发现目录预设（~/.dsh/.agent-presets/<id>/agent.cordis.yml），跳过')
   }
 
   // 落盘前的最后一道闸：任何顶层条目都不允许在重建中凭空消失。
@@ -3479,7 +3708,7 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     process.exitCode = 1
   } else {
     fs.writeFileSync(CORDIS_PATCH_FILE, patchContent.trim() + '\n', 'utf8')
-    console.log(`[profile] 已更新 ${CORDIS_PATCH_FILE}（挂载自定义插件 + 重建预设声明，不再改动压缩后端开关）`)
+    console.log(`[profile] 已更新 ${CORDIS_PATCH_FILE}（挂载自定义插件 + 重建预设声明）`)
   }
 }
 
@@ -3498,11 +3727,11 @@ function applyCorePatches(baseDir) {
   const readTargetCode = (file) => fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n')
 
   // 4.1 preset-switch: 后端 agent 预设注册表解除非空白会话限制
-  //     包名沿革：dsh-agent-presets（复数）已拆成
-  //     dsh-agent-preset（声明插件）与 dsh-agent-preset-registry（`agentPresets` 服务）。
-  //     补丁目标的 select() 现位于 dsh-agent-preset-registry/lib/index.js，
-  //     仍以 `boundary !== void 0 && (boundary.openTurnStartSeq !== null || boundary.lastTurn > 0)`
-  //     的形式出现，因此内层子串替换照旧成立。
+  //     目标包是 dsh-agent-preset-registry（提供 `agentPresets` 服务）；
+  //     声明插件是 dsh-agent-preset。
+  //     补丁目标的 select() 位于 dsh-agent-preset-registry/lib/index.js，
+  //     以 `boundary !== void 0 && (boundary.openTurnStartSeq !== null || boundary.lastTurn > 0)`
+  //     的形式出现，因此内层子串替换成立。
   const agentPresetsFile = path.join(baseDir, 'node_modules', '@deepseek-ai', 'dsh-agent-preset-registry', 'lib', 'index.js')
   if (fs.existsSync(agentPresetsFile)) {
     let fileCode = readTargetCode(agentPresetsFile)
@@ -3768,7 +3997,7 @@ function syncWorkspaces(dshRoot, force = false) {
   // 活跃会话大量落在 v3/v4：只认 `session.jsonl(.zstd)` 的扫描会整片
   // 漏掉新代日志；而下面的重建只写回「扫描到的」会话，于是这些会话连同账目一起
   // 消失，侧栏显示为「未分组」。因此扫描必须覆盖全部代。
-  // 同一目录多代并存时取版本最高的一代（低代是迁移前的残留）；`.bak`/临时文件
+  // 同一目录多代并存时取版本最高的一代；`.bak`/临时文件
   // 不匹配该模式，天然被排除，避免读到过期的头。
   // 版本号与 dsh 的规范正则完全一致：`v` 后必须是 ≥1 的十进制数且无前导零
   // （`session.v0.jsonl` / `session.v01.jsonl` 不是合法文件名，dsh 也不会生成）。

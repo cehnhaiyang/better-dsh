@@ -105,8 +105,8 @@ export function resolveSkeleton(format) {
  * 三种状态：空或恰为某套骨架 → 整段替换；在某套骨架基础上追加过 → 只替换骨架部分、
  * 保留追加内容；完全手写 → 不动（此时说明才是最终契约）。
  *
- * 中间那条是关键：早先「已被手写就完全不覆盖」的规则会让用户改选格式后，产物里仍是
- * 旧格式的契约，而界面已高亮新值 —— 两边静默分叉。
+ * 中间那条是关键：「已被手写就完全不覆盖」会让用户改选格式后，产物里仍是
+ * 原格式的契约，而界面已高亮新值 —— 两边静默分叉。
  */
 export function applyFormatChoice(current, format) {
   const skeleton = resolveSkeleton(format)

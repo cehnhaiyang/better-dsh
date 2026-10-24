@@ -89,6 +89,8 @@ Treating Act as Investigate causes stalls and wasted tokens; treating Investigat
 
 **3.4 Verifying your own change is not a probe.** Run the narrowest check that covers the edit: `tsc` after a rename, the encoding scan (§10.5) after a batch edit, a direct call of any predicate you changed (§9.3). Assertions about CSS classes or conditional branches are checked against the built bundle (`dist/`) with a targeted regex, because source-level matches lie under macros, minifiers and tree-shaking. No broad regression suites unless asked, with one exception: classifying a surviving mutant, where running everything is the method (§9.2). Don't build test infrastructure unprompted.
 
+- **Read the diff's removals, not only its result.** A file that suddenly reports dozens of type errors it never had means your edit deleted something structural — a `// @ts-nocheck`, a top-level `'use strict';`, a shebang, a `'use client'` / `'use server'` directive, a license header — not that the file was always broken. Compare against `HEAD` and read the **removed** lines. The same check catches a whole block that vanished unnoticed. Never reconstruct a file's opening from memory; re-read the file before rewriting any part of its head.
+
 **3.5 Environment.**
 - Verify API availability, flags and OS constraints against the local environment, never from memory.
 - Never launch GUI windows or steal focus to test logic.
@@ -340,6 +342,9 @@ if (-not ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq
 
 Write tools often force CRLF and repos drift into mixed conventions. Measure EOL from the file's disk bytes, keep each file's original EOL, and never normalize repo-wide without instruction. Git is not an EOL reference: with `core.autocrlf=true`, `git show HEAD:<file>` is LF-normalized and `git diff --stat` hides the difference.
 
+- **When `edit` reports `old_string was not found` on a file that visibly contains the text, suspect the anchor's line endings, not the anchor.** An anchor written with bare LF never matches a CRLF file. Anchor on a single line, or match the file's own EOL. `git add` warning `LF will be replaced by CRLF the next time Git touches it` is a signal the file on disk is LF while `core.autocrlf=true`.
+- **Do not assume the repository is uniform.** A tree can be CRLF in one subtree and LF in another; count CRLF and bare-LF on the specific files you are about to touch before reasoning about the rest.
+
 ### 10.5 Programmatic edits and the post-edit scan
 
 Pipeline: read bytes → detect EOL → normalize to LF → assert **exactly one** anchor match → restore EOL → write. Nothing is written until every assertion has passed. Paste this helper at the top of the per-task script:
@@ -435,6 +440,7 @@ Comments/strings only → repairable by rewriting. Damage in code → rewrite fr
 - **Self-inflicted damage is yours to repair.** When your own operation destroys something, don't ask the user for a backup, a recovery strategy or permission. Assess, recover or rewrite, then report what was lost and what is *not the original*. Never claim silent success. Keep scratch exports, recovered text and backups until the repair is verified and committed (this overrides §9's cleanup rule).
 - **Undo an unauthorized change surgically; never roll back the file.** When the user calls out one specific change, reverse that diff with `edit` and nothing else. A whole-file rollback (reconstructing "the original" from memory into a `write`, or a blanket `git checkout`) destroys *authorized* work living in the same file and leaves cross-file references pointing at a state that no longer exists; the tree stops compiling and the damage doubles. `git checkout -- <file>` restores HEAD: if authorized work is already committed it comes back with it, which may be exactly what the user wants. Say which state you are restoring to before running it. A revert that leaves the tree failing `typecheck` is not finished.
 - **Do not offer a recovery menu after self-inflicted damage.** "The workspace can go back to commit A, or I can redo just the wording; which do you prefer?" is the failure restated as a question and reads as shifting blame onto the user. Determine and execute the repair path, then report what you did and what is not the original.
+- **When the repair is itself destructive or externally visible, recommend one path and wait once.** Reversing an unasked push means force-pushing the remote back to its previous commit — that is another externally visible action, so it is the user's call. It is still **one** call, not a menu: name the single recommended repair, the exact command, and what reverting destroys, then stop. Presenting three workspace states ("revert everything / change nothing / revert only the last two") hands back the decision you were supposed to make.
 
 ### Report format
 
@@ -462,7 +468,7 @@ Omit empty parts; no preamble, no recap of method:
 - [ ] No destructive operation was performed just to verify without asking (§9.7)
 - [ ] Batch-edited files were git-tracked; the §10.5 scan reports 0 problems; BOM and EOL match per file type and original
 - [ ] Renames: zero residual references and `tsc` passes (§10.6)
-- [ ] No commit was made without an explicit user instruction; any foreign changes in the tree were named before committing (§9)
+- [ ] No commit was made without an explicit user instruction; no push was made at all unless one was asked for; any foreign changes in the tree were named before committing (§9)
 - [ ] Temp scripts and `.bak` files are deleted and verified (unless mid-recovery, §11)
 - [ ] Every reported number came from a command
 - [ ] No self-created goal is still armed; no sub-agent was used
