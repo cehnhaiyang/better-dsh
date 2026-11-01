@@ -3,14 +3,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // tools.js —— better-dsh 自定义工具集的唯一实现（由各预设按需声明使用）
 //
-// 本文件是 js / delete / browser / soup 四个工具的
+// 本文件是 js / delete / browser / web 四个工具的
 // 唯一实现，放在仓库根。**哪个预设能用哪几个工具，由那个预设自己在
 // agent.cordis.yml 里声明**：
 //
 //     - id: custom-tools
 //       name: 'better-dsh:tools'
 //       config:
-//         tools: [js, delete, browser, soup]
+//         tools: [js, delete, browser, web]
 //
 // git 的提交 / 推送不在这里：它是**由用户手动触发的斜杠命令**（`/git c|p|c&p`），
 // 实现见 plugins/git-command.js 的生成模板（~/.dsh/.js 里的 GIT_COMMAND_CODE）。
@@ -76,7 +76,7 @@ const { spawn } = require('node:child_process')
 /** 单流、以及整段最终文本的捕获上限；超出即截断并附提示，避免输出打爆上下文。 */
 const MAX_OUTPUT_BYTES = 262144
 
-/** js / delete / browser 的输出契约完全一致：一段纯文本。soup 同此口径。 */
+/** js / delete / browser / web 的输出契约完全一致：一段纯文本。 */
 const textOutput = () => ({
     schema: {
         type: 'object',
@@ -1156,150 +1156,815 @@ function defineBrowser(tools) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// soup —— 汤底封存：模型可见、界面不可见
+// web —— 多引擎并行搜索：一次查询打到多个搜索引擎，结果按 URL 去重合并
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * 把一局海龟汤的汤面与汤底封存到磁盘，按会话分文件；另提供取回与结束。
+ * 用多个**免密钥**的搜索引擎并行检索，把各自的命中按 URL 去重后合并返回。
  *
- * 为什么要落盘：一局会拖很久，历史迟早被压缩折叠，模型会忘记自己编的汤底。
- * 汤底若只活在上下文里，「被压缩后重述汤底」必然重述出一个新的，与之前的答案
- * 自相矛盾——这是这类游戏唯一会真正翻车的地方。因此汤底必须有一份不随上下文
- * 消失的副本，`recall` 就是取回它的唯一入口。
+ * 为什么自带引擎、不接官方 `ctx.web`：官方那条路只有 DeepSeek 一家 provider，
+ * 且必须有 DEEPSEEK_API_KEY 或 DeepSeek 账号登录（见 dsh-web-search-deepseek
+ * 的 available()）。本工具是**无凭据**的：只打公开搜索页，因此不依赖任何配置，
+ * 也不占用官方的 provider 选择（两者的结果形态也不同——这里给的是标题+URL+摘要）。
  *
- * 为什么不写在会话工作区：汤底不属于任何项目，落到工作区里既污染目录、又会
- * 被 git 或构建脚本带上。因此存在本文件旁边的 `storages/turtle-soup/` 下。
+ * 为什么是这几个引擎：每个都是实测可直连、且返回结构可稳定解析的（见每个
+ * ENGINE 的注释）。被排除的候选也记在那里，免得以后有人再试一遍。
  *
- * 界面为什么看不见：本工具的返回值（含汤底）进模型上下文，同时也进会话日志，
- * 而 Web 端渲染的是同一份内容。**隐藏靠客户端半边**——`plugins/soup-view` 用
- * `tool.call.toolview` 的 key `soup` 顶替通用行，因此参数与结果都不上屏。宿主
- * 这一侧只负责「汤底在哪儿」，不负责「怎么藏」。
- *
+ * 为什么全部走 node 内置 fetch、不经 ctx.shell：与 js / delete / browser 同一套
+ * 理由（见文件头）。命令与 URL 模板是本文件的常量，模型能给的只有查询词。
  * @param {object} tools - dsh-tools 注册表。
  */
-function defineSoup(tools) {
-    /** 汤底档案目录：与会话日志同级的持久区，不随工作区走。 */
-    const STORE_DIR = path.join(__dirname, 'storages', 'turtle-soup')
-    /** 会话 id 直接做文件名，因此只接受不需要转义的字符。 */
-    const SAFE_SESSION_ID = /^[A-Za-z0-9._-]+$/
+function defineWeb(tools) {
+    /** 单引擎的单次请求预算：搜索页偶尔会拖，超过就当作该引擎不可用。 */
+    const ENGINE_TIMEOUT_MS = 15000
+    /** 一次调用最多接受的查询条数：再多就该拆成几次调用了。 */
+    const MAX_QUERIES = 8
+    /** 每个查询默认取回的条数上限。 */
+    const DEFAULT_LIMIT = 10
+    /** 单条摘要的截断长度：摘要只用来判断相关性，不需要全文。 */
+    const SNIPPET_CHARS = 240
+    /** 整段最终文本的封顶：查询数 × 引擎数 × 条数会很快打爆上下文。 */
+    const MAX_RESULT_CHARS = 262144
 
     /**
-     * 本会话的汤底档案路径。
-     * @param {object} exec - 工具执行上下文。
-     * @returns {string} 档案文件的绝对路径。
+     * 桌面 UA。这些搜索页对非浏览器 UA 会返回降级页或直接拦截，因此必须伪装。
+     * 与 browser 工具无关：这里只发一个 GET，不需要真实 Chrome。
      */
-    function storeFile(exec) {
-        const agent = exec.agent
-        if (agent === undefined) throw new Error('soup 需要 agent 会话')
-        const id = agent.session.header.id
-        if (typeof id !== 'string' || !SAFE_SESSION_ID.test(id)) {
-            throw new Error(`soup 无法为会话 ${JSON.stringify(id)} 建立汤底档案`)
-        }
-        return path.join(STORE_DIR, `${id}.json`)
+    const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        + ' (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    /** 移动 UA：360 的移动站结果页比网页版稳定得多（网页版会弹验证码）。 */
+    const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)'
+        + ' AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+
+    /**
+     * 命名实体解码。
+     *
+     * 只做「够用」的那几个：搜索页里出现的就是这些，引一个完整的 HTML 解码器
+     * 要额外依赖，而本文件刻意只用 node 内置模块（见文件头）。
+     * @param {string} text - 含实体的文本。
+     * @returns {string} 解码后的文本。
+     */
+    const NAMED = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', ensp: ' ', emsp: ' ' }
+    function decodeEntities(text) {
+        return text
+            .replace(/&#x([0-9a-fA-F]+);/g, (whole, hex) => {
+                const code = Number.parseInt(hex, 16)
+                return Number.isFinite(code) ? String.fromCodePoint(code) : whole
+            })
+            .replace(/&#([0-9]+);/g, (whole, dec) => {
+                const code = Number.parseInt(dec, 10)
+                return Number.isFinite(code) ? String.fromCodePoint(code) : whole
+            })
+            .replace(/&([a-zA-Z]+);/g, (whole, name) => NAMED[name] ?? whole)
     }
 
     /**
-     * 读回本会话已封存的汤底。
-     * @param {string} file - 档案路径。
-     * @returns {{face: string, base: string} | null} 记录，或 null（尚未开过局）。
+     * 去标签 + 解码 + 压空白。
+     *
+     * 搜索页的标题与摘要里带 `<em>` 高亮、`&ensp;`、`&#0183;` 之类的东西，
+     * 这些都不该原样交给模型。
+     *
+     * 「阅读更多」是 Bing 摘要旁的「展开」按钮文案：它**不在**摘要的 `<p>` 里，
+     * 而是紧随其后的独立节点，因此不能靠「去掉结尾后缀」处理——它根本不该被
+     * 抓进来。这里的过滤是最后一道保险。
+     * @param {string} html - 一段 HTML 片段。
+     * @returns {string} 纯文本。
      */
-    function loadRecord(file) {
-        let text
+    function stripTags(html) {
+        return decodeEntities(html.replace(/<[^>]*>/g, ' '))
+            .replace(/\s+/g, ' ')
+            .replace(/阅读更多/gu, '')
+            .replace(/\s*…\s*$/u, '')
+            .trim()
+    }
+
+    /**
+     * 截断摘要。
+     * @param {string} text - 纯文本摘要。
+     * @returns {string} 至多 SNIPPET_CHARS 个字符的摘要。
+     */
+    const clipSnippet = (text) => (text.length <= SNIPPET_CHARS ? text : `${text.slice(0, SNIPPET_CHARS)}…`)
+
+    /**
+     * 发一个 GET 并取回文本。
+     *
+     * 走 node 内置 fetch（Node 18+ 起可用），不经 ctx.shell。重定向跟随：搜索页
+     * 常有一次跳转。非 2xx 当作该引擎失败而不是空结果——静默当空结果会让模型
+     * 以为「这个词没有结果」。
+     * @param {string} url - 目标地址（本文件的常量拼装，模型触及不到）。
+     * @param {string} userAgent - 伪装用的 UA。
+     * @param {AbortSignal} signal - 工具调用的取消信号。
+     * @returns {Promise<string>} 响应正文。
+     */
+    async function httpText(url, userAgent, signal) {
+        throwIfAborted(signal)
+        // 超时与取消合并：AbortSignal.any 在 Node 20+ 可用，两条信号任一触发都中止。
+        const timeout = AbortSignal.timeout(ENGINE_TIMEOUT_MS)
+        const merged = AbortSignal.any([signal, timeout])
         try {
-            text = fs.readFileSync(file, 'utf8')
-        } catch {
-            return null
+            const response = await fetch(url, {
+                redirect: 'follow',
+                headers: {
+                    'user-agent': userAgent,
+                    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                },
+                signal: merged,
+            })
+            if (!response.ok) throw new Error(`HTTP ${response.status}`)
+            return await response.text()
+        } catch (error) {
+            if (signal.aborted) throwIfAborted(signal)
+            throw new Error(error.name === 'TimeoutError' ? `超时（${ENGINE_TIMEOUT_MS}ms）` : String(error.message ?? error))
         }
+    }
+
+    /**
+     * 判定一次解析结果是否可信。
+     *
+     * 搜索站点的拦截页（「访问异常出错」「请输入验证码」）**仍然返回 HTTP 200**，
+     * 只是正文里没有任何结果。若把这种情况当空数组返回，模型会以为「这个词没有
+     * 结果」——而真实原因是引擎限流。因此解析出 0 条时必须抛错，让失败原因随
+     * 结果一起报上去。
+     * @param {object[]} hits - 某引擎解析出的命中。
+     * @param {string} engine - 引擎 id，只进报错文案。
+     * @returns {object[]} 原样返回的命中（非空）。
+     */
+    function requireHits(hits, engine) {
+        if (hits.length === 0) throw new Error(`${engine} 没有解析出结果（可能被限流或页面改版）`)
+        return hits
+    }
+
+    // ── fetch：抓一个网址，把页面内容取回 ──────────────────────────────────────
+    //
+    // 与上面「搜索」是同一工具的两个动作：web 负责**模糊定位**（哪几个 URL 值得看），
+    // fetch 负责**精确取回**（那个 URL 里到底写了什么）。分成两个工具会让
+    // 「先搜后取」变成跨工具的对话，而它们共用同一套 HTTP 与编码处理。
+
+    /** fetch 的超时预算：正文页比搜索页大得多，给足 30 秒。 */
+    const FETCH_TIMEOUT_MS = 30000
+    /** 抓回正文的字符上限：单页动辄几十万字符，不封顶会直接打爆上下文。 */
+    const MAX_FETCH_CHARS = 131072
+    /** 响应体字节上限：先按字节拦住，避免把超大文件整个读进内存。 */
+    const MAX_FETCH_BYTES = 8 * 1024 * 1024
+    /** 可解析为文本的内容类型前缀；其余（图片、压缩包、二进制）一律拒绝。 */
+    const TEXTUAL_TYPES = ['text/', 'application/json', 'application/xml', 'application/javascript',
+        'application/x-javascript', 'application/rss+xml', 'application/atom+xml', 'application/xhtml+xml']
+
+    /**
+     * 从 Content-Type 或 HTML 头部的 meta 推断字符集。
+     *
+     * 中文站点里 GBK/GB2312 仍然常见，直接按 UTF-8 解会得到整页乱码。因此先看
+     * 响应头，再退回扫前 4KB 的 `<meta charset>`；都没有就按 UTF-8。
+     * @param {string} contentType - 响应的 content-type。
+     * @param {Uint8Array} headBytes - 正文开头若干字节（用于找 meta）。
+     * @returns {string} 字符集名（交给 TextDecoder）。
+     */
+    function detectCharset(contentType, headBytes) {
+        const fromHeader = /charset=["']?([^\s;'"]+)/i.exec(contentType)?.[1]
+        if (fromHeader !== undefined) return fromHeader
+        // 头部可能是任意编码，先用 UTF-8 尽力解出 ASCII 的 meta 声明即可。
+        const head = new TextDecoder('utf-8').decode(headBytes)
+        const fromMeta = /<meta[^>]+charset=["']?([^\s;"'>]+)/i.exec(head)?.[1]
+        return fromMeta ?? 'utf-8'
+    }
+
+    /**
+     * 把 HTML 转成可读纯文本。
+     *
+     * 刻意不引 HTML 解析器（本文件只用 node 内置模块，见文件头），因此用一串
+     * 正则分阶段处理。顺序很重要：先删整段 `<script>`/`<style>`（否则里面的
+     * JS 会被当成正文），再把块级标签换成换行（否则整页会挤成一行），最后才
+     * 去掉剩余标签。
+     *
+     * 代码块（`<pre>`/`<code>`）必须**保住原有缩进与换行**：技术文档的价值大半
+     * 在示例代码里，按普通段落那样压空白会把 `function f() {` 和 `return x;`
+     * 挤成一行，读起来完全走样。因此先把它整块摘出来、用占位符挡住，处理完
+     * 其余文本后再原样放回。
+     * @param {string} html - 原始 HTML。
+     * @returns {string} 纯文本，段落之间保留空行。
+     */
+    function htmlToText(html) {
+        // 1) 先删掉注释与整段脚本/样式。
+        //
+        // **顺序至关重要**：这一步必须在摘代码块之前做。站点的 JS 源码里常出现
+        // 形如 `noteContent.replace(/<pre>/, …)` 的**字符串字面量**，它们含有
+        // `<pre>` 文本；若先摘代码块，正则会把脚本里的这些假标签当成真的代码块，
+        // 与页面里真正的 `<pre>` 错位配对，把正文大段吞掉或撕碎（实测菜鸟教程
+        // 就是这样：一个脚本里的 `<pre>` 把后面整段正文配成了「代码块」）。
+        let text = html
+            .replace(/<!--[\s\S]*?-->/g, ' ')
+            .replace(/<(script|style|noscript|svg|iframe|template|head)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+
+        // 2) 摘出代码块，用占位符占位（占位符不含标签，不会被打扰）。
+        //
+        // 代码块的形态不止 `<pre>`：不少站点（例如菜鸟教程）用
+        // `div.example_code` + `<br />` + `&nbsp;` 做缩进来呈现示例，语法高亮则是
+        // 一堆 `<span style="color:…">`。这些同样必须按原样保留，否则示例代码会
+        // 被压成一行。先匹配 `pre`/`textarea`（它们可能内含 `<code>`），再匹配
+        // `div.example_code`。
+        const blocks = []
+        text = text.replace(
+            /<(pre|textarea)[^>]*>[\s\S]*?<\/\1>|<div[^>]*class="[^"]*example_code[^"]*"[^>]*>[\s\S]*?<\/div>/gi,
+            (whole) => {
+                // 块内常被语法高亮拆成行级标签（`<span>`、`<br>`）。把 `<br>` 与
+                // 块级边界还原成换行、其余标签去掉，再把每个非空行左侧的缩进
+                // **原样保留**——这正是普通段落处理会毁掉的部分。
+                //
+                // `&nbsp;` 必须在「压空白」之前先变成普通空格，否则它会和
+                // 连续空格一起被折叠掉，缩进就没了。
+                const inner = whole
+                    .replace(/<br\s*\/?>/gi, '\n')
+                    .replace(/<\/?(?:div|p|li|tr)[^>]*>/gi, '\n')
+                    .replace(/<[^>]*>/g, '')
+                    .replace(/&nbsp;/gi, ' ')
+                blocks.push(
+                    decodeEntities(inner)
+                        .replace(/\r\n/g, '\n')
+                        // 只裁掉整体首尾空行，不动行内缩进。
+                        .replace(/^[ \t]*\n+|\n+[ \t]*$/g, ''),
+                )
+                return `\u0000CODE${blocks.length - 1}\u0000`
+            },
+        )
+
+        // 3) 块级边界 → 换行，保住段落结构；其余标签直接去掉（保留内部文本）。
+        text = text
+            .replace(/<\/?(?:p|div|br|li|ul|ol|h[1-6]|table|tr|td|th|section|article|header|footer|nav|aside|main|blockquote|pre|figure|form)[^>]*>/gi, '\n')
+            .replace(/<[^>]*>/g, ' ')
+
+        text = decodeEntities(text)
+            .split('\n')
+            .map((line) => line.replace(/[ \t\u00a0]+/g, ' ').trim())
+            .join('\n')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim()
+
+        // 4) 把代码块放回原处，保持它自己的换行与缩进。
+        return text.replace(/\u0000CODE(\d+)\u0000/g, (_whole, index) => blocks[Number(index)] ?? '')
+    }
+
+    /**
+     * 从 `<div …>` 的起始位置取出配对的整块（按嵌套层数计数）。
+     *
+     * 不能用非贪婪的 `([\s\S]*?)</div>`：正文容器内部一定嵌套着别的 div
+     * （列表、示例块、卡片），那样会在第一个 `</div>` 处提前截断，把正文切成
+     * 半截（实测菜鸟教程的 article-body 就是这样：代码示例全被切掉，只剩标题
+     * 和开头两段）。这里改为从起点扫，遇到 `<div` 加一层、遇到 `</div>` 减一层，
+     * 归零处就是真正的闭合位置。
+     * @param {string} html - 原始 HTML。
+     * @param {number} openIndex - 起始 `<div` 的下标。
+     * @returns {string | null} 配对后的内部内容，找不到闭合时返回 null。
+     */
+    function sliceBalancedDiv(html, openIndex) {
+        const tagPattern = /<div\b[^>]*>|<\/div>/gi
+        tagPattern.lastIndex = openIndex
+        let depth = 0
+        let match
+        while ((match = tagPattern.exec(html)) !== null) {
+            depth += match[0].length > 1 && match[0][1] === '/' ? -1 : 1
+            if (depth === 0) {
+                // match.index 指向闭合标签，内部内容就是开标签之后到它之前。
+                const start = html.indexOf('>', openIndex) + 1
+                return html.slice(start, match.index)
+            }
+        }
+        return null
+    }
+
+    /**
+     * 尝试只取正文，而不是整页（含导航、侧栏、页脚）。
+     *
+     * 实测一个文档站整页转文本后 7.4k 字符，其中前 1.2k 全是侧边栏目录；只取
+     * 正文容器能砍掉大半噪音。策略是「按已知容器切块，选转文本后最长的那块」，
+     * 不引入任何权重算法——够用且不会误判。找不到任何容器时返回 null，由调用方
+     * 回退到整页。
+     * @param {string} html - 原始 HTML。
+     * @returns {{text: string, container: string} | null} 正文与它来自哪个容器。
+     */
+    function extractMainText(html) {
+        const candidates = []
+        for (const tag of ['article', 'main']) {
+            for (const match of html.matchAll(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'gi'))) {
+                candidates.push({ container: tag, html: match[1] })
+            }
+        }
+        // 常见正文容器的类名（覆盖博客、文档站与论坛）。用 sliceBalancedDiv 取
+        // 配对整块，避免被内部嵌套的 div 提前截断。
+        for (const name of ['article-body', 'post-content', 'entry-content', 'markdown-body',
+            'article_content', 'rich_media_content', 'main-content']) {
+            const opener = new RegExp(`<div[^>]*class="[^"]*${name}[^"]*"[^>]*>`, 'gi')
+            for (const match of html.matchAll(opener)) {
+                const inner = sliceBalancedDiv(html, match.index)
+                if (inner !== null) candidates.push({ container: `div.${name}`, html: inner })
+            }
+        }
+        if (candidates.length === 0) return null
+
+        let best = null
+        for (const candidate of candidates) {
+            const text = htmlToText(candidate.html)
+            if (best === null || text.length > best.text.length) {
+                best = { text, container: candidate.container }
+            }
+        }
+        // 正文容器比整页还小得离谱时（多半是误匹配到一个小 div），不如用整页。
+        if (best === null || best.text.length < 200) return null
+        return best
+    }
+
+    /**
+     * 抓一个网址并把内容取回。
+     *
+     * 与搜索用的 httpText 分开：那条只关心「有没有解析出结果」，这条要拿到
+     * 字节、判定编码、区分内容类型，并处理 404/403 这类「有响应但不该当正文」的
+     * 情况。非 2xx **不抛错**而是如实报出状态码——抓取失败本身是结果的一部分
+     * （模型需要知道是 404 还是 403 才能决定下一步）。
+     * @param {string} url - 模型给出的完整网址（已由 assertFetchableUrl 校验）。
+     * @param {AbortSignal} signal - 工具调用的取消信号。
+     * @returns {Promise<object>} 抓取结果。
+     */
+    async function fetchPage(url, signal) {
+        throwIfAborted(signal)
+        const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS)
+        const merged = AbortSignal.any([signal, timeout])
+
+        let response
         try {
-            const parsed = JSON.parse(text)
-            return typeof parsed?.face === 'string' && typeof parsed?.base === 'string' ? parsed : null
+            response = await fetch(url, {
+                redirect: 'follow',
+                headers: {
+                    'user-agent': UA_DESKTOP,
+                    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                },
+                signal: merged,
+            })
+        } catch (error) {
+            if (signal.aborted) throwIfAborted(signal)
+            throw new Error(error.name === 'TimeoutError'
+                ? `抓取超时（${FETCH_TIMEOUT_MS}ms）`
+                : `抓取失败：${String(error.message ?? error)}`)
+        }
+
+        const contentType = response.headers.get('content-type') ?? ''
+        const status = response.status
+        const finalUrl = response.url
+
+        // 非 2xx：如实报出，不当作正文。
+        if (!response.ok) {
+            return { status, finalUrl, contentType, ok: false, reason: `HTTP ${status} ${response.statusText}`.trim() }
+        }
+
+        // 内容类型不在文本范围内（图片、PDF、压缩包）：不读正文，说明原因即可。
+        const lowered = contentType.toLowerCase()
+        if (lowered.length > 0 && !TEXTUAL_TYPES.some((prefix) => lowered.startsWith(prefix))) {
+            return { status, finalUrl, contentType, ok: false, reason: `不是文本内容（content-type: ${contentType || '未知'}），未读取正文` }
+        }
+
+        let bytes
+        try {
+            bytes = new Uint8Array(await response.arrayBuffer())
+        } catch (error) {
+            if (signal.aborted) throwIfAborted(signal)
+            throw new Error(`读取响应体失败：${String(error.message ?? error)}`)
+        }
+        throwIfAborted(signal)
+
+        if (bytes.byteLength > MAX_FETCH_BYTES) {
+            return {
+                status, finalUrl, contentType, ok: false,
+                reason: `响应体过大（${bytes.byteLength} 字节，上限 ${MAX_FETCH_BYTES}），未解析`,
+            }
+        }
+
+        const charset = detectCharset(contentType, bytes.slice(0, 4096))
+        let raw
+        try {
+            raw = new TextDecoder(charset.toLowerCase()).decode(bytes)
         } catch {
-            // 档案损坏按「没有档案」处理：宁可让模型重开一局，也不要抛一个它无法修复的错误。
-            return null
+            // 未知字符集名：退回 UTF-8，而不是让整次抓取失败。
+            raw = new TextDecoder('utf-8').decode(bytes)
         }
+
+        const isHtml = lowered.includes('html') || /^<!doctype\s+html|<html[\s>]/i.test(raw.slice(0, 1024))
+        return { status, finalUrl, contentType, ok: true, charset, raw, isHtml }
     }
 
     /**
-     * 覆盖写入本会话的汤底档案。
-     * @param {string} file - 档案路径。
-     * @param {{face: string, base: string}} record - 本局记录。
+     * 校验并规范化 fetch 的 url 参数。
+     *
+     * 只接受完整的 http(s) 网址：模型从搜索结果里拿到的是绝对 URL，若它给出
+     * 相对路径或别的协议，那是理解错了，当场报错比发一个必然失败的请求好。
+     * @param {unknown} raw - 模型传入的 url。
+     * @returns {string} 规范化后的绝对网址。
      */
-    function saveRecord(file, record) {
-        fs.mkdirSync(STORE_DIR, { recursive: true })
-        fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, 'utf8')
+    function assertFetchableUrl(raw) {
+        if (typeof raw !== 'string' || raw.trim().length === 0) {
+            throw new Error('web 的 action=fetch 需要 url 参数：一个完整的网址（含 http:// 或 https://）')
+        }
+        const trimmed = raw.trim()
+        let parsed
+        try {
+            parsed = new URL(trimmed)
+        } catch {
+            throw new Error(`web 的 url 不是合法网址：${JSON.stringify(trimmed)}`)
+        }
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            throw new Error(`web 的 url 只支持 http/https，收到 ${JSON.stringify(parsed.protocol)}`)
+        }
+        return parsed.href
     }
 
     /**
-     * 汤面 + 汤底的统一呈现。汤底一定排在汤面之后，避免模型顺手把汤底写进回复。
-     * @param {string} lead - 首行结论。
-     * @param {{face: string, base: string}} record - 本局记录。
-     * @returns {string} 模型可见的文本。
+     * 把一次抓取渲染成模型可见的文本。
+     *
+     * 头部给出状态码与最终地址（重定向后可能变化，模型需要知道），然后是正文。
+     * `mode: 'raw'` 时返回原始响应（HTML 源码或 JSON 原文），不转纯文本——用于
+     * 「我要看这个页面的结构」或「这是个 API」的情形。
+     * @param {object} result - fetchPage 的返回值。
+     * @param {string} mode - 'text' 或 'raw'。
+     * @returns {string} 一段纯文本。
      */
-    function renderRecord(lead, record) {
-        return `${lead}\n\n【汤面】\n${record.face}\n\n【汤底】\n${record.base}\n\n（汤底只存在于本工具结果里，回复用户时只写汤面。）`
+    function renderFetch(result, mode) {
+        const lines = [`$ fetch ${result.finalUrl}`]
+        if (!result.ok) {
+            lines.push(`[失败] ${result.reason}`)
+            return lines.join('\n')
+        }
+
+        if (result.finalUrl !== result.requestedUrl) lines.push(`[重定向至] ${result.finalUrl}`)
+        lines.push(`[状态] ${result.status} · ${result.contentType || '未知类型'}${result.isHtml ? '' : ' · 非 HTML'} · 编码 ${result.charset}`)
+
+        let body
+        let container = null
+        if (mode === 'raw') {
+            body = result.raw
+        } else if (result.isHtml) {
+            const main = extractMainText(result.raw)
+            if (main !== null) {
+                body = main.text
+                container = main.container
+            } else {
+                body = htmlToText(result.raw)
+            }
+        } else {
+            // JSON / 纯文本：本身就是可读内容，原样给出。
+            body = result.raw.trim()
+        }
+
+        if (container !== null) lines.push(`[正文来源] ${container}`)
+        const truncated = body.length > MAX_FETCH_CHARS
+        lines.push('')
+        lines.push(truncated ? `${body.slice(0, MAX_FETCH_CHARS)}\n[正文被截断，仅保留前 ${MAX_FETCH_CHARS} 字符]` : body)
+        return lines.join('\n')
     }
 
-    /** 三个动作的实现；键就是 schema 里 enum 的取值，也用于执行前的白名单校验。 */
-    const ACTIONS = {
-        open(args, exec) {
-            const face = typeof args.face === 'string' ? args.face.trim() : ''
-            const base = typeof args.base === 'string' ? args.base.trim() : ''
-            if (face.length === 0 || base.length === 0) throw new Error('soup 的 action=open 需要 face（汤面）与 base（汤底）两项都非空')
-            const record = { face, base }
-            saveRecord(storeFile(exec), record)
-            return renderRecord('已封存。之后按汤底答问，上下文被压缩后用 action=recall 取回。', record)
-        },
-        recall(_args, exec) {
-            const record = loadRecord(storeFile(exec))
-            if (record === null) throw new Error('本会话还没有封存的汤底：先调用 action=open 开一局')
-            return renderRecord('已取回。', record)
-        },
-        close(_args, exec) {
-            const file = storeFile(exec)
-            if (loadRecord(file) === null) throw new Error('本会话没有可结束的汤底档案')
-            fs.rmSync(file, { force: true })
-            return '本局已结束，汤底档案已删除。'
+    /**
+     * 解析 Bing 的 HTML 结果页（两个 Bing 引擎共用这一份解析）。
+     *
+     * 走 HTML 结果页而不是 `format=rss`：实测 RSS 出口在**没有 Cookie**时会被降级，
+     * 对同一查询反复返回完全不相干的结果（查「typescript 泛型」返回「中美俄大三角」
+     * 「Eaglercraft」「河北福派安管道制造有限公司」，且每次不同）；补上 Cookie 或
+     * `mkt` 参数后才正常。HTML 页在同样的无 Cookie 条件下稳定给出正确结果。
+     *
+     * `mkt=zh-CN` 是显式的市场参数：Bing 会按 IP 猜市场，猜错时中文查询召回很差。
+     * 带上它就不再依赖 IP 归属。
+     * @param {string} host - `cn.bing.com` 或 `www.bing.com`。
+     * @param {string} engine - 引擎 id，只进报错文案。
+     * @param {string} query - 查询词。
+     * @param {AbortSignal} signal - 工具调用的取消信号。
+     * @returns {Promise<object[]>} 命中列表（非空，否则抛错）。
+     */
+    async function bingHits(host, engine, query, signal) {
+        const body = await httpText(
+            `https://${host}/search?q=${encodeURIComponent(query)}&count=10&mkt=zh-CN`,
+            UA_DESKTOP, signal,
+        )
+        const hits = []
+        // 每条自然结果是一个 <li class="b_algo"> 块；块内标题是 <h2><a href=…>，
+        // 摘要是 b_lineclamp* 的 <p>（Bing 按行数给出不同后缀的类名）。
+        for (const block of body.split(/<li class="b_algo"/).slice(1)) {
+            const seg = block.slice(0, 4000)
+            const anchor = /<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/s.exec(seg)
+            if (anchor === null) continue
+            const url = decodeEntities(anchor[1])
+            const title = stripTags(anchor[2])
+            const snippet = stripTags(
+                /<p[^>]*class="[^"]*b_lineclamp[^"]*"[^>]*>([\s\S]*?)<\/p>/s.exec(seg)?.[1] ?? '',
+            )
+            if (title.length === 0 || !/^https?:/i.test(url)) continue
+            hits.push({ title, url, snippet: clipSnippet(snippet) })
         }
+        return requireHits(hits, engine)
+    }
+
+    /**
+     * Bing 中国站。
+     *
+     * 与 `bing`（全球站）是两个独立引擎而不是一个：它们的索引与排序确实不同
+     * （同一查询的命中集合有明显差异），因此合并时能互补。分成两条还带来一个
+     * 工程上的好处——一条被限流时另一条仍可用，而 `Promise.allSettled` 会让
+     * 失败的那条只作为附注出现，不影响结果。
+     */
+    const searchBingCn = (query, signal) => bingHits('cn.bing.com', 'bing-cn', query, signal)
+
+    /** Bing 全球站。 */
+    const searchBingGlobal = (query, signal) => bingHits('www.bing.com', 'bing', query, signal)
+
+    /**
+     * 360 搜索（移动站）。
+     *
+     * 走 `m.so.com` 而不是 `www.so.com`：网页版更容易触发验证码，而移动站
+     * 给出的是同一套索引。真实 URL 在卡片容器的 `data-pcurl` 属性里；`href` 是
+     * m.so.com 的跳转壳，不能直接给模型。
+     *
+     * 注意 360 对**同一 IP 的高频请求**会返回「访问异常出错」拦截页（HTTP 仍是
+     * 200）。这种情况由 requireHits 抛错上报，而不是静默变成空结果。
+     */
+    async function search360(query, signal) {
+        const body = await httpText(`https://m.so.com/s?q=${encodeURIComponent(query)}`, UA_MOBILE, signal)
+        const hits = []
+        for (const block of body.split(/class="g-card res-list/).slice(1)) {
+            const seg = block.slice(0, 4000)
+            const url = decodeEntities(/data-pcurl="(https?:\/\/[^"]+)"/.exec(seg)?.[1] ?? '')
+            const title = stripTags(/<h3[^>]*class="res-title[^"]*"[^>]*>([\s\S]*?)<\/h3>/.exec(seg)?.[1] ?? '')
+            const raw = /<p[^>]*class="[^"]*(?:g-main|summary)[^"]*"[^>]*>([\s\S]*?)<\/p>/.exec(seg)?.[1]
+                ?? /<div[^>]*class="[^"]*(?:summary|sumext-line)[^"]*"[^>]*>([\s\S]*?)<\/div>/.exec(seg)?.[1]
+                ?? ''
+            if (title.length === 0 || !/^https?:/i.test(url)) continue
+            hits.push({ title, url, snippet: clipSnippet(stripTags(raw)) })
+        }
+        return requireHits(hits, '360')
+    }
+
+    /**
+     * 搜狗微信。
+     *
+     * 这个引擎的价值在于**中文技术内容**：公众号文章在 Bing/360 上覆盖很差，
+     * 而这里是它们的原生索引。注意它的链接是 `/link?url=…` 的相对跳转壳
+     * （需要 Referer 才能落地），因此统一补成绝对地址并标注为跳转链。
+     */
+    async function searchSogouWeixin(query, signal) {
+        const body = await httpText(
+            `https://weixin.sogou.com/weixin?type=2&query=${encodeURIComponent(query)}`,
+            UA_DESKTOP, signal,
+        )
+        const hits = []
+        for (const block of body.split(/class="txt-box"/).slice(1)) {
+            const seg = block.slice(0, 2000)
+            const href = decodeEntities(/<a[^>]+href="(\/link\?url=[^"]+)"/.exec(seg)?.[1] ?? '')
+            const title = stripTags(/<h3[^>]*>([\s\S]*?)<\/h3>/.exec(seg)?.[1] ?? '')
+            const snippet = stripTags(/<p[^>]*class="txt-info[^"]*"[^>]*>([\s\S]*?)<\/p>/.exec(seg)?.[1] ?? '')
+            const account = stripTags(/<span[^>]*class="all-time-y2[^"]*"[^>]*>([\s\S]*?)<\/span>/.exec(seg)?.[1] ?? '')
+            if (title.length === 0 || href.length === 0) continue
+            hits.push({
+                title: account.length > 0 ? `${title}（${account}）` : title,
+                url: `https://weixin.sogou.com${href}`,
+                snippet: clipSnippet(snippet),
+            })
+        }
+        return requireHits(hits, 'weixin')
+    }
+
+    /**
+     * 引擎表：id → 实现。
+     *
+     * 键会出现在输出里（每条结果标注它来自哪个引擎），因此取值要短且稳定。
+     * 顺序**显式**由 ENGINE_IDS 给出，不要用 Object.keys(ENGINES)：`'360'` 是
+     * 数字样字符串键，JS 的对象键序会把它排到最前面（整型键优先于字符串键），
+     * 于是默认顺序会变成 360 → bing-cn → bing → weixin，与这里的字面顺序不符。
+     *
+     * 四个引擎的取舍（都是实测结论，免得以后有人再试一遍）：
+     *   · bing-cn / bing —— 稳定，中英文都准。两个站点的索引确有差异，因此都留。
+     *   · weixin —— 中文技术内容（公众号）覆盖极好，是前两者的盲区。
+     *   · 360 —— 中文综合结果好，但对同一 IP 高频请求会限流。留作第四条：
+     *     被限流时只会在附注里出现一行失败，不影响其余三条的结果。
+     * 已排除：百度（改版后稳定返回 1.4KB 拦截页）、DuckDuckGo / Mojeek / Wikipedia /
+     * Startpage / SearXNG 各公共实例（本机网络不可达）、Yahoo / Yandex（超时或验证码）、
+     * 搜狗网页版（触发验证码）、头条（客户端渲染，无 SSR 数据）、Marginalia（无中文结果）。
+     */
+    const ENGINES = {
+        'bing-cn': searchBingCn,
+        bing: searchBingGlobal,
+        weixin: searchSogouWeixin,
+        '360': search360,
+    }
+    /** 全部引擎 id，按声明顺序（也是轮转合并的起始顺序）。 */
+    const ENGINE_IDS = ['bing-cn', 'bing', 'weixin', '360']
+
+    /**
+     * 把一个查询打到多个引擎并合并。
+     *
+     * 并发而不是串行：三个引擎各自 1-3 秒，串起来会让单次调用逼近超时。
+     * 用 allSettled 而不是 all：一个引擎被限流不该让整次搜索失败——那正是
+     * 「多引擎」这个设计的意义。失败原因逐条收集，随结果一起报给模型。
+     *
+     * 合并按**轮转**（每个引擎轮流取一条）而不是「先到先满」：后者会让第一个
+     * 返回的引擎（通常是 360，条数多）吃满 limit，其余引擎一条都进不来，
+     * 「多引擎」于是名存实亡。轮转保证每个引擎都有代表。
+     * @param {string} query - 查询词。
+     * @param {string[]} engineIds - 本次启用的引擎 id。
+     * @param {number} limit - 合并后的条数上限。
+     * @param {AbortSignal} signal - 工具调用的取消信号。
+     * @returns {Promise<{hits: object[], failures: string[]}>} 合并结果与失败说明。
+     */
+    async function searchOne(query, engineIds, limit, signal) {
+        const settled = await Promise.allSettled(
+            engineIds.map(async (id) => ({ id, hits: await ENGINES[id](query, signal) })),
+        )
+        throwIfAborted(signal)
+
+        // 按引擎分桶，并把失败原因记下来（顺序与 engineIds 一致，便于阅读）。
+        const buckets = []
+        const failures = []
+        for (const [index, outcome] of settled.entries()) {
+            if (outcome.status === 'rejected') {
+                failures.push(`${engineIds[index]}: ${String(outcome.reason?.message ?? outcome.reason)}`)
+                continue
+            }
+            buckets.push({ id: outcome.value.id, hits: outcome.value.hits })
+        }
+
+        // 轮转合并：每一轮每个引擎取一条，直到取满 limit 或全部取尽。
+        const hits = []
+        const seen = new Set()
+        const cursors = buckets.map(() => 0)
+        let progressed = true
+        while (hits.length < limit && progressed) {
+            progressed = false
+            for (const [bucketIndex, bucket] of buckets.entries()) {
+                if (hits.length >= limit) break
+                // 跳过本桶里已被别的引擎收录过的 URL，直到取到一条新的或取尽。
+                while (cursors[bucketIndex] < bucket.hits.length) {
+                    const hit = bucket.hits[cursors[bucketIndex]]
+                    cursors[bucketIndex] += 1
+                    if (seen.has(hit.url)) continue
+                    seen.add(hit.url)
+                    hits.push({ ...hit, source: bucket.id })
+                    progressed = true
+                    break
+                }
+            }
+        }
+        return { hits, failures }
+    }
+
+    /**
+     * 把一次查询的结果渲染成模型可见的文本。
+     * @param {string} query - 查询词。
+     * @param {object} outcome - searchOne 的返回值。
+     * @param {number} limit - 条数上限（用于「没有结果」的文案）。
+     * @returns {string} 一段纯文本。
+     */
+    function renderQuery(query, outcome, limit) {
+        const lines = [`## ${query}`]
+        if (outcome.hits.length === 0) {
+            lines.push(`(没有结果${outcome.failures.length > 0 ? '；引擎失败见下' : ''})`)
+        } else {
+            for (const [index, hit] of outcome.hits.entries()) {
+                lines.push(`${index + 1}. ${hit.title}`)
+                lines.push(`   ${hit.url}`)
+                if (hit.snippet.length > 0) lines.push(`   ${hit.snippet}`)
+                lines.push(`   [${hit.source}]`)
+            }
+        }
+        if (outcome.failures.length > 0) {
+            lines.push(`[部分引擎失败] ${outcome.failures.join('；')}`)
+        }
+        if (outcome.hits.length >= limit) lines.push(`（已达条数上限 ${limit}，可能有更多结果）`)
+        return lines.join('\n')
+    }
+
+    /**
+     * 拆查询词。
+     *
+     * 输入约定是 `AAA,BBB,CCC` 这样的英文逗号分隔；同时容忍中文逗号与换行，
+     * 因为模型和用户都会顺手用它们。
+     * @param {unknown} raw - 模型传入的 query。
+     * @returns {string[]} 非空查询词。
+     */
+    function splitQueries(raw) {
+        if (typeof raw !== 'string') return []
+        return raw.split(/[,，\n]/).map((item) => item.trim()).filter((item) => item.length > 0)
     }
 
     tools.register({
-        name: 'soup',
+        name: 'web',
         description:
-            'Seal one turtle-soup round: `action` = open (needs `face` = the riddle text and `base` = the full truth),'
-            + ' recall (read the sealed truth back after context compaction), or close (end the round and delete it).'
-            + ' The tool result carries the truth for YOU only; the user interface never shows it.'
-            + ' Open a round before answering any question, and recall instead of retelling the truth from memory.',
+            'Search the web, then read the pages worth reading. `action` selects what to do.'
+            + ' action=search (default): `query` is one or more queries separated by commas (e.g. "AAA,BBB,CCC");'
+            + ' every query runs in parallel across all enabled engines and results are deduplicated by URL,'
+            + ' returning title + URL + snippet. Use this to find out WHICH urls are relevant.'
+            + ' action=fetch: `url` is one complete URL (usually taken from a search result); the page is fetched and'
+            + ' returned as readable text. Use this to read WHAT a specific url actually says.'
+            + ' The intended flow is search first (fuzzy), then fetch the promising urls (precise).'
+            + ' No API key is required: search hits public search pages directly (Bing, 360, Sogou WeChat)'
+            + ' and fetch makes a plain HTTP GET.',
         parameters: {
             type: 'object',
             properties: {
                 action: {
                     type: 'string',
-                    enum: ['open', 'recall', 'close'],
-                    description: 'open: seal this round. recall: read the sealed truth back. close: end the round.'
+                    enum: ['search', 'fetch'],
+                    description: 'search: query the engines. fetch: read one URL. Defaults to search when omitted.'
                 },
-                face: { type: 'string', description: 'open: the riddle text shown to the user.' },
-                base: { type: 'string', description: 'open: the complete truth. Never repeated in your reply text.' }
+                query: {
+                    type: 'string',
+                    description: 'search: one or more queries separated by commas, e.g. "AAA,BBB,CCC".'
+                },
+                url: {
+                    type: 'string',
+                    description: 'fetch: a complete URL including http:// or https://, e.g. taken from a search result.'
+                },
+                mode: {
+                    type: 'string',
+                    enum: ['text', 'raw'],
+                    description: 'fetch: text (default) converts HTML to readable text and extracts the main article;'
+                        + ' raw returns the untouched response body (use it for JSON APIs or to inspect markup).'
+                },
+                engines: {
+                    type: 'string',
+                    description: `search: optional comma-separated engine ids; available: ${ENGINE_IDS.join(', ')}. Default: all.`
+                },
+                limit: {
+                    type: 'number',
+                    description: `search: results per query (1-30). Default ${DEFAULT_LIMIT}.`
+                }
             },
-            required: ['action'],
+            required: [],
             additionalProperties: false
         },
         output: textOutput(),
         async execute(args, exec) {
-            const action = args.action
-            if (typeof action !== 'string' || !Object.hasOwn(ACTIONS, action)) {
-                throw new Error(`soup 的 action 只能是 ${Object.keys(ACTIONS).join(' / ')}，收到 ${JSON.stringify(action)}`)
+            // 本工具不发子进程、不碰文件系统，因此不需要会话工作区：输入只有查询词
+            // 或一个网址，边界由 splitQueries / assertFetchableUrl 与白名单校验负责。
+            //
+            // action 缺省为 search：fetch 是后来加的动作，旧调用方（以及模型的习惯）
+            // 都只传 query，让它们继续工作比强迫补一个 action 更合适。
+            const action = typeof args.action === 'string' ? args.action : 'search'
+            if (action !== 'search' && action !== 'fetch') {
+                throw new Error(`web 的 action 只能是 search / fetch，收到 ${JSON.stringify(args.action)}`)
             }
-            // face / base 只对 open 有意义：给错动作就是理解错了，当场报错而不是默默丢掉。
-            if (action !== 'open' && (hasText(args.face) || hasText(args.base))) {
-                throw new Error('soup 的 face / base 只对 action=open 有意义')
+
+            if (action === 'fetch') {
+                // 动作互斥：给了 query 却要 fetch，说明理解错了，当场报错而不是默默忽略。
+                if (hasText(args.query)) throw new Error('web 的 action=fetch 不接受 query；要搜索请用 action=search')
+                if (hasText(args.engines) || typeof args.limit === 'number') {
+                    throw new Error('web 的 engines / limit 只对 action=search 有意义')
+                }
+                const mode = typeof args.mode === 'string' ? args.mode : 'text'
+                if (mode !== 'text' && mode !== 'raw') {
+                    throw new Error(`web 的 mode 只能是 text / raw，收到 ${JSON.stringify(args.mode)}`)
+                }
+                const url = assertFetchableUrl(args.url)
+                const result = await fetchPage(url, exec.signal)
+                result.requestedUrl = url
+                throwIfAborted(exec.signal)
+                return { output: renderFetch(result, mode) }
             }
-            return { output: ACTIONS[action](args, exec) }
+
+            // 以下为 search。
+            if (hasText(args.url)) throw new Error('web 的 url 只对 action=fetch 有意义')
+            if (hasText(args.mode)) throw new Error('web 的 mode 只对 action=fetch 有意义')
+            const queries = splitQueries(args.query)
+            if (queries.length === 0) throw new Error('web 需要 query 参数：一个或多个查询词，多个用英文逗号分隔')
+            if (queries.length > MAX_QUERIES) {
+                throw new Error(`web 一次最多接受 ${MAX_QUERIES} 个查询，收到 ${queries.length} 个；请拆成几次调用`)
+            }
+
+            const requested = splitQueries(args.engines)
+            const engineIds = requested.length === 0 ? ENGINE_IDS : requested
+            const unknown = engineIds.filter((id) => ENGINES[id] === undefined)
+            if (unknown.length > 0) {
+                throw new Error(`web 的 engines 只能是 ${ENGINE_IDS.join(' / ')}，收到 ${unknown.map((n) => JSON.stringify(n)).join('、')}`)
+            }
+
+            const rawLimit = typeof args.limit === 'number' && Number.isFinite(args.limit) ? args.limit : DEFAULT_LIMIT
+            const limit = Math.min(30, Math.max(1, Math.trunc(rawLimit)))
+
+            const blocks = []
+            for (const query of queries) {
+                throwIfAborted(exec.signal)
+                const outcome = await searchOne(query, engineIds, limit, exec.signal)
+                blocks.push(renderQuery(query, outcome, limit))
+            }
+
+            const text = blocks.join('\n\n')
+            if (text.length <= MAX_RESULT_CHARS) return { output: text }
+            return { output: `${text.slice(0, MAX_RESULT_CHARS)}\n[输出被截断，仅保留前 ${MAX_RESULT_CHARS} 字符]` }
         },
-        // 卡片只写动作名：presentCall 拿不到返回值，但参数里就有汤底，绝不能进 rawInput。
+        // UI 呈现：搜索按 search 卡片，抓取按 terminal 卡片（它等价于一条 GET）。
         presentCall: (args) => {
-            const action = args !== null && typeof args === 'object' ? args.action : undefined
-            return { card: 'generic', title: `soup ${typeof action === 'string' ? action : '…'}`, kind: 'other' }
-        }
+            if (args === null || typeof args !== 'object') return { card: 'generic', title: 'web …', kind: 'search' }
+            if (args.action === 'fetch') {
+                const url = typeof args.url === 'string' && args.url.length > 0 ? args.url : '…'
+                return { card: 'terminal', title: `fetch ${url}`, description: '抓取网页内容' }
+            }
+            const query = typeof args.query === 'string' && args.query.length > 0 ? args.query : '…'
+            return { card: 'generic', title: `web ${query}`, kind: 'search' }
+        },
+        presentResult: terminalResult
     })
 }
 
@@ -1317,7 +1982,7 @@ const DEFINITIONS = {
     js: defineJs,
     delete: defineDelete,
     browser: defineBrowser,
-    soup: defineSoup
+    web: defineWeb
 }
 
 /** 本文件提供的全部工具名，按声明顺序（也是注册顺序）。 */

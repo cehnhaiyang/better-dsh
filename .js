@@ -31,14 +31,11 @@
 //        三种强度共用一份内核：rewrite（只重述）/ augment（保守增量）/
 //        structure（七段结构化）。模型调用走 ctx.llm，不引入第二套凭据。
 //      - 挂载 `~/.dsh/tools.js`（手写资源，脚本只校验不生成）：自定义工具集的唯一
-//        实现（js / delete / browser / soup）。工具**不是**
+//        实现（js / delete / browser）。工具**不是**
 //        在这里全局挂载的：预设用占位名 `better-dsh:tools` + `config: { tools: [...] }`
 //        声明自己要用哪几个，脚本在生成预设声明时把占位名改写成本机的 file:// 绝对
 //        路径。预设因此各自掌握自己的工具集，实现只有一份。
 //        契约（能否加载、每个工具是否真的注册）在改写前核对。
-//      - 挂载 `~/.dsh/plugins/soup-view/`（手写资源，脚本只校验不生成）：soup 工具的
-//        客户端半边。汤底进模型上下文，隐藏则全靠它把 soup 的调用行整个替换掉，
-//        因此它是「汤底用户不可见」的唯一实现点。
 //
 //   2. 自建预设迁移与落地：
 //      扫描 `~/.dsh/.agent-presets/<id>/`，把每个目录转成一条
@@ -99,7 +96,7 @@ const DSH_ROOT = process.env.DSH_HOME || path.join(HOME, '.dsh')
 // 本脚本面向 Web profile（WEB_PROFILE_DIR 与它必须一致，故集中成一个常量）。
 const PROFILE_NAME = 'web'
 const PLUGINS_DIR = path.join(DSH_ROOT, 'plugins')
-// 自定义工具集：js / delete / browser / soup 四个工具的
+// 自定义工具集：js / delete / browser 三个工具的
 // 唯一实现，放在仓库根、由人手写维护（脚本只挂载与校验，不生成也不覆盖）。
 const TOOLS_FILE = path.join(DSH_ROOT, 'tools.js')
 const WEB_PROFILE_DIR = path.join(DSH_ROOT, 'profiles', PROFILE_NAME)
@@ -2867,10 +2864,6 @@ const PROMPT_FORGE_DIR = path.join(PLUGINS_DIR, 'prompt-forge')
 const PROMPT_FORGE_HOST = path.join(PROMPT_FORGE_DIR, 'lib', 'index.js')
 const PROMPT_FORGE_CLIENT = path.join(PROMPT_FORGE_DIR, 'lib', 'client.js')
 
-// soup-view 与 idle-arm 同构：宿主半边空转，客户端半边靠 tool.call.toolview 顶替
-// soup 工具的通用行（汤底因此不上屏）。同样必须是一个带 package.json 的独立包目录。
-const SOUP_VIEW_DIR = path.join(PLUGINS_DIR, 'soup-view')
-
 /**
  * 校验一个「宿主半边 + 客户端半边」双面包的声明是否真的成立。
  *
@@ -2923,9 +2916,6 @@ function verifyClientBundle(dir) {
 
 /** 校验 idle-arm 的双面声明（提交键旁的落盘拦截按钮）。 */
 const verifyIdleArmBundle = () => verifyClientBundle(IDLE_ARM_DIR)
-
-/** 校验 soup-view 的双面声明（汤底不上屏的那一行）。 */
-const verifySoupViewBundle = () => verifyClientBundle(SOUP_VIEW_DIR)
 
 /**
  * 校验 prompt-forge 的双面声明与模块完整性。
@@ -3020,15 +3010,6 @@ if (idleArmProblems.length > 0) {
   process.exitCode = 1
 } else {
   console.log(`[plugins] idle-arm 双面插件就位: ${IDLE_ARM_DIR}`)
-}
-
-const soupViewProblems = verifySoupViewBundle()
-if (soupViewProblems.length > 0) {
-  for (const problem of soupViewProblems) console.error(`  [soup-view] ${problem}`)
-  console.error('  [soup-view] 双面声明不完整：soup 工具的调用行会退回通用行，汤底将直接显示在界面上。请从仓库恢复 plugins/soup-view/。')
-  process.exitCode = 1
-} else {
-  console.log(`[plugins] soup-view 双面插件就位: ${SOUP_VIEW_DIR}`)
 }
 
 // 3. 自建预设迁移：把目录预设转成声明式预设
@@ -3498,7 +3479,6 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
   const absIdleGuard = pathToFileURL(idleGuardPath).href
   const absIdleArm = pathToFileURL(IDLE_ARM_HOST).href
   const absPromptForge = pathToFileURL(PROMPT_FORGE_HOST).href
-  const absSoupView = pathToFileURL(path.join(SOUP_VIEW_DIR, 'lib', 'index.js')).href
 
   // 1. host 层不启用 compaction-basic，并摘除该层残留的启用行。
   //    dsh-web-app bundle 明确把该 host 行置为 disabled，压缩后端整体位于
@@ -3610,18 +3590,6 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     patchContent = spliceBeforeManaged(`- insert:\n    - id: prompt-forge\n      name: ${absPromptForge}`)
   } else {
     patchContent = patchContent.replace(/(- id: prompt-forge\n      name:\s*)['"]?[^'"\n]*['"]?/, `$1${absPromptForge}`)
-  }
-
-  // 4.9 挂载 soup-view 双面插件（宿主半边空转；客户端半边顶替 soup 工具的通用行，
-  //     让汤底既不上屏、也不进可展开区）。
-  //     与 idle-arm 同一套理由：name 用 file:// 指向宿主半边，client-modules 的
-  //     locatePkgJson 对 path-like 行名走 nearestPackage，会从该文件向上找到
-  //     soup-view/package.json，从而拿到 exports["./client"]。
-  //     幂等判据用条目 id `soup-view`（不能用包名：插入的是 file:// 路径，不含包名）。
-  if (!patchContent.includes('- id: soup-view')) {
-    patchContent = spliceBeforeManaged(`- insert:\n    - id: soup-view\n      name: ${absSoupView}`)
-  } else {
-    patchContent = patchContent.replace(/(- id: soup-view\n      name:\s*)['"]?[^'"\n]*['"]?/, `$1${absSoupView}`)
   }
 
   // 注意：自定义工具集**不**在这里挂载。tools.js 只提供实现，一个预设能用哪几个
