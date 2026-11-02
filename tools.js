@@ -67,7 +67,12 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
-const { spawn } = require('node:child_process')
+const http = require('node:http')
+const https = require('node:https')
+const net = require('node:net')
+const tls = require('node:tls')
+const zlib = require('node:zlib')
+const { execFileSync, spawn } = require('node:child_process')
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 共用基础设施
@@ -293,6 +298,271 @@ function resolveInside(root, item, { allowRoot = false } = {}) {
 
 /** 参数里是否真的给了一个非空字符串（会话回放时可能是任何东西）。 */
 const hasText = (value) => typeof value === 'string' && value.trim().length > 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 出站 HTTP：走代理，或直连
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 为什么不用全局 fetch：Node 的 fetch 不读系统代理，浏览器能打开的站点在 fetch
+// 里可能直接连不上——同一条工具与浏览器于是走了两条路。所以这里自己做传输层：
+// **有代理就用，没代理就直连**。
+//
+// 代理来源按优先级：
+//   1. 环境变量 HTTPS_PROXY / https_proxy / ALL_PROXY（显式配置最优先）；
+//   2. Windows 的 Internet Settings（浏览器用的那份，ProxyEnable + ProxyServer）。
+// 只支持 http:// 形式的代理（CONNECT 隧道）；socks 代理需要额外的握手协议，
+// 这里不假装支持——遇到 socks 就跳过，按直连处理，而不是静默失败。
+
+/** 缓存代理探测结果：注册表查询要起子进程，不值得每次请求都做。 */
+let proxyCache
+
+/**
+ * 解析一个代理字符串（`host:port` 或 `http://host:port`）。
+ * @param {string} raw - 代理配置文本。
+ * @returns {{host: string, port: number} | null} 解析结果；非 http 代理返回 null。
+ */
+function parseProxy(raw) {
+    const text = raw.trim()
+    if (text.length === 0) return null
+    // socks 需要额外握手，不支持：明确跳过而不是当成 http 代理用。
+    if (/^socks/i.test(text)) return null
+    const withoutScheme = text.replace(/^http:\/\//i, '')
+    // 去掉可能出现的路径与认证部分（`user:pass@host:port`）。
+    const authority = withoutScheme.split('/')[0].split('@').pop()
+    const match = /^([^\s:]+):(\d+)$/.exec(authority)
+    if (match === null) return null
+    const port = Number.parseInt(match[2], 10)
+    if (!Number.isFinite(port) || port <= 0 || port > 65535) return null
+    return { host: match[1], port }
+}
+
+/**
+ * 读 Windows 系统代理（浏览器用的那份）。
+ *
+ * `netsh winhttp show proxy` 是 WinHTTP 的配置，与浏览器用的 Internet Settings
+ * 是两套；浏览器（Chrome/Edge）读的是后者，所以这里读注册表而不是 netsh。
+ * @returns {{host: string, port: number} | null} 代理；未启用或读不到返回 null。
+ */
+function windowsSystemProxy() {
+    if (process.platform !== 'win32') return null
+    const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'
+    try {
+        const out = execFileSync('reg', ['query', key], { encoding: 'utf8', timeout: 5000, windowsHide: true })
+        // ProxyEnable 为 0 时 ProxyServer 可能仍留在注册表里，必须看开关。
+        if (!/ProxyEnable\s+REG_DWORD\s+0x1/i.test(out)) return null
+        const server = /ProxyServer\s+REG_SZ\s+([^\r\n]+)/i.exec(out)?.[1]
+        if (server === undefined) return null
+        // 多协议写法（`http=host:port;https=host:port`）：取 https 那一项。
+        const parts = server.split(';')
+        const httpsPart = parts.find((p) => /^https=/i.test(p.trim()))
+        const chosen = httpsPart !== undefined ? httpsPart.trim().replace(/^https=/i, '') : server
+        return parseProxy(chosen)
+    } catch {
+        // reg 不可用 / 键不存在：当作没有代理。
+        return null
+    }
+}
+
+/**
+ * 取得当前生效的代理（带缓存）。
+ * @returns {{host: string, port: number} | null} 代理；没有则 null（表示直连）。
+ */
+function detectProxy() {
+    if (proxyCache !== undefined) return proxyCache
+    for (const name of ['HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'HTTP_PROXY', 'http_proxy']) {
+        const value = process.env[name]
+        if (typeof value === 'string' && value.trim().length > 0) {
+            const parsed = parseProxy(value)
+            if (parsed !== null) {
+                proxyCache = parsed
+                return proxyCache
+            }
+        }
+    }
+    proxyCache = windowsSystemProxy()
+    return proxyCache
+}
+
+/** 响应体解压：站点普遍 gzip/deflate/br，不处理会拿到一堆乱码。 */
+function decompress(buffer, encoding) {
+    const name = typeof encoding === 'string' ? encoding.toLowerCase() : ''
+    if (name === 'gzip' || name === 'x-gzip') return zlib.gunzipSync(buffer)
+    if (name === 'deflate') {
+        // 有些服务器把 deflate 发成 raw deflate，先试标准再退 raw。
+        try { return zlib.inflateSync(buffer) } catch { return zlib.inflateRawSync(buffer) }
+    }
+    if (name === 'br') return zlib.brotliDecompressSync(buffer)
+    return buffer
+}
+
+/**
+ * 经 HTTP 代理建立到目标的隧道（CONNECT），返回一个已 TLS 握手的 socket。
+ * @param {{host: string, port: number}} proxy - 代理地址。
+ * @param {string} targetHost - 目标主机。
+ * @param {number} targetPort - 目标端口。
+ * @param {number} timeoutMs - 建连与握手的预算。
+ * @returns {Promise<import('node:tls').TLSSocket>}
+ */
+function openProxyTunnel(proxy, targetHost, targetPort, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const socket = net.connect({ host: proxy.host, port: proxy.port })
+        let settled = false
+        const fail = (error) => {
+            if (settled) return
+            settled = true
+            socket.destroy()
+            reject(error)
+        }
+        socket.setTimeout(timeoutMs)
+        socket.on('timeout', () => fail(new Error(`代理连接超时（${proxy.host}:${proxy.port}）`)))
+        socket.on('error', (error) => fail(new Error(`代理不可用（${proxy.host}:${proxy.port}）：${error.code ?? error.message}`)))
+        socket.on('connect', () => {
+            socket.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`)
+        })
+        socket.once('data', (chunk) => {
+            const statusLine = chunk.toString('utf8').split('\r\n')[0] ?? ''
+            if (!/\s2\d\d\s/.test(statusLine)) {
+                fail(new Error(`代理拒绝隧道：${statusLine.trim() || '无响应'}`))
+                return
+            }
+            const secure = tls.connect({ socket, servername: targetHost }, () => {
+                if (settled) return
+                settled = true
+                socket.setTimeout(0)
+                resolve(secure)
+            })
+            secure.on('error', (error) => fail(new Error(`TLS 握手失败：${error.code ?? error.message}`)))
+        })
+    })
+}
+
+/**
+ * 发一个 GET，跟随重定向，返回 { status, statusText, headers, body, url }。
+ *
+ * 传输路径：**有代理就走代理，代理用不了就直连**。
+ *
+ * 代理配置存在不等于代理可用：代理软件退出后，环境变量或 Windows 注册表里的
+ * ProxyServer 往往还留着。照着它连一个已经关掉的端口只会拿到 ECONNREFUSED，
+ * 此时必须退回直连，而不是把「代理没开」报成抓取失败。
+ *
+ * 不判断站点属于国内还是国外：那要求工具去猜哪些域名算国内，永远判不全。
+ *
+ * @param {string} url - 目标地址。
+ * @param {object} options - headers、timeoutMs、取消信号与 maxRedirects。
+ * @returns {Promise<object>} 见上；body 为 Buffer（已解压）。
+ */
+async function httpGet(url, { headers, timeoutMs, signal, maxRedirects = 5 }) {
+    throwIfAborted(signal)
+    const proxy = detectProxy()
+
+    const request = async (useProxy) => {
+        let current = url
+        for (let hop = 0; hop <= maxRedirects; hop += 1) {
+            throwIfAborted(signal)
+            const parsed = new URL(current)
+            const targetPort = parsed.port.length > 0 ? Number.parseInt(parsed.port, 10) : 443
+            const requestHeaders = { ...headers, host: parsed.host }
+
+            const socket = useProxy
+                ? await openProxyTunnel(proxy, parsed.hostname, targetPort, timeoutMs)
+                : undefined
+
+            const result = await new Promise((resolve, reject) => {
+                let settled = false
+                let answered = false
+                const fail = (error) => { if (settled) return; settled = true; reject(error) }
+
+                const req = https.request({
+                    host: parsed.hostname,
+                    port: targetPort,
+                    path: `${parsed.pathname}${parsed.search}`,
+                    method: 'GET',
+                    headers: requestHeaders,
+                    ...(socket === undefined ? {} : { createConnection: () => socket }),
+                    // 这个超时管的是「连接与等首字节」；一旦服务器开始应答，就由
+                    // body 自己的节奏决定，避免大页面下载被误判成连不上。
+                    timeout: timeoutMs,
+                }, (response) => {
+                    answered = true
+                    // 已应答：撤掉连接阶段的超时，改由 timeoutMs 兜底下载耗时。
+                    req.setTimeout(timeoutMs)
+                    const chunks = []
+                    response.on('data', (chunk) => chunks.push(chunk))
+                    response.on('error', fail)
+                    response.on('end', () => {
+                        if (settled) return
+                        settled = true
+                        let body
+                        try {
+                            body = decompress(Buffer.concat(chunks), response.headers['content-encoding'])
+                        } catch (error) {
+                            fail(new Error(`响应体解压失败：${error.message}`))
+                            return
+                        }
+                        resolve({
+                            status: response.statusCode ?? 0,
+                            statusText: response.statusMessage ?? '',
+                            headers: response.headers,
+                            body,
+                            url: current,
+                        })
+                    })
+                })
+                req.on('timeout', () => {
+                    req.destroy()
+                    fail(new Error(answered
+                        ? `读取响应超时（${timeoutMs}ms）`
+                        : `连接超时（${timeoutMs}ms）`))
+                })
+                req.on('error', (error) => fail(new Error(`${error.code ?? error.name}: ${error.message}`)))
+                const onAbort = () => { req.destroy(); fail(Object.assign(new Error('aborted'), { name: 'AbortError' })) }
+                signal.addEventListener('abort', onAbort, { once: true })
+                req.on('close', () => signal.removeEventListener('abort', onAbort))
+                req.end()
+            })
+
+            // 重定向：Location 可能是相对路径。
+            if (result.status >= 300 && result.status < 400 && typeof result.headers.location === 'string') {
+                current = new URL(result.headers.location, current).href
+                continue
+            }
+            return result
+        }
+        throw new Error(`重定向次数过多（>${maxRedirects}）`)
+    }
+
+    if (proxy === null) return request(false)
+
+    try {
+        return await request(true)
+    } catch (error) {
+        if (signal.aborted || error.name === 'AbortError') throw error
+        // 代理用不了（没开、端口拒绝、隧道被拒）：退回直连。
+        return request(false)
+    }
+}
+
+/**
+ * 把底层错误翻成一句能说明病因的话。
+ *
+ * `fetch failed` 这种笼统报错毫无用处——真正的原因在 error.code / error.cause
+ * 里（UND_ERR_CONNECT_TIMEOUT、ECONNRESET、ENOTFOUND…）。这里把整条链摊平。
+ * @param {unknown} error - 捕获到的错误。
+ * @returns {string} 可读的病因。
+ */
+function describeHttpError(error) {
+    const parts = []
+    let cursor = error
+    for (let depth = 0; cursor !== null && cursor !== undefined && depth < 4; depth += 1) {
+        const text = String(cursor.message ?? cursor)
+        const code = cursor.code === undefined ? '' : ` (${cursor.code})`
+        if (!parts.includes(text + code)) parts.push(text + code)
+        cursor = cursor.cause
+    }
+    return parts.join(' ← ') || '未知错误'
+}
+
+/** presentCall 在会话回放时会收到未经校验的参数，取值一律防御性处理。 */
 
 /** presentCall 在会话回放时会收到未经校验的参数，取值一律防御性处理。 */
 function pathsTitle(args) {
@@ -1156,34 +1426,51 @@ function defineBrowser(tools) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// web —— 多引擎并行搜索：一次查询打到多个搜索引擎，结果按 URL 去重合并
+// web —— Bing 搜索 + 网页抓取
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * 用多个**免密钥**的搜索引擎并行检索，把各自的命中按 URL 去重后合并返回。
+ * 用**免密钥**的 Bing 检索，结果按 Bing 原有顺序返回。
  *
- * 为什么自带引擎、不接官方 `ctx.web`：官方那条路只有 DeepSeek 一家 provider，
+ * 为什么自带搜索、不接官方 `ctx.web`：官方那条路只有 DeepSeek 一家 provider，
  * 且必须有 DEEPSEEK_API_KEY 或 DeepSeek 账号登录（见 dsh-web-search-deepseek
  * 的 available()）。本工具是**无凭据**的：只打公开搜索页，因此不依赖任何配置，
  * 也不占用官方的 provider 选择（两者的结果形态也不同——这里给的是标题+URL+摘要）。
  *
- * 为什么是这几个引擎：每个都是实测可直连、且返回结构可稳定解析的（见每个
- * ENGINE 的注释）。被排除的候选也记在那里，免得以后有人再试一遍。
+ * 只用 Bing 一个引擎：多引擎合并没有意义。`www.bing.com` 会 302 到
+ * `cn.bing.com`，两个端点实际是同一个后端，合并出来的只是同一份结果的重复。
  *
- * 为什么全部走 node 内置 fetch、不经 ctx.shell：与 js / delete / browser 同一套
- * 理由（见文件头）。命令与 URL 模板是本文件的常量，模型能给的只有查询词。
+ * 为什么全部走 node 内置 http 模块（见「出站 HTTP」一节）、不经 ctx.shell：与
+ * js / delete / browser 同一套理由（见文件头）。URL 模板是本文件的常量，模型能
+ * 给的只有查询词。
  * @param {object} tools - dsh-tools 注册表。
  */
 function defineWeb(tools) {
-    /** 单引擎的单次请求预算：搜索页偶尔会拖，超过就当作该引擎不可用。 */
-    const ENGINE_TIMEOUT_MS = 15000
-    /** 一次调用最多接受的查询条数：再多就该拆成几次调用了。 */
-    const MAX_QUERIES = 8
-    /** 每个查询默认取回的条数上限。 */
+    /** 搜索的单次请求预算：结果页偶尔会拖，超过就当作搜索失败。 */
+    const SEARCH_TIMEOUT_MS = 15000
+    /** 每个查询默认返回的条数上限（Bing 结果页的 `count` 默认量级）。 */
     const DEFAULT_LIMIT = 10
+
+    /**
+     * 把一个可选数值参数夹到 [min, max] 里。
+     *
+     * 缺省、非数值或非有限值一律退回 fallback 而不是报错：会话回放与手工调用可能
+     * 带来任何东西，而 limit 只是一个「给多给少」的旋钮，夹紧比失败更有用。
+     * 小数取整：条数只能是整数。
+     * @param {unknown} raw - 模型传入的值。
+     * @param {number} min - 允许的最小值。
+     * @param {number} max - 允许的最大值。
+     * @param {number} fallback - 缺省值。
+     * @returns {number} 夹紧后的整数。
+     */
+    function clampNumber(raw, min, max, fallback) {
+        const value = typeof raw === 'number' && Number.isFinite(raw) ? raw : fallback
+        return Math.min(max, Math.max(min, Math.trunc(value)))
+    }
+
     /** 单条摘要的截断长度：摘要只用来判断相关性，不需要全文。 */
     const SNIPPET_CHARS = 240
-    /** 整段最终文本的封顶：查询数 × 引擎数 × 条数会很快打爆上下文。 */
+    /** 整段最终文本的封顶：条数上限很高时仍可能打爆上下文。 */
     const MAX_RESULT_CHARS = 262144
 
     /**
@@ -1192,9 +1479,6 @@ function defineWeb(tools) {
      */
     const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         + ' (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    /** 移动 UA：360 的移动站结果页比网页版稳定得多（网页版会弹验证码）。 */
-    const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)'
-        + ' AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
 
     /**
      * 命名实体解码。
@@ -1248,8 +1532,8 @@ function defineWeb(tools) {
     /**
      * 发一个 GET 并取回文本。
      *
-     * 走 node 内置 fetch（Node 18+ 起可用），不经 ctx.shell。重定向跟随：搜索页
-     * 常有一次跳转。非 2xx 当作该引擎失败而不是空结果——静默当空结果会让模型
+     * 走 httpGet（有代理走代理，没有就直连），不经 ctx.shell。重定向跟随：搜索页
+     * 常有一次跳转。非 2xx 当作搜索失败而不是空结果——静默当空结果会让模型
      * 以为「这个词没有结果」。
      * @param {string} url - 目标地址（本文件的常量拼装，模型触及不到）。
      * @param {string} userAgent - 伪装用的 UA。
@@ -1258,24 +1542,23 @@ function defineWeb(tools) {
      */
     async function httpText(url, userAgent, signal) {
         throwIfAborted(signal)
-        // 超时与取消合并：AbortSignal.any 在 Node 20+ 可用，两条信号任一触发都中止。
-        const timeout = AbortSignal.timeout(ENGINE_TIMEOUT_MS)
-        const merged = AbortSignal.any([signal, timeout])
         try {
-            const response = await fetch(url, {
-                redirect: 'follow',
+            const response = await httpGet(url, {
+                timeoutMs: SEARCH_TIMEOUT_MS,
+                signal,
                 headers: {
                     'user-agent': userAgent,
                     accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                     'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                    'accept-encoding': 'gzip, deflate, br',
                 },
-                signal: merged,
             })
-            if (!response.ok) throw new Error(`HTTP ${response.status}`)
-            return await response.text()
+            if (response.status < 200 || response.status >= 300) throw new Error(`HTTP ${response.status}`)
+            return response.body.toString('utf8')
         } catch (error) {
             if (signal.aborted) throwIfAborted(signal)
-            throw new Error(error.name === 'TimeoutError' ? `超时（${ENGINE_TIMEOUT_MS}ms）` : String(error.message ?? error))
+            if (error.name === 'AbortError') throwIfAborted(signal)
+            throw new Error(describeHttpError(error))
         }
     }
 
@@ -1284,14 +1567,14 @@ function defineWeb(tools) {
      *
      * 搜索站点的拦截页（「访问异常出错」「请输入验证码」）**仍然返回 HTTP 200**，
      * 只是正文里没有任何结果。若把这种情况当空数组返回，模型会以为「这个词没有
-     * 结果」——而真实原因是引擎限流。因此解析出 0 条时必须抛错，让失败原因随
+     * 结果」——而真实原因是被限流。因此解析出 0 条时必须抛错，让失败原因随
      * 结果一起报上去。
-     * @param {object[]} hits - 某引擎解析出的命中。
-     * @param {string} engine - 引擎 id，只进报错文案。
+     * @param {object[]} hits - 解析出的命中。
+     * @param {string} source - 站点名，只进报错文案。
      * @returns {object[]} 原样返回的命中（非空）。
      */
-    function requireHits(hits, engine) {
-        if (hits.length === 0) throw new Error(`${engine} 没有解析出结果（可能被限流或页面改版）`)
+    function requireHits(hits, source) {
+        if (hits.length === 0) throw new Error(`${source} 没有解析出结果（可能被限流或页面改版）`)
         return hits
     }
 
@@ -1486,33 +1769,32 @@ function defineWeb(tools) {
      */
     async function fetchPage(url, signal) {
         throwIfAborted(signal)
-        const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS)
-        const merged = AbortSignal.any([signal, timeout])
 
         let response
         try {
-            response = await fetch(url, {
-                redirect: 'follow',
+            response = await httpGet(url, {
+                timeoutMs: FETCH_TIMEOUT_MS,
+                signal,
                 headers: {
                     'user-agent': UA_DESKTOP,
                     accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                     'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                    'accept-encoding': 'gzip, deflate, br',
                 },
-                signal: merged,
             })
         } catch (error) {
             if (signal.aborted) throwIfAborted(signal)
-            throw new Error(error.name === 'TimeoutError'
-                ? `抓取超时（${FETCH_TIMEOUT_MS}ms）`
-                : `抓取失败：${String(error.message ?? error)}`)
+            if (error.name === 'AbortError') throwIfAborted(signal)
+            // 报出真实病因：连不上 / 代理拒绝 / DNS 失败，各不相同。
+            throw new Error(`抓取失败：${describeHttpError(error)}`)
         }
 
-        const contentType = response.headers.get('content-type') ?? ''
+        const contentType = response.headers['content-type'] ?? ''
         const status = response.status
         const finalUrl = response.url
 
         // 非 2xx：如实报出，不当作正文。
-        if (!response.ok) {
+        if (status < 200 || status >= 300) {
             return { status, finalUrl, contentType, ok: false, reason: `HTTP ${status} ${response.statusText}`.trim() }
         }
 
@@ -1522,13 +1804,7 @@ function defineWeb(tools) {
             return { status, finalUrl, contentType, ok: false, reason: `不是文本内容（content-type: ${contentType || '未知'}），未读取正文` }
         }
 
-        let bytes
-        try {
-            bytes = new Uint8Array(await response.arrayBuffer())
-        } catch (error) {
-            if (signal.aborted) throwIfAborted(signal)
-            throw new Error(`读取响应体失败：${String(error.message ?? error)}`)
-        }
+        const bytes = new Uint8Array(response.body)
         throwIfAborted(signal)
 
         if (bytes.byteLength > MAX_FETCH_BYTES) {
@@ -1621,30 +1897,30 @@ function defineWeb(tools) {
     }
 
     /**
-     * 解析 Bing 的 HTML 结果页（两个 Bing 引擎共用这一份解析）。
+     * 搜索 Bing，按结果页原有顺序返回命中。
      *
-     * 走 HTML 结果页而不是 `format=rss`：实测 RSS 出口在**没有 Cookie**时会被降级，
-     * 对同一查询反复返回完全不相干的结果（查「typescript 泛型」返回「中美俄大三角」
-     * 「Eaglercraft」「河北福派安管道制造有限公司」，且每次不同）；补上 Cookie 或
-     * `mkt` 参数后才正常。HTML 页在同样的无 Cookie 条件下稳定给出正确结果。
-     *
-     * `mkt=zh-CN` 是显式的市场参数：Bing 会按 IP 猜市场，猜错时中文查询召回很差。
-     * 带上它就不再依赖 IP 归属。
-     * @param {string} host - `cn.bing.com` 或 `www.bing.com`。
-     * @param {string} engine - 引擎 id，只进报错文案。
+     * 走 HTML 结果页而不是 `format=rss`：RSS 出口在没有 Cookie 时会被降级，
+     * 对同一查询反复返回完全不相干的结果；HTML 页在同样条件下更稳定。
+     * `mkt=zh-CN` 显式指定中文市场，避免按 IP 猜错市场。
      * @param {string} query - 查询词。
+     * @param {number} limit - 最多返回的条数。
      * @param {AbortSignal} signal - 工具调用的取消信号。
-     * @returns {Promise<object[]>} 命中列表（非空，否则抛错）。
+     * @returns {Promise<{hits: object[], truncated: boolean}>} 命中列表与是否被截断。
      */
-    async function bingHits(host, engine, query, signal) {
+    async function searchBing(query, limit, signal) {
         const body = await httpText(
-            `https://${host}/search?q=${encodeURIComponent(query)}&count=10&mkt=zh-CN`,
+            `https://cn.bing.com/search?q=${encodeURIComponent(query)}&count=${limit}&mkt=zh-CN`,
             UA_DESKTOP, signal,
         )
         const hits = []
+        let truncated = false
         // 每条自然结果是一个 <li class="b_algo"> 块；块内标题是 <h2><a href=…>，
         // 摘要是 b_lineclamp* 的 <p>（Bing 按行数给出不同后缀的类名）。
         for (const block of body.split(/<li class="b_algo"/).slice(1)) {
+            if (hits.length >= limit) {
+                truncated = true
+                break
+            }
             const seg = block.slice(0, 4000)
             const anchor = /<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/s.exec(seg)
             if (anchor === null) continue
@@ -1656,226 +1932,86 @@ function defineWeb(tools) {
             if (title.length === 0 || !/^https?:/i.test(url)) continue
             hits.push({ title, url, snippet: clipSnippet(snippet) })
         }
-        return requireHits(hits, engine)
+        return { hits: requireHits(hits, 'Bing'), truncated }
     }
 
     /**
-     * Bing 中国站。
-     *
-     * 与 `bing`（全球站）是两个独立引擎而不是一个：它们的索引与排序确实不同
-     * （同一查询的命中集合有明显差异），因此合并时能互补。分成两条还带来一个
-     * 工程上的好处——一条被限流时另一条仍可用，而 `Promise.allSettled` 会让
-     * 失败的那条只作为附注出现，不影响结果。
-     */
-    const searchBingCn = (query, signal) => bingHits('cn.bing.com', 'bing-cn', query, signal)
-
-    /** Bing 全球站。 */
-    const searchBingGlobal = (query, signal) => bingHits('www.bing.com', 'bing', query, signal)
-
-    /**
-     * 360 搜索（移动站）。
-     *
-     * 走 `m.so.com` 而不是 `www.so.com`：网页版更容易触发验证码，而移动站
-     * 给出的是同一套索引。真实 URL 在卡片容器的 `data-pcurl` 属性里；`href` 是
-     * m.so.com 的跳转壳，不能直接给模型。
-     *
-     * 注意 360 对**同一 IP 的高频请求**会返回「访问异常出错」拦截页（HTTP 仍是
-     * 200）。这种情况由 requireHits 抛错上报，而不是静默变成空结果。
-     */
-    async function search360(query, signal) {
-        const body = await httpText(`https://m.so.com/s?q=${encodeURIComponent(query)}`, UA_MOBILE, signal)
-        const hits = []
-        for (const block of body.split(/class="g-card res-list/).slice(1)) {
-            const seg = block.slice(0, 4000)
-            const url = decodeEntities(/data-pcurl="(https?:\/\/[^"]+)"/.exec(seg)?.[1] ?? '')
-            const title = stripTags(/<h3[^>]*class="res-title[^"]*"[^>]*>([\s\S]*?)<\/h3>/.exec(seg)?.[1] ?? '')
-            const raw = /<p[^>]*class="[^"]*(?:g-main|summary)[^"]*"[^>]*>([\s\S]*?)<\/p>/.exec(seg)?.[1]
-                ?? /<div[^>]*class="[^"]*(?:summary|sumext-line)[^"]*"[^>]*>([\s\S]*?)<\/div>/.exec(seg)?.[1]
-                ?? ''
-            if (title.length === 0 || !/^https?:/i.test(url)) continue
-            hits.push({ title, url, snippet: clipSnippet(stripTags(raw)) })
-        }
-        return requireHits(hits, '360')
-    }
-
-    /**
-     * 搜狗微信。
-     *
-     * 这个引擎的价值在于**中文技术内容**：公众号文章在 Bing/360 上覆盖很差，
-     * 而这里是它们的原生索引。注意它的链接是 `/link?url=…` 的相对跳转壳
-     * （需要 Referer 才能落地），因此统一补成绝对地址并标注为跳转链。
-     */
-    async function searchSogouWeixin(query, signal) {
-        const body = await httpText(
-            `https://weixin.sogou.com/weixin?type=2&query=${encodeURIComponent(query)}`,
-            UA_DESKTOP, signal,
-        )
-        const hits = []
-        for (const block of body.split(/class="txt-box"/).slice(1)) {
-            const seg = block.slice(0, 2000)
-            const href = decodeEntities(/<a[^>]+href="(\/link\?url=[^"]+)"/.exec(seg)?.[1] ?? '')
-            const title = stripTags(/<h3[^>]*>([\s\S]*?)<\/h3>/.exec(seg)?.[1] ?? '')
-            const snippet = stripTags(/<p[^>]*class="txt-info[^"]*"[^>]*>([\s\S]*?)<\/p>/.exec(seg)?.[1] ?? '')
-            const account = stripTags(/<span[^>]*class="all-time-y2[^"]*"[^>]*>([\s\S]*?)<\/span>/.exec(seg)?.[1] ?? '')
-            if (title.length === 0 || href.length === 0) continue
-            hits.push({
-                title: account.length > 0 ? `${title}（${account}）` : title,
-                url: `https://weixin.sogou.com${href}`,
-                snippet: clipSnippet(snippet),
-            })
-        }
-        return requireHits(hits, 'weixin')
-    }
-
-    /**
-     * 引擎表：id → 实现。
-     *
-     * 键会出现在输出里（每条结果标注它来自哪个引擎），因此取值要短且稳定。
-     * 顺序**显式**由 ENGINE_IDS 给出，不要用 Object.keys(ENGINES)：`'360'` 是
-     * 数字样字符串键，JS 的对象键序会把它排到最前面（整型键优先于字符串键），
-     * 于是默认顺序会变成 360 → bing-cn → bing → weixin，与这里的字面顺序不符。
-     *
-     * 四个引擎的取舍（都是实测结论，免得以后有人再试一遍）：
-     *   · bing-cn / bing —— 稳定，中英文都准。两个站点的索引确有差异，因此都留。
-     *   · weixin —— 中文技术内容（公众号）覆盖极好，是前两者的盲区。
-     *   · 360 —— 中文综合结果好，但对同一 IP 高频请求会限流。留作第四条：
-     *     被限流时只会在附注里出现一行失败，不影响其余三条的结果。
-     * 已排除：百度（改版后稳定返回 1.4KB 拦截页）、DuckDuckGo / Mojeek / Wikipedia /
-     * Startpage / SearXNG 各公共实例（本机网络不可达）、Yahoo / Yandex（超时或验证码）、
-     * 搜狗网页版（触发验证码）、头条（客户端渲染，无 SSR 数据）、Marginalia（无中文结果）。
-     */
-    const ENGINES = {
-        'bing-cn': searchBingCn,
-        bing: searchBingGlobal,
-        weixin: searchSogouWeixin,
-        '360': search360,
-    }
-    /** 全部引擎 id，按声明顺序（也是轮转合并的起始顺序）。 */
-    const ENGINE_IDS = ['bing-cn', 'bing', 'weixin', '360']
-
-    /**
-     * 把一个查询打到多个引擎并合并。
-     *
-     * 并发而不是串行：三个引擎各自 1-3 秒，串起来会让单次调用逼近超时。
-     * 用 allSettled 而不是 all：一个引擎被限流不该让整次搜索失败——那正是
-     * 「多引擎」这个设计的意义。失败原因逐条收集，随结果一起报给模型。
-     *
-     * 合并按**轮转**（每个引擎轮流取一条）而不是「先到先满」：后者会让第一个
-     * 返回的引擎（通常是 360，条数多）吃满 limit，其余引擎一条都进不来，
-     * 「多引擎」于是名存实亡。轮转保证每个引擎都有代表。
+     * 把一次搜索渲染成模型可见的文本。
      * @param {string} query - 查询词。
-     * @param {string[]} engineIds - 本次启用的引擎 id。
-     * @param {number} limit - 合并后的条数上限。
-     * @param {AbortSignal} signal - 工具调用的取消信号。
-     * @returns {Promise<{hits: object[], failures: string[]}>} 合并结果与失败说明。
-     */
-    async function searchOne(query, engineIds, limit, signal) {
-        const settled = await Promise.allSettled(
-            engineIds.map(async (id) => ({ id, hits: await ENGINES[id](query, signal) })),
-        )
-        throwIfAborted(signal)
-
-        // 按引擎分桶，并把失败原因记下来（顺序与 engineIds 一致，便于阅读）。
-        const buckets = []
-        const failures = []
-        for (const [index, outcome] of settled.entries()) {
-            if (outcome.status === 'rejected') {
-                failures.push(`${engineIds[index]}: ${String(outcome.reason?.message ?? outcome.reason)}`)
-                continue
-            }
-            buckets.push({ id: outcome.value.id, hits: outcome.value.hits })
-        }
-
-        // 轮转合并：每一轮每个引擎取一条，直到取满 limit 或全部取尽。
-        const hits = []
-        const seen = new Set()
-        const cursors = buckets.map(() => 0)
-        let progressed = true
-        while (hits.length < limit && progressed) {
-            progressed = false
-            for (const [bucketIndex, bucket] of buckets.entries()) {
-                if (hits.length >= limit) break
-                // 跳过本桶里已被别的引擎收录过的 URL，直到取到一条新的或取尽。
-                while (cursors[bucketIndex] < bucket.hits.length) {
-                    const hit = bucket.hits[cursors[bucketIndex]]
-                    cursors[bucketIndex] += 1
-                    if (seen.has(hit.url)) continue
-                    seen.add(hit.url)
-                    hits.push({ ...hit, source: bucket.id })
-                    progressed = true
-                    break
-                }
-            }
-        }
-        return { hits, failures }
-    }
-
-    /**
-     * 把一次查询的结果渲染成模型可见的文本。
-     * @param {string} query - 查询词。
-     * @param {object} outcome - searchOne 的返回值。
-     * @param {number} limit - 条数上限（用于「没有结果」的文案）。
+     * @param {object} outcome - searchBing 的返回值。
+     * @param {number} limit - 条数上限。
      * @returns {string} 一段纯文本。
      */
     function renderQuery(query, outcome, limit) {
         const lines = [`## ${query}`]
-        if (outcome.hits.length === 0) {
-            lines.push(`(没有结果${outcome.failures.length > 0 ? '；引擎失败见下' : ''})`)
-        } else {
-            for (const [index, hit] of outcome.hits.entries()) {
-                lines.push(`${index + 1}. ${hit.title}`)
-                lines.push(`   ${hit.url}`)
-                if (hit.snippet.length > 0) lines.push(`   ${hit.snippet}`)
-                lines.push(`   [${hit.source}]`)
-            }
+        for (const [index, hit] of outcome.hits.entries()) {
+            lines.push(`${index + 1}. ${hit.title}`)
+            lines.push(`   ${hit.url}`)
+            if (hit.snippet.length > 0) lines.push(`   ${hit.snippet}`)
         }
-        if (outcome.failures.length > 0) {
-            lines.push(`[部分引擎失败] ${outcome.failures.join('；')}`)
-        }
-        if (outcome.hits.length >= limit) lines.push(`（已达条数上限 ${limit}，可能有更多结果）`)
+        if (outcome.truncated) lines.push(`（已达条数上限 ${limit}，可能有更多结果）`)
         return lines.join('\n')
     }
 
     /**
-     * 拆查询词。
+     * 校验查询词。
      *
-     * 输入约定是 `AAA,BBB,CCC` 这样的英文逗号分隔；同时容忍中文逗号与换行，
-     * 因为模型和用户都会顺手用它们。
+     * `query` 是一个查询词，原样交给 Bing：它本身可以含逗号、空格、引号、减号等
+     * 搜索语法，这些都不该被本工具解释。这里只做「有没有给」与首尾空白。
      * @param {unknown} raw - 模型传入的 query。
-     * @returns {string[]} 非空查询词。
+     * @returns {string} 去掉首尾空白的查询词。
      */
-    function splitQueries(raw) {
-        if (typeof raw !== 'string') return []
-        return raw.split(/[,，\n]/).map((item) => item.trim()).filter((item) => item.length > 0)
+    function assertQuery(raw) {
+        if (typeof raw !== 'string' || raw.trim().length === 0) {
+            throw new Error('web 需要 query 参数：一个查询词')
+        }
+        return raw.trim()
     }
 
     tools.register({
         name: 'web',
         description:
-            'Search the web, then read the pages worth reading. `action` selects what to do.'
-            + ' action=search (default): `query` is one or more queries separated by commas (e.g. "AAA,BBB,CCC");'
-            + ' every query runs in parallel across all enabled engines and results are deduplicated by URL,'
-            + ' returning title + URL + snippet. Use this to find out WHICH urls are relevant.'
-            + ' action=fetch: `url` is one complete URL (usually taken from a search result); the page is fetched and'
-            + ' returned as readable text. Use this to read WHAT a specific url actually says.'
-            + ' The intended flow is search first (fuzzy), then fetch the promising urls (precise).'
-            + ' No API key is required: search hits public search pages directly (Bing, 360, Sogou WeChat)'
-            + ' and fetch makes a plain HTTP GET.',
+            'Web research in two steps: find candidate URLs, then read the ones worth reading.'
+            + ' `action` selects which step you are on.'
+            + '\n\n'
+            + 'action=search (default) — find out WHICH urls are relevant.'
+            + ' `query` is a single query, passed to Bing as written; results keep Bing\'s original order'
+            + ' and include title + URL + snippet.'
+            + '\n\n'
+            + 'Send one query per call. If you have several distinct topics, make several web calls.'
+            + '\n\n'
+            + 'action=fetch — read WHAT a specific url actually says.'
+            + ' `url` is one complete http(s) URL, normally copied from a search result; redirects are followed'
+            + ' and the final URL is reported. HTML is reduced to readable text with the main article body'
+            + ' extracted when the page has one; JSON and plain text come back as-is.'
+            + ' `mode=raw` returns the untouched body instead, for API responses or to inspect markup.'
+            + '\n\n'
+            + 'The intended flow is search first (fuzzy), then fetch the promising urls (precise).'
+            + ` Snippets are truncated to about ${SNIPPET_CHARS} characters and exist only to rank relevance —`
+            + ' never present a snippet as the content of the page; fetch it when the wording matters.'
+            + '\n\n'
+            + 'Optional `limit` caps the number of results (1-30, default 10).'
+            + '\n\n'
+            + 'No API key is required: Bing is queried directly and fetch is a plain HTTP GET.'
+            + ' The two actions are mutually exclusive — search takes query/limit,'
+            + ' fetch takes url/mode; passing the wrong group is an error, not a silent no-op.',
         parameters: {
             type: 'object',
             properties: {
                 action: {
                     type: 'string',
                     enum: ['search', 'fetch'],
-                    description: 'search: query the engines. fetch: read one URL. Defaults to search when omitted.'
+                    description: 'search: find candidate urls (default when omitted). fetch: read one url.'
                 },
                 query: {
                     type: 'string',
-                    description: 'search: one or more queries separated by commas, e.g. "AAA,BBB,CCC".'
+                    description: 'search: one query, e.g. "typescript 泛型约束". Sent to Bing as written,'
+                        + ' so search syntax such as quotes or a minus sign works. Use one query per call.'
                 },
                 url: {
                     type: 'string',
-                    description: 'fetch: a complete URL including http:// or https://, e.g. taken from a search result.'
+                    description: 'fetch: one complete URL including http:// or https://, normally copied from a search'
+                        + ' result. Redirects are followed and the final URL is reported.'
                 },
                 mode: {
                     type: 'string',
@@ -1883,13 +2019,9 @@ function defineWeb(tools) {
                     description: 'fetch: text (default) converts HTML to readable text and extracts the main article;'
                         + ' raw returns the untouched response body (use it for JSON APIs or to inspect markup).'
                 },
-                engines: {
-                    type: 'string',
-                    description: `search: optional comma-separated engine ids; available: ${ENGINE_IDS.join(', ')}. Default: all.`
-                },
                 limit: {
                     type: 'number',
-                    description: `search: results per query (1-30). Default ${DEFAULT_LIMIT}.`
+                    description: `search: maximum number of results to return (1-30). Default ${DEFAULT_LIMIT}.`
                 }
             },
             required: [],
@@ -1898,7 +2030,7 @@ function defineWeb(tools) {
         output: textOutput(),
         async execute(args, exec) {
             // 本工具不发子进程、不碰文件系统，因此不需要会话工作区：输入只有查询词
-            // 或一个网址，边界由 splitQueries / assertFetchableUrl 与白名单校验负责。
+            // 或一个网址，边界由 assertSingleQuery / assertFetchableUrl 与白名单校验负责。
             //
             // action 缺省为 search：fetch 是后来加的动作，旧调用方（以及模型的习惯）
             // 都只传 query，让它们继续工作比强迫补一个 action 更合适。
@@ -1910,8 +2042,8 @@ function defineWeb(tools) {
             if (action === 'fetch') {
                 // 动作互斥：给了 query 却要 fetch，说明理解错了，当场报错而不是默默忽略。
                 if (hasText(args.query)) throw new Error('web 的 action=fetch 不接受 query；要搜索请用 action=search')
-                if (hasText(args.engines) || typeof args.limit === 'number') {
-                    throw new Error('web 的 engines / limit 只对 action=search 有意义')
+                if (typeof args.limit === 'number') {
+                    throw new Error('web 的 limit 只对 action=search 有意义')
                 }
                 const mode = typeof args.mode === 'string' ? args.mode : 'text'
                 if (mode !== 'text' && mode !== 'raw') {
@@ -1927,30 +2059,12 @@ function defineWeb(tools) {
             // 以下为 search。
             if (hasText(args.url)) throw new Error('web 的 url 只对 action=fetch 有意义')
             if (hasText(args.mode)) throw new Error('web 的 mode 只对 action=fetch 有意义')
-            const queries = splitQueries(args.query)
-            if (queries.length === 0) throw new Error('web 需要 query 参数：一个或多个查询词，多个用英文逗号分隔')
-            if (queries.length > MAX_QUERIES) {
-                throw new Error(`web 一次最多接受 ${MAX_QUERIES} 个查询，收到 ${queries.length} 个；请拆成几次调用`)
-            }
+            const query = assertQuery(args.query)
+            const limit = clampNumber(args.limit, 1, 30, DEFAULT_LIMIT)
 
-            const requested = splitQueries(args.engines)
-            const engineIds = requested.length === 0 ? ENGINE_IDS : requested
-            const unknown = engineIds.filter((id) => ENGINES[id] === undefined)
-            if (unknown.length > 0) {
-                throw new Error(`web 的 engines 只能是 ${ENGINE_IDS.join(' / ')}，收到 ${unknown.map((n) => JSON.stringify(n)).join('、')}`)
-            }
-
-            const rawLimit = typeof args.limit === 'number' && Number.isFinite(args.limit) ? args.limit : DEFAULT_LIMIT
-            const limit = Math.min(30, Math.max(1, Math.trunc(rawLimit)))
-
-            const blocks = []
-            for (const query of queries) {
-                throwIfAborted(exec.signal)
-                const outcome = await searchOne(query, engineIds, limit, exec.signal)
-                blocks.push(renderQuery(query, outcome, limit))
-            }
-
-            const text = blocks.join('\n\n')
+            throwIfAborted(exec.signal)
+            const outcome = await searchBing(query, limit, exec.signal)
+            const text = renderQuery(query, outcome, limit)
             if (text.length <= MAX_RESULT_CHARS) return { output: text }
             return { output: `${text.slice(0, MAX_RESULT_CHARS)}\n[输出被截断，仅保留前 ${MAX_RESULT_CHARS} 字符]` }
         },
