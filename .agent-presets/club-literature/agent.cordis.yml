@@ -78,58 +78,14 @@
 
        设定/法典.md的内容即法典全文，它是实时动态更新的。
 
-# 文学创作模式不提供 Shell 工具：文件读写与检索由 `tool-fs`/`tool-fs-search`
-# 覆盖，保持工具目录专注于创作。需要时再从此处恢复 `tool-bash`/`tool-pwsh`。
-
-# ── 文件系统工具 ──────────────────────────────────────────────────────────────
-
-# 两者都注册进宿主 `tools` 注册表且不提供任何服务，因此不需要领域。
-# `fs` 服务及其观察/沙箱策略留在宿主。
-
-# 提供模型侧文件工具：read（读文本）、write（写文件）、edit（改文件）；
-# 并在 attachments（附件存储）服务可用时附带注册 read_image（读图片）。
 - id: tool-fs
   name: '@deepseek-ai/dsh-tool-fs'
 
-# 文件区注入：本地插件 inject-filezone.js（源文件在本预设目录，声明里引用为
-# ./preset-assets/club-literature/inject-filezone.js）每次模型调用时从工作区实时
-# 读取文件区清单中的文件（当前仅《法典》：设定/法典.md）注入系统提示词，随对话常驻
-# 存在。扩展文件区只需在插件 FILEZONE 数组中追加路径；修改文件内容即时生效。
-# 插件源码的复制与引用改写由 ~/.dsh/.js 负责，改完插件需重跑脚本。
-- id: filezone-inject
-  name: './inject-filezone.js'
-
-# 提供检索工具：glob（按路径模式找文件）、grep（按正则搜内容）。
-# `sampleOverCapGlobResults: false` 表示超量结果不做抽样、如实返回（溢出落盘）。
 - id: tool-fs-search
   name: '@deepseek-ai/dsh-tool-fs-search'
   config:
     sampleOverCapGlobResults: false
 
-# ── 目标（Goals）：人类命令与模型侧工具 ───────────────────────────────────────
-
-# 目标领域（`goals`）与续行驱动器留在宿主平面：网关以 Remote 端点提供目标领域，
-# 接收方来自生成描述符，若此处用条目本地领域会藏起宿主上的 `goals` 服务。
-# 注册表按会话为键，一个宿主实例服务所有会话。
-# 但 Web bundle（`dsh-web-app`）已在宿主层把 `command-goal` 与 `tool-goal` 两行
-# 禁用（见其 cordis.patch.yml），因此人类命令与模型侧工具必须由本 preset 自行
-# 挂载：前者提供 `/goal` 命令，后者提供 create_goal / get_goal / update_goal。
-# 两行都只消费宿主服务、不发布服务，因此不需要领域。
-- id: command-goal
-  name: '@deepseek-ai/dsh-command-goal'
-
-- id: tool-goal
-  name: '@deepseek-ai/dsh-tool-goal'
-
-# ── 上下文压缩（Compaction）───────────────────────────────────────────────────
-
-# `compaction-basic` 通过 `ctx.get` 读取 `toolResultPrune`，因此修剪器必须与
-# 它共享同一领域，而不能放在领域之外。
-#
-# `tokenMeter` 刻意不放在本领域：计量器留在宿主平面，本文件的行解析到那一
-# 个实例。它无需配置，按 Session 记录每次折叠，并持有浏览器为每个会话读取
-# 的上下文计量投影单元——若放进领域，这些单元会随挂载的预设不同而时有时无。
-# 预设能选择的是：本预设的代理是否压缩上下文，即下方 `compaction-basic`。
 - id: compaction
   name: cordis:group
   group: true
@@ -137,26 +93,15 @@
     compaction: true
     toolResultPruner: true
   config:
-    # 基础压缩器：达到阈值时折叠历史上下文。
     - id: compaction-basic
       name: '@deepseek-ai/dsh-compaction-basic'
 
-    # 人类可用的 `/compact` 命令：在自动阈值之下做一次有意义的精简。
     - id: command-compact
       name: '@deepseek-ai/dsh-command-compact'
 
-    # 工具结果修剪器：在整体压缩器运行前，先把超大工具结果压缩到预算内。
-    # thresholdChars 8192：结果超过 8192 字符才修剪；
-    # headChars 4096 / tailChars 1024：保留头部 4096、尾部 1024 字符。
     - id: tool-result-pruner
       name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
       config:
         thresholdChars: 8192
         headChars: 4096
         tailChars: 1024
-
-# ── 其余模型侧行 ──────────────────────────────────────────────────────────────
-
-# 提问工具：ask_user_question——需求含糊时向主人提出一个关键问题。
-- id: tool-ask-user
-  name: '@deepseek-ai/dsh-tool-ask-user'
