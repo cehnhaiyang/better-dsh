@@ -67,7 +67,7 @@ so **writing it into `.npmrc` makes it visible to it**:
 ```
 
 **It supports HTTP proxies only, not SOCKS5** (it uses `tunnel-agent` internally).
-**Use the HTTP port** (10810 on this machine; for the port split see `proxy-and-networking` pitfall 5).
+**Use the HTTP port** (10810 on this machine; for the port split see section 1 of `proxy-and-networking`).
 
 ### Where it lands: user level, not project level
 
