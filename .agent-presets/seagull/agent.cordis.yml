@@ -344,7 +344,11 @@
       config:
         provider: spawn
         toolName: subagent
-        modelSelectionSettings: true
+        # 0.2.2 把旧的 modelSelectionSettings 拆成两个独立开关：
+        # modelSelection 暴露 provider/model/reasoning_effort 路由字段，
+        # modelDiscovery 注册 list_subagent_models（同一 tool scope 只能有一个实例开启）。
+        modelSelection: true
+        modelDiscovery: true
     - id: tool-subagent-fork
       name: '@deepseek-ai/dsh-tool-subagent'
       config:

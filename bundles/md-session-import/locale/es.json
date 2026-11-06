@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Importar sesión desde Markdown",
+    "description": "Reconstruye una sesión a partir de un documento exportado con Copiar sesión como Markdown."
+  }
+}

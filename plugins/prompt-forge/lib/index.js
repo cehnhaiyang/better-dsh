@@ -75,12 +75,19 @@ function wantsContext(text) {
  * 读会话最近若干条 user/assistant 文本，组成锚定摘要。
  *
  * 只取叶子字段、从尾部反向遍历：DSH 日志可能上百万条，正序遍历会在长会话里卡住。
+ * Session 的公开面没有 `events` 字段；`ownEvents()` 返回本会话自有事件
+ * （不含 fork 继承前缀），仍是同步快照，语义正好适合做上下文锚定。
  * @param {object} agent - 会话 agent。
  * @param {number} maxChars - 长度上限。
  * @returns {string} 摘要文本；无可用消息时为空串。
  */
 function extractDigest(agent, maxChars) {
-  const events = agent && agent.session && Array.isArray(agent.session.events) ? agent.session.events : null
+  const session = agent && agent.session ? agent.session : null
+  const events = session === null
+    ? null
+    : typeof session.ownEvents === 'function'
+      ? session.ownEvents()
+      : Array.isArray(session.events) ? session.events : null
   if (!events || events.length === 0) return ''
   const picks = []
   const floor = Math.max(0, events.length - 3000)
@@ -227,11 +234,18 @@ export function apply(ctx, config = {}) {
     if (!llm || typeof llm.stream !== 'function') {
       return { ok: false, text: '当前 profile 没有 llm 服务，无法改写。请确认模型已在设置里配置。', mode }
     }
+    // llm.stream 的 GenerateOptions 要求显式 provider/model（缺省不会解析默认路由），
+    // 因此这里必须先拿到默认选择；拿不到就给出可操作的提示，而不是让
+    // "no adapter registered for provider undefined" 冒到用户面前。
+    const route = resolveRoute()
+    if (route === null) {
+      return { ok: false, text: '当前 profile 没有可用的默认模型路由，无法改写。请先在设置里选择模型。', mode }
+    }
 
     const signal = AbortSignal.timeout(cfg.timeoutMs)
     let output
     try {
-      output = await callLlm(llm, resolveRoute(), buildSystem(mode), buildUser(raw, {
+      output = await callLlm(llm, route, buildSystem(mode), buildUser(raw, {
         digest: input.digest,
         previous: input.previous,
         feedback: input.feedback,

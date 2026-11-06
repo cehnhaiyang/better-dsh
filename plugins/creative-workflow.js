@@ -16,7 +16,8 @@ module.exports = {
       polish_mode: { label: '润色模式', workflow: 'workflows/polish_mode.md', scope: ['正文/', '设定台账.md'] },
     }
     const SECTION_NAME = 'creative-workflow:rules'
-    // 携带文件路径参数的工具 → 参数名。未列出的工具不触碰文件，不受范围限制。
+    // 携带单一文件路径参数的工具 → 参数名。未列出的工具不触碰文件，不受范围限制。
+    // apply_patch 一次可携带多个路径且写在补丁正文里，由 scopeDenial 单独解析。
     const PATH_ARGUMENTS = {
       read: 'file_path',
       write: 'file_path',
@@ -73,6 +74,20 @@ module.exports = {
       return rel === entry
     })
 
+    // apply_patch 的路径不在单一参数里：Codex 风格补丁逐行声明
+    // `*** Add File:` / `*** Update File:` / `*** Delete File:` / `*** Move to:`。
+    // 只取这些指令行，路径仍按工作区相对路径解析。
+    const patchPaths = (text) => {
+      if (typeof text !== 'string' || text.length === 0) return []
+      const paths = []
+      const pattern = /^\*\*\* (?:Add File|Update File|Delete File|Move to):[ \t]*(.+?)[ \t]*$/gm
+      for (const match of text.matchAll(pattern)) {
+        const raw = match[1].trim()
+        if (raw.length > 0) paths.push(raw)
+      }
+      return paths
+    }
+
     // 工具调用的范围闸门。命中本会话已激活的模式时，只放行该模式 scope 内的
     // 路径；越界一律拒绝并说明原因。无模式激活、工具不碰文件、或路径无法解析
     // （交由工具自身报错）时放行。
@@ -80,10 +95,27 @@ module.exports = {
       const name = agent === undefined ? undefined : activeModes.get(agent.session)
       const spec = name === undefined ? undefined : MODES[name]
       if (spec === undefined) return undefined
+      const cwd = agent.session.header.cwd
+      // apply_patch 一次可改多个文件，且路径写在补丁正文里而不是某个参数上；
+      // 逐条解析并全部校验，任何一条越界都拒绝整个补丁。
+      if (exec.name === 'apply_patch') {
+        const patch = exec.arguments === null || typeof exec.arguments !== 'object' ? undefined : exec.arguments.input
+        const paths = patchPaths(patch)
+        // 非空补丁却解析不出任何路径：说明补丁语法超出本闸门的认知，按失败关闭处理，
+        // 绝不把「看不懂」当成「没有路径」放行。
+        if (typeof patch === 'string' && patch.trim().length > 0 && paths.length === 0) {
+          return `【${spec.label}】无法从补丁中解析出文件路径，已拒绝。本模式仅允许访问：${spec.scope.join('、')}。`
+        }
+        for (const raw of paths) {
+          const rel = toWorkspaceRelative(cwd, raw)
+          if (rel !== undefined && withinScope(rel, spec.scope)) continue
+          return `【${spec.label}】越界访问被拒绝：${rel === undefined ? raw : rel === '' ? '（工作区根目录）' : rel} 不在本模式允许范围内。本模式仅允许访问：${spec.scope.join('、')}。`
+        }
+        return undefined
+      }
       const argName = PATH_ARGUMENTS[exec.name]
       if (argName === undefined) return undefined
       const raw = exec.arguments === null || typeof exec.arguments !== 'object' ? undefined : exec.arguments[argName]
-      const cwd = agent.session.header.cwd
       if (SEARCH_TOOLS.has(exec.name) && raw === undefined) {
         return `【${spec.label}】禁止在整个工作区范围内检索：${exec.name} 必须显式指定 path。本模式仅允许访问：${spec.scope.join('、')}。`
       }

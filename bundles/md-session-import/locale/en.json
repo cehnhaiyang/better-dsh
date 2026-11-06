@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Import session from Markdown",
+    "description": "Rebuild a Session from a transcript exported by Copy session as Markdown."
+  }
+}

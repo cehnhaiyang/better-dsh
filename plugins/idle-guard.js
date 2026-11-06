@@ -6,7 +6,9 @@ module.exports = {
   inject: ['webServer', 'connection'],
   apply(ctx) {
     // 会落盘的工具。它们一到就把计时清零——本规则唯一认可的生产行为。
-    const EDIT_TOOLS = new Set(['write', 'edit', 'str_replace_editor'])
+    // apply_patch 是 tool-fs 的多文件补丁工具（applyPatch 开关），同样是落盘，
+    // 必须计入，否则模型用补丁写入后仍会被当作空转继续拦截。
+    const EDIT_TOOLS = new Set(['write', 'edit', 'apply_patch', 'str_replace_editor'])
     const MINUTE_MS = 60000
     // 起拦分钟数的合法区间。下限取 3 而非 1：单段间隔的下限就是 3 分钟，允许更小的
     // 起拦时间会让首段间隔低于下限——要么静默按 3 跑（用户填的数被改写），要么违反
