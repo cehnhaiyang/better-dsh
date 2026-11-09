@@ -434,8 +434,43 @@ const STATUS_BY_CODE = {
   unavailable: 503,
   'workspace-unavailable': 503,
   'workspace-not-found': 404,
+  'preset-unavailable': 503,
+  'preset-not-found': 404,
+  'preset-broken': 422,
   'write-failed': 500,
 };
+
+/**
+ * Validate one requested preset against the mounted registry and return the id
+ * the registry resolved it to.
+ *
+ * A header naming a preset the registry cannot resolve produces a Session that
+ * cannot be opened: every later resume resolves the recorded id before it
+ * composes anything, so an unknown or unusable one fails there — long after the
+ * import reported success and with nothing left to correct. Refusing at import
+ * time keeps that failure where the user can act on it.
+ *
+ * @param ctx - the composed host context.
+ * @param id - the requested preset id.
+ * @returns the registry's resolved id.
+ * @throws {ImportError} when no registry is mounted, the id is unknown, or the preset cannot compose.
+ */
+async function resolvePresetId(ctx, id) {
+  const registry = ctx.get('agentPresets');
+  if (registry === undefined) {
+    throw new ImportError('preset-unavailable', 'the agent preset registry is not mounted in this profile');
+  }
+  let resolved;
+  try {
+    resolved = await registry.resolve(id);
+  } catch (error) {
+    throw new ImportError('preset-not-found', `agent preset "${id}" does not exist: ${String(error)}`);
+  }
+  if (resolved.broken !== undefined) {
+    throw new ImportError('preset-broken', `agent preset "${id}" cannot compose a session: ${resolved.broken}`);
+  }
+  return resolved.id;
+}
 
 /**
  * The project directory an import defaults to when the caller names none.
@@ -584,11 +619,16 @@ async function importResponse(ctx, request) {
       workspace = registry.get(workspaceId);
       if (workspace === undefined) throw new ImportError('workspace-not-found', `workspace "${workspaceId}" does not exist`);
     }
+    // Validate the preset before anything is written, for the reason
+    // `resolvePresetId` gives: a stored header is immutable, so a bad id has no
+    // later correction.
+    const requestedPreset = typeof body.agentPreset === 'string' && body.agentPreset !== '' ? body.agentPreset : undefined;
+    const agentPreset = requestedPreset === undefined ? undefined : await resolvePresetId(ctx, requestedPreset);
     const result = await importTranscript(persistence, {
       markdown,
       ...(workspace === undefined ? {} : { workspace }),
       ...(cwd === undefined ? {} : { cwd }),
-      ...(typeof body.agentPreset === 'string' && body.agentPreset !== '' ? { agentPreset: body.agentPreset } : {}),
+      ...(agentPreset === undefined ? {} : { agentPreset }),
       ...(typeof body.provider === 'string' && body.provider !== '' ? { provider: body.provider } : {}),
       ...(typeof body.model === 'string' && body.model !== '' ? { model: body.model } : {}),
       log: { warn: persist },

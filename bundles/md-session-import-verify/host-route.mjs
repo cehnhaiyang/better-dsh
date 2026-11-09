@@ -22,7 +22,7 @@ const check = (label, condition, detail = '') => {
 };
 
 /** Build a fake host context and mount the plugin on it. */
-const mount = (persistence, registry) => {
+const mount = (persistence, registry, presets) => {
   const routes = [];
   const ctx = {
     connection: {
@@ -36,6 +36,7 @@ const mount = (persistence, registry) => {
     get: (service) => {
       if (service === 'sessionPersistence') return persistence;
       if (service === 'workspaceRegistry') return registry;
+      if (service === 'agentPresets') return presets;
       return undefined;
     },
     effect: (callback) => callback(),
@@ -43,6 +44,31 @@ const mount = (persistence, registry) => {
   };
   apply(ctx);
   return routes[0];
+};
+
+/**
+ * Agent-preset registry double. `resolve` mirrors the real contract: an unknown
+ * id throws a RemoteError-shaped error, and a declaration whose activation
+ * failed answers with `broken`.
+ */
+const fakePresets = (options = {}) => {
+  const known = new Map([
+    ['safe', {}],
+    ['writing', {}],
+    ['broken-one', { broken: 'row failed to activate' }],
+  ]);
+  const resolved = [];
+  return {
+    resolved,
+    service: {
+      async resolve(id) {
+        resolved.push(id);
+        const record = known.get(id);
+        if (record === undefined) throw new Error(`Unknown agent preset: ${id}`);
+        return record.broken === undefined ? { id } : { id, broken: record.broken };
+      },
+    },
+  };
 };
 
 /**
@@ -261,7 +287,7 @@ check('route path', IMPORT_PATH === '/api/session.import');
 //#region Optional route fields
 {
   const { calls, service } = recordingPersistence();
-  const route = mount(service);
+  const route = mount(service, undefined, fakePresets().service);
   await post(route, { markdown: '> hi\n\nhello\n', cwd: 'D:\\somewhere', agentPreset: 'safe', provider: 'p', model: 'm' });
   const create = calls.find((c) => c.op === 'create');
   const append = calls.find((c) => c.op === 'append');
@@ -269,6 +295,80 @@ check('route path', IMPORT_PATH === '/api/session.import');
   check('optional: cwd overrides the default', create.header.cwd === 'D:\\somewhere', create.header.cwd);
   check('optional: agentPreset recorded', create.header.agentPreset === 'safe');
   check('optional: provider and model reach the assistant source', assistant.data.message.source.provider === 'p' && assistant.data.message.source.model === 'm');
+}
+//#endregion
+
+//#region Preset selection
+{
+  const { calls, service } = recordingPersistence();
+  const presets = fakePresets();
+  const route = mount(service, undefined, presets.service);
+  const response = await post(route, { markdown: '> hi\n\nhello\n', agentPreset: 'writing' });
+  const create = calls.find((c) => c.op === 'create');
+  check('preset: 200 for a healthy preset', response.status === 200, String(response.status));
+  check('preset: the resolved id is what the header records', create.header.agentPreset === 'writing', create.header.agentPreset);
+  check('preset: the registry was consulted exactly once', presets.resolved.length === 1 && presets.resolved[0] === 'writing', presets.resolved.join(','));
+}
+{
+  const { calls, service } = recordingPersistence();
+  const presets = fakePresets();
+  const route = mount(service, undefined, presets.service);
+  await post(route, { markdown: '> hi\n\nhello\n' });
+  const create = calls.find((c) => c.op === 'create');
+  check('preset: omitting it writes no agentPreset', create.header.agentPreset === undefined, String(create.header.agentPreset));
+  check('preset: omitting it never consults the registry', presets.resolved.length === 0, presets.resolved.join(','));
+}
+{
+  const { calls, service } = recordingPersistence();
+  const route = mount(service, undefined, fakePresets().service);
+  const response = await post(route, { markdown: '> hi\n\nhello\n', agentPreset: 'no-such-preset' });
+  check('preset: unknown id is 404 preset-not-found', response.status === 404 && (await response.json()).error === 'preset-not-found', String(response.status));
+  check('preset: unknown id writes nothing', calls.length === 0, calls.map((c) => c.op).join(','));
+}
+{
+  const { calls, service } = recordingPersistence();
+  const route = mount(service, undefined, fakePresets().service);
+  const response = await post(route, { markdown: '> hi\n\nhello\n', agentPreset: 'broken-one' });
+  check('preset: broken preset is 422 preset-broken', response.status === 422 && (await response.json()).error === 'preset-broken', String(response.status));
+  check('preset: broken preset writes nothing', calls.length === 0, calls.map((c) => c.op).join(','));
+}
+{
+  const { calls, service } = recordingPersistence();
+  const route = mount(service, undefined, undefined);
+  const response = await post(route, { markdown: '> hi\n\nhello\n', agentPreset: 'safe' });
+  check('preset: no registry is 503 preset-unavailable', response.status === 503 && (await response.json()).error === 'preset-unavailable', String(response.status));
+  check('preset: no registry writes nothing', calls.length === 0, calls.map((c) => c.op).join(','));
+}
+{
+  // Validation must precede the write: a refused preset cannot leave a Session
+  // behind, because a stored header is immutable and would have no correction.
+  const { calls, service } = recordingPersistence();
+  const registry = fakeRegistry();
+  const route = mount(service, registry.service, fakePresets().service);
+  const response = await post(route, { markdown: '> hi\n\nhello\n', workspaceId: 'ws-1', agentPreset: 'no-such-preset' });
+  check('preset: a bad preset beats a valid workspace', response.status === 404, String(response.status));
+  check('preset: nothing written and nothing attached', calls.length === 0 && registry.attached.length === 0);
+}
+{
+  const { calls, service } = recordingPersistence();
+  const route = mount(service, fakeRegistry().service, fakePresets().service);
+  const response = await post(route, { markdown: '> hi\n\nhello\n', workspaceId: 'ws-1', agentPreset: 'safe' });
+  const create = calls.find((c) => c.op === 'create');
+  check('preset: workspace and preset compose', response.status === 200 && create.header.agentPreset === 'safe' && create.header.cwd === 'D:\\projects\\mine', `${String(create.header.agentPreset)} @ ${String(create.header.cwd)}`);
+}
+{
+  const { service } = recordingPersistence();
+  const route = mount(service, undefined, fakePresets().service);
+  const response = await post(route, { markdown: '> hi\n\nhello\n', agentPreset: '' });
+  const payload = await response.json();
+  check('preset: empty string is treated as omitted', response.status === 200 && payload.sessionId !== undefined, String(response.status));
+}
+{
+  const { calls, service } = recordingPersistence();
+  const route = mount(service, undefined, fakePresets().service);
+  const response = await post(route, { markdown: '> hi\n\nhello\n', agentPreset: 42 });
+  check('preset: a non-string is ignored rather than fatal', response.status === 200, String(response.status));
+  check('preset: a non-string writes no agentPreset', calls.find((c) => c.op === 'create').header.agentPreset === undefined);
 }
 //#endregion
 
