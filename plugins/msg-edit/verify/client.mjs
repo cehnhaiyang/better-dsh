@@ -2,8 +2,8 @@
 // parity, the labels the code requests, and that nothing about deletion remains.
 import { readFileSync } from 'node:fs'
 
-const CLIENT = 'C:/Users/q1505/.dsh/bundles/msg-edit/client.js'
-const HOST = 'C:/Users/q1505/.dsh/bundles/msg-edit/index.js'
+const CLIENT = 'C:/Users/q1505/.dsh/plugins/msg-edit/client.js'
+const HOST = 'C:/Users/q1505/.dsh/plugins/msg-edit/index.js'
 const source = readFileSync(CLIENT, 'utf8')
 const host = readFileSync(HOST, 'utf8')
 

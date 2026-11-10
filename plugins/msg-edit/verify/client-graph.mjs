@@ -1,5 +1,5 @@
 ﻿import { readFileSync } from 'node:fs';
-const BUNDLE = 'C:/Users/q1505/.dsh/bundles/msg-edit/client.js';
+const BUNDLE = 'C:/Users/q1505/.dsh/plugins/msg-edit/client.js';
 const ID = 'dsh-msg-edit';
 const response = await fetch('http://127.0.0.1:3080/plugins/events', {
   headers: { accept: 'text/event-stream' },

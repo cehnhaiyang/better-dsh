@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { zstdDecompressSync } from 'node:zlib';
 
 const DSH = 'C:/Users/q1505/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai';
-const BUNDLE = 'C:/Users/q1505/.dsh/bundles/md-session-import';
+const BUNDLE = 'C:/Users/q1505/.dsh/plugins/md-session-import';
 
 const { formatSessionMarkdown } = await import(`file:///${DSH}/dsh-session-log-export/lib/index.js`);
 const { adoptSessionEvent, KNOWN_SESSION_EVENT_TYPES } = await import(`file:///${DSH}/dsh-session/lib/index.js`);

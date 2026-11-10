@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-const bundle = 'C:/Users/q1505/.dsh/bundles/md-session-import';
+const bundle = 'C:/Users/q1505/.dsh/plugins/md-session-import';
 
 // 1. Every JSON resource parses as UTF-8 and round-trips.
 for (const name of readdirSync(join(bundle, 'locale'))) {

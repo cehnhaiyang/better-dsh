@@ -10,7 +10,7 @@
 - id: tool-fs-search
   name: '@deepseek-ai/dsh-tool-fs-search'
   config:
-    sampleOverCapGlobResults: false  # 结果超出上限时不抽样、如实返回（溢出部分落盘）
+    sampleOverCapGlobResults: false
 
 - id: command-goal
   name: '@deepseek-ai/dsh-command-goal'

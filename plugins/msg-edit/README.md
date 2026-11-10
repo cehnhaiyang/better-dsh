@@ -2,10 +2,10 @@
 
 Edit the model's own output in a Session, **in place**.
 
-Clicking the pencil in a reply's action row turns that reply's text into an
-editable area drawn exactly over the text it replaces — same position, same
-width, same font — with save and cancel beside it. Saving changes both the
-transcript and the model context.
+Clicking the pencil in a reply's action row takes that reply's row out of layout
+and inserts a `contenteditable` area in its place, in the document flow — same
+column width, same typography — with save and cancel beside it. Saving changes
+both the transcript and the model context.
 
 The durable log is never rewritten. What changes is the decision the next
 request is built from.
@@ -142,8 +142,6 @@ no text block is not editable for the same reason.
   events, which still hold the original text.
 - **The original is always recoverable.** Disabling the plugin restores the
   original text everywhere, because nothing was rewritten.
-- **The editor is positioned once, when it opens.** Scrolling or resizing while
-  editing leaves it where it was; cancel and reopen to re-measure.
 
 ## Layout
 
@@ -151,9 +149,23 @@ no text block is not editable for the same reason.
 |---|---|
 | `index.js` | Host half: the message projection, decision folding, and the `/api/session.message` route |
 | `client.js` | Browser half: the pencil, the in-place editable area, and the transcript overlay |
-| `cordis.patch.yml` | The one profile row this bundle contributes |
+| `package.json` | The `dsh.client` declaration the loader reads to find the browser half |
 | `locale/*.json` | Metadata titles for the plugin list |
 | `verify/` | The suites below |
+
+## Installing it
+
+Two lines, no bundle:
+
+| Where | What | Why |
+|---|---|---|
+| `~/.dsh/profiles/web/cordis.patch.yml` | `- id: msg-edit`, `name: file:///C:/Users/q1505/.dsh/plugins/msg-edit/index.js` | The row itself. The browser half is found by walking up from this file to the nearest `package.json`, so the row does not have to name the package. |
+| `~/.dsh/profiles/web/package.json` | `"dsh-msg-edit": "link:C:/Users/q1505/.dsh/plugins/msg-edit"` | The host half imports `@deepseek-ai/dsh-session`. A bare `@deepseek-ai/*` specifier is intercepted only for an importer inside the profiles tree, or inside a **linked root** whose own manifest declares that package as a peer (`dsh-app-boot`: `findInterceptionLayer` / `routeLinked`). The link is what puts this directory in that set. |
+
+There is no `dsh.bundle` and no bundle patch: nothing installs, lists, enables or
+removes it. The cost is reloading — a bundle can be reconciled with
+`setBundle(enabled)`, a plain row cannot, so a change to `index.js` needs a DSH
+restart (a change to `client.js` still only needs a rebuild).
 
 ## Verification
 
@@ -196,7 +208,7 @@ node --import ./verify/register-hook.mjs verify/end-to-end.mjs
 node verify/client-graph.mjs
 ```
 
-`verify/register-hook.mjs` exists because the DSH loader resolves a bundle's
+`verify/register-hook.mjs` exists because the DSH loader resolves a plugin's
 bare `@deepseek-ai/*` imports through the profile's peer-dependency layer, which
 plain `node` has no part in. It redirects exactly the declared peers onto the
 installed Harness, so the suites exercise the real packages.
@@ -211,9 +223,9 @@ installed Harness, so the suites exercise the real packages.
 - **client.mjs** — the loader envelope and slot ids; all eight dictionaries have
   identical key sets; every label the code requests exists; the overlay rewrites
   an edited row's text, leaves a tool-only row alone, and preserves the tool
-  call; the editor is a fixed-position layer that matches typography and hides
-  the element it covers; nothing about deletion remains in either half.
-- **repro.mjs** — the bundle loads and exports an API; `apply()` does not throw;
+  call; the edited row leaves the layout and is restored afterwards; nothing
+  about deletion remains in either half.
+- **repro.mjs** — the plugin loads and exports an API; `apply()` does not throw;
   the action row is the only slot registered; the pencil carries its Session and
   can reach the Chat snapshot; a click inserts an editor beside the row and takes
   the row out of layout; the draft starts from the source text; the editor has no
@@ -229,7 +241,7 @@ installed Harness, so the suites exercise the real packages.
   and yields the raw Markdown; an unknown message, a tool-only message, and a
   missing binding resolve to nothing; the rendered row resolves by node key,
   tolerating a quote in the key and preferring a laid-out duplicate. It also
-  guards against a false pass: if the bundle's module constants were not bound,
+  guards against a false pass: if the plugin's module constants were not bound,
   every lookup would return nothing and the "resolves to nothing" checks would
   pass vacuously, so one check asserts the resolver is not vacuous.
 - **route.mjs** — authorized GET returns `revision`/`edited` and no `deleted`;
@@ -239,5 +251,5 @@ installed Harness, so the suites exercise the real packages.
   derived history; the identity survives; the durable log still holds the
   original; without the projection the original returns; the probe records are
   removed and the log still restores strictly.
-- **client-graph.mjs** — the running Host serves this bundle's client chunk
+- **client-graph.mjs** — the running Host serves this plugin's client chunk
   byte-for-byte, with only its own source-map reference appended.

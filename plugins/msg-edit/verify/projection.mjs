@@ -7,7 +7,7 @@ const { Session, appendPluginRecord, foldSurface } = await import(pathToFileURL(
 const llm = await import(pathToFileURL(`${root}/dsh-llm/lib/index.js`).href)
 const { sessionFormatCatalog } = await import(pathToFileURL(`${root}/dsh-session-format-catalog/lib/index.js`).href)
 
-const host = await import(pathToFileURL('C:/Users/q1505/.dsh/bundles/msg-edit/index.js').href)
+const host = await import(pathToFileURL('C:/Users/q1505/.dsh/plugins/msg-edit/index.js').href)
 const { RECORD_TYPE, apply } = host
 
 let passed = 0

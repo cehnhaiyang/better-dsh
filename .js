@@ -35,6 +35,12 @@
 //        工具与 /api/forge/* 路由；客户端半边在输入框右侧挂一个「改写」按钮与面板。
 //        三种强度共用一份内核：rewrite（只重述）/ augment（保守增量）/
 //        structure（七段结构化）。模型调用走 ctx.llm，不引入第二套凭据。
+//      - `msg-edit/`：会话内模型输出的原地编辑双面插件。宿主半边注册消息投影与
+//        /api/session.message 路由，客户端半边把回复行换成可编辑区域。它是唯一
+//        需要 link: 依赖的手写插件（宿主半边 import 了 @deepseek-ai/dsh-session，
+//        裸说明符只有落在 linked root 里才会被解析器接管），理由见第 4.9 节。
+//      - `md-session-import/`：md 转录稿 → 新会话的双面插件。宿主半边只用 node: 内建，
+//        因此挂载方式与其它单行插件一致，不需要 link:，理由见第 4.10 节。
 //      - `~/.dsh/tools.js`：自定义工具集的唯一实现（js / delete / browser）。工具
 //        **不是**全局挂载的：预设用占位名 `better-dsh:tools` + `config: { tools: [...] }`
 //        声明自己要用哪几个，脚本在生成预设声明时把占位名改写成本机的 file:// 绝对
@@ -1278,6 +1284,13 @@ const PROMPT_FORGE_DIR = path.join(PLUGINS_DIR, 'prompt-forge')
 const PROMPT_FORGE_HOST = path.join(PROMPT_FORGE_DIR, 'lib', 'index.js')
 const PROMPT_FORGE_CLIENT = path.join(PROMPT_FORGE_DIR, 'lib', 'client.js')
 
+// msg-edit / md-session-import：两个在 plugins/ 下的双面插件。它们的入口就在包根
+// （index.js），不像 prompt-forge / idle-arm 那样放在 lib/ 下。
+const MSG_EDIT_DIR = path.join(PLUGINS_DIR, 'msg-edit')
+const MSG_EDIT_HOST = path.join(MSG_EDIT_DIR, 'index.js')
+const MD_IMPORT_DIR = path.join(PLUGINS_DIR, 'md-session-import')
+const MD_IMPORT_HOST = path.join(MD_IMPORT_DIR, 'index.js')
+
 /**
  * 校验一个「宿主半边 + 客户端半边」双面包的声明是否真的成立。
  *
@@ -1370,6 +1383,37 @@ if (promptForgeProblems.length > 0) {
   process.exitCode = 1
 } else {
   console.log(`[plugins] prompt-forge 双面插件就位: ${PROMPT_FORGE_DIR}`)
+}
+
+/**
+ * 校验 msg-edit / md-session-import 的双面声明。
+ *
+ * 与 idle-arm 同一套契约（复用 verifyClientBundle），额外只核对宿主半边在位：
+ * 两个宿主半边都是 ESM，不在这个同步脚本里动态 import，缺失的后果同样是「界面
+ * 静默少一块」，所以存在性也要验。
+ * @param {string} dir - 包目录。
+ * @param {string} host - 宿主半边入口文件。
+ * @param {string} label - 报告用的名字。
+ * @returns {string[]} 问题列表（空数组表示全部通过）。
+ */
+function verifyPluginHalves(dir, host, label) {
+  const problems = verifyClientBundle(dir)
+  if (!fs.existsSync(host)) problems.push(`缺少 ${host}（${label} 的宿主半边）`)
+  return problems
+}
+
+for (const [label, dir, host] of [
+  ['msg-edit', MSG_EDIT_DIR, MSG_EDIT_HOST],
+  ['md-session-import', MD_IMPORT_DIR, MD_IMPORT_HOST],
+]) {
+  const problems = verifyPluginHalves(dir, host, label)
+  if (problems.length > 0) {
+    for (const problem of problems) console.error(`  [${label}] ${problem}`)
+    console.error(`  [${label}] 双面声明不完整：界面上的入口不会出现。请从仓库恢复 plugins/${label}/。`)
+    process.exitCode = 1
+  } else {
+    console.log(`[plugins] ${label} 双面插件就位: ${dir}`)
+  }
 }
 
 /**
@@ -1894,6 +1938,8 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
   const absIdleGuard = pathToFileURL(idleGuardPath).href
   const absIdleArm = pathToFileURL(IDLE_ARM_HOST).href
   const absPromptForge = pathToFileURL(PROMPT_FORGE_HOST).href
+  const absMsgEdit = pathToFileURL(MSG_EDIT_HOST).href
+  const absMdImport = pathToFileURL(MD_IMPORT_HOST).href
 
   // 1. host 层不启用 compaction-basic，并摘除该层残留的启用行。
   //    dsh-web-app bundle 明确把该 host 行置为 disabled，压缩后端整体位于
@@ -2013,6 +2059,32 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     patchContent = spliceBeforeManaged(`- insert:\n    - id: prompt-forge\n      name: ${absPromptForge}`)
   } else {
     patchContent = patchContent.replace(/(- id: prompt-forge\n      name:\s*)['"]?[^'"\n]*['"]?/, `$1${absPromptForge}`)
+  }
+
+  // 4.9 挂载 msg-edit 双面插件（会话内模型输出的原地编辑）。
+  //     行名用 file:// 指向宿主半边，与 idle-arm / prompt-forge 同一套理由：locatePkgJson
+  //     对 path-like 行名走 nearestPackage，从 index.js 向上找到 msg-edit/package.json，
+  //     拿到 dsh.client 与 exports["./client"]。幂等判据用条目 id `msg-edit`。
+  //
+  //     与那两个不同的是，这个包**同时是 profile 的 link: 依赖**：宿主半边
+  //     `import '@deepseek-ai/dsh-session'`（appendPluginRecord / SessionSeq），而裸
+  //     @deepseek-ai 说明符只对「profile 树内」或「linked root 内、且自身 package.json
+  //     声明了该 peer」的模块做拦截（dsh-app-boot: findInterceptionLayer / routeLinked）。
+  //     所以它不声明 dsh.bundle（不安装、不出现在插件列表），但 package.json 里的那行
+  //     link 依赖和 node_modules 里的那条 junction 都不能删；改宿主半边不再有
+  //     setBundle 可以触发 reconcile，需要重启 dsh。
+  if (!patchContent.includes('- id: msg-edit')) {
+    patchContent = spliceBeforeManaged(`- insert:\n    - id: msg-edit\n      name: ${absMsgEdit}`)
+  } else {
+    patchContent = patchContent.replace(/(- id: msg-edit\n      name:\s*)['"]?[^'"\n]*['"]?/, `$1${absMsgEdit}`)
+  }
+
+  // 4.10 挂载 md-session-import 双面插件（md 转录稿 → 新会话）。
+  //      宿主半边只 import node:crypto，因此不需要 link:，就是最普通的一行 file:// 插件。
+  if (!patchContent.includes('- id: md-session-import')) {
+    patchContent = spliceBeforeManaged(`- insert:\n    - id: md-session-import\n      name: ${absMdImport}`)
+  } else {
+    patchContent = patchContent.replace(/(- id: md-session-import\n      name:\s*)['"]?[^'"\n]*['"]?/, `$1${absMdImport}`)
   }
 
   // 注意：自定义工具集**不**在这里挂载。tools.js 只提供实现，一个预设能用哪几个

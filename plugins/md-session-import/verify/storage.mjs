@@ -22,7 +22,7 @@ const { Context } = await load('@deepseek-ai/cordis');
 const jsonl = await load('@deepseek-ai/dsh-session-persistence-jsonl');
 const { adoptSessionEvent } = await load('@deepseek-ai/dsh-session');
 const { formatSessionMarkdown } = await load('@deepseek-ai/dsh-session-log-export');
-const mdImport = await import('file:///C:/Users/q1505/.dsh/bundles/md-session-import/index.js');
+const mdImport = await import('file:///C:/Users/q1505/.dsh/plugins/md-session-import/index.js');
 
 let passed = 0;
 const failures = [];

@@ -13,14 +13,10 @@
   "files": [
     "index.js",
     "client.js",
-    "cordis.patch.yml",
     "locale/*.json",
     "icon.svg"
   ],
   "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    },
     "client": {
       "platform": "web",
       "immediately": true,

@@ -6,7 +6,7 @@
  * taxonomy, and the ownership release are all observed rather than assumed.
  */
 const DSH = 'C:/Users/q1505/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai';
-const BUNDLE = 'C:/Users/q1505/.dsh/bundles/md-session-import';
+const BUNDLE = 'C:/Users/q1505/.dsh/plugins/md-session-import';
 
 const { adoptSessionEvent } = await import(`file:///${DSH}/dsh-session/lib/index.js`);
 const { apply, inject, name, IMPORT_PATH } = await import(`file:///${BUNDLE}/index.js`);

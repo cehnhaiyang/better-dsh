@@ -12,7 +12,7 @@ const DSH = 'C:/Users/q1505/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/no
 
 const { foldSurface } = await import(`file:///${DSH}/dsh-session/lib/index.js`)
 const { sessionFormatCatalog } = await import(`file:///${DSH}/dsh-session-format-catalog/lib/index.js`)
-const host = await import('file:///C:/Users/q1505/.dsh/bundles/msg-edit/index.js')
+const host = await import('file:///C:/Users/q1505/.dsh/plugins/msg-edit/index.js')
 
 let passed = 0
 const failures = []

@@ -11,7 +11,7 @@
 // the shipped code differs.
 import { readFileSync } from 'node:fs'
 
-const CLIENT = 'C:/Users/q1505/.dsh/bundles/msg-edit/client.js'
+const CLIENT = 'C:/Users/q1505/.dsh/plugins/msg-edit/client.js'
 const source = readFileSync(CLIENT, 'utf8')
 
 let passed = 0

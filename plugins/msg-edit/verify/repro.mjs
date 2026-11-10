@@ -6,7 +6,7 @@
 // carry its Session, and does a click reach the editor at all.
 import { readFileSync } from 'node:fs'
 
-const CLIENT = 'C:/Users/q1505/.dsh/bundles/msg-edit/client.js'
+const CLIENT = 'C:/Users/q1505/.dsh/plugins/msg-edit/client.js'
 
 let passed = 0
 const failures = []

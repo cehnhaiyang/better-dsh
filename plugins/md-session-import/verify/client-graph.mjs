@@ -7,7 +7,7 @@
  */
 import { readFileSync } from 'node:fs';
 
-const BUNDLE = 'C:/Users/q1505/.dsh/bundles/md-session-import/client.js';
+const BUNDLE = 'C:/Users/q1505/.dsh/plugins/md-session-import/client.js';
 
 const response = await fetch('http://127.0.0.1:3080/plugins/events', {
   headers: { accept: 'text/event-stream' },
