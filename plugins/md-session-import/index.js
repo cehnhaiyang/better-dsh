@@ -7,20 +7,40 @@
  * tool work collapsed into `<details>` blocks. This plugin reads that document
  * back and rebuilds a Session log from it.
  *
- * Two deliberate departures from the export, both because the export is a
- * presentation format and not a serialization format:
+ * The document is a presentation format, not a serialization format, so the
+ * rebuild restores what the document actually carries and states what it cannot.
  *
- * - Tool invocations are not reconstructed. A tool call must be paired with a
- *   result carrying the same call id, or the next request fails at the
- *   provider; the collapsed block records a rendered summary of the call and
- *   its output, not the raw `arguments` string and result blocks a replay
- *   needs. Losing them costs the model that intermediate work; fabricating them
- *   would cost the user the Session.
- * - Every turn collapses to exactly one user message and one assistant message.
- *   The turn's remaining assistant text is concatenated in document order, so
- *   the imported history always alternates strictly between the two roles.
- *   A `turn` in the exported document is not the original turn: the export
- *   merges injected runtime context into the turn it was delivered in.
+ * Restored: every assistant message (its text plus one `tool-call` block per
+ * tool entry, in document order), every `tool/call` with the arguments the
+ * export printed, and every `tool/result` with its visible content and error
+ * flag. One exported turn becomes as many steps as the transcript had model
+ * calls, which is the structure the agent loop replays.
+ *
+ * Not recoverable, and therefore handled rather than pretended:
+ *
+ * - Tool call ids. The export prints names and arguments, never ids, and a call
+ *   must be paired with a result carrying the same id — an unpaired call fails
+ *   the next request at the provider. Each pair therefore gets one freshly
+ *   minted id: the pairing is exact, only the spelling is new.
+ * - Argument formatting. The export pretty-prints JSON arguments, so a call
+ *   whose arguments were compact is stored pretty-printed. The block and the
+ *   `tool/call` event take the same string (the log requires them to match
+ *   byte for byte) and the value is unchanged.
+ * - Attachment bytes. An image or file inside a result renders as an
+ *   `[Image: …]`/`[File: …]` label. The label is kept; the bytes never enter
+ *   the document.
+ * - A call with no recorded result. The export writes `(no result recorded)`;
+ *   the rebuild stores exactly that text as an error result, because a step
+ *   cannot close over an unresolved call and inventing a success would be a lie.
+ * - Where one model call ended and the next began, when the next one produced no
+ *   text. A call batch is written as a run of tool entries under one assistant
+ *   entry, and a later textless call batch is written the same way, so the two
+ *   are the same shape in the document. Consecutive entries therefore rebuild as
+ *   one assistant message holding every call: the same work in the same order,
+ *   one message instead of two.
+ *
+ * A `turn` in the exported document is also not the original turn: the export
+ * merges injected runtime context into the turn it was delivered in.
  *
  * Records are written straight through the persistence write handle
  * (`create` → `append` → `close`) rather than through `ctx.sessions.create()`.
@@ -76,8 +96,20 @@ export class ImportError extends Error {
 const OPENING_FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/u;
 /** One entry header inside a collapsed block: an assistant turn or a tool call. */
 const ENTRY_HEADER = /^\*\*(Assistant|Tool: `.*`)\*\*[ \t]*$/u;
+/** The tool name between the backticks of a `**Tool: \`name\`**` header. */
+const TOOL_HEADER_NAME = /^Tool: `(.*)`$/u;
+/** The heading the export writes above a tool result, error or not. */
+const RESULT_HEADER = /^\*\*Result( \(error\))?\*\*[ \t]*$/u;
 /** One quoted line the export writes for a user message. */
 const QUOTED_LINE = /^> ?(.*)$/u;
+/** The placeholder the export writes for a result that produced no visible content. */
+const NO_OUTPUT = '(no output)';
+/** The placeholder the export writes for a call whose result never landed. */
+const NO_RESULT = '(no result recorded)';
+/** The placeholder the export writes for a call that carried no arguments. */
+const NO_ARGUMENTS = '(no arguments)';
+/** The prefix the export writes before a tool failure reason. */
+const ERROR_PREFIX = 'Error: ';
 
 /**
  * Trim blank first and last lines without touching interior blank lines.
@@ -98,12 +130,13 @@ function trimBlankEdgeLines(text) {
  * `>`-prefixed line inside a fence stays code and a `<details>` inside a fence
  * does not open a collapsed block.
  *
- * Token kinds: `fence` carries a whole fenced block as raw lines; `top` is a
- * line outside every construct; `quote` is a `>`-prefixed line; `details-open`,
- * `details-body` and `details-close` bracket a collapsed block. Every token
- * also carries the `group` its document run belongs to, so a fence opened
- * inside a collapsed block stays part of that block instead of splitting it and
- * surfacing its contents as an assistant message.
+ * Token kinds: `fence` carries a whole fenced block as raw lines plus a
+ * `closed` flag, so a body can be extracted without guessing where it ends;
+ * `top` is a line outside every construct; `quote` is a `>`-prefixed line;
+ * `details-open`, `details-body` and `details-close` bracket a collapsed block.
+ * Every token also carries the `group` its document run belongs to, so a fence
+ * opened inside a collapsed block stays part of that block instead of splitting
+ * it and surfacing its contents as an assistant message.
  *
  * @param markdown - the document text.
  * @returns the token list in document order.
@@ -119,7 +152,7 @@ function tokenize(markdown) {
       fence.lines.push(line);
       const closes = new RegExp(`^ {0,3}${fence.character}{${String(fence.length)},}[ \t]*$`, 'u').test(line);
       if (closes) {
-        tokens.push({ kind: 'fence', group: fence.group, lines: fence.lines });
+        tokens.push({ kind: 'fence', group: fence.group, lines: fence.lines, closed: true });
         fence = undefined;
       }
       continue;
@@ -161,50 +194,144 @@ function tokenize(markdown) {
     tokens.push({ kind: 'top', group: 'top', line });
   }
   // An unterminated fence runs to the end of the document.
-  if (fence !== undefined) tokens.push({ kind: 'fence', group: fence.group, lines: fence.lines });
+  if (fence !== undefined) tokens.push({ kind: 'fence', group: fence.group, lines: fence.lines, closed: false });
   return tokens;
 }
 
 /**
- * Recover the assistant text held in one collapsed block. Tool entries are
- * skipped whole, including their argument and result fences, so no rendered
- * tool output leaks into a message.
+ * The text one block carries: a fence's interior, or a single bare line.
+ * @param block - a `{ kind: 'fence', … }` or `{ kind: 'line', line }` block.
+ * @returns the block's own text, fence markers excluded.
+ */
+function blockText(block) {
+  if (block.kind === 'line') return block.line;
+  // A closed fence ends with its closing marker; an unterminated one runs to the
+  // end of the document, so only the opening line is furniture there.
+  return block.token.lines.slice(1, block.token.closed === true ? -1 : undefined).join('\n');
+}
+
+/**
+ * Read the argument text a tool entry printed.
  *
- * The export escapes `<details>`/`<summary>` inside this text as HTML entities;
- * the entities are kept verbatim. Unescaping them would restore literal tags
- * that a Markdown renderer would then treat as markup, changing the rendering
- * of text the author wrote as text.
+ * The export writes the call's `arguments` string as a JSON fence, or the
+ * literal `(no arguments)` when it was empty. Anything else is unexpected, and
+ * the visible text is kept rather than dropped so no content disappears.
+ *
+ * @param blocks - the blocks before the result heading.
+ * @returns the argument string to store on both the block and the `tool/call`.
+ */
+function argumentTextOf(blocks) {
+  const fences = blocks.filter((block) => block.kind === 'fence');
+  const blankOnly = blocks.every((block) => block.kind === 'fence' || block.line.trim() === '');
+  if (fences.length === 1 && blankOnly) return blockText(fences[0]);
+  const text = trimBlankEdgeLines(blocks.map(blockText).join('\n'));
+  return text === NO_ARGUMENTS ? '' : text;
+}
+
+/**
+ * Read the result a tool entry printed.
+ *
+ * The export writes one of four bodies: a fence holding the visible content,
+ * `(no output)` when that content was empty, `Error: <reason>` (optionally
+ * followed by the content fence) for a failure, or `(no result recorded)` when
+ * the call never settled. The reason is the harness's own classification, not
+ * content the model saw, so it is kept beside the text instead of inside it.
+ *
+ * @param errorHeading - whether the heading said `(error)`.
+ * @param blocks - the blocks after the result heading.
+ * @returns the result, or undefined when the export recorded none at all.
+ */
+function resultOf(errorHeading, blocks) {
+  const fences = blocks.filter((block) => block.kind === 'fence');
+  const bare = blocks.filter((block) => block.kind === 'line' && block.line.trim() !== '');
+  const lone = bare.length === 1 && fences.length === 0 ? bare[0].line.trim() : undefined;
+  if (lone === NO_RESULT) return undefined;
+  if (lone === NO_OUTPUT) return { text: '', isError: errorHeading };
+  if (lone?.startsWith(ERROR_PREFIX) === true) {
+    return { text: '', isError: true, reason: lone.slice(ERROR_PREFIX.length) };
+  }
+  if (lone !== undefined) return { text: lone, isError: errorHeading };
+  const reasonLine = bare.length === 1 && fences.length === 1 ? bare[0].line.trim() : undefined;
+  if (reasonLine?.startsWith(ERROR_PREFIX) === true) {
+    return { text: blockText(fences[0]), isError: true, reason: reasonLine.slice(ERROR_PREFIX.length) };
+  }
+  if (fences.length === 1 && bare.length === 0) return { text: blockText(fences[0]), isError: errorHeading };
+  // Unrecognized shape: keep every visible line rather than lose the entry.
+  return { text: trimBlankEdgeLines(blocks.map(blockText).join('\n')), isError: errorHeading };
+}
+
+/**
+ * Parse one tool entry: the name from its header, then arguments and result.
+ * @param name - the tool name between the header's backticks.
+ * @param blocks - the entry's body blocks, header excluded.
+ * @returns the tool call with whatever the export recorded of its result.
+ */
+function toolEntryOf(name, blocks) {
+  const headingIndex = blocks.findIndex((block) => block.kind === 'line' && RESULT_HEADER.test(block.line));
+  if (headingIndex === -1) {
+    // No result heading at all: the entry is arguments only.
+    return { kind: 'tool', name, arguments: argumentTextOf(blocks), result: undefined };
+  }
+  const heading = RESULT_HEADER.exec(blocks[headingIndex].line);
+  return {
+    kind: 'tool',
+    name,
+    arguments: argumentTextOf(blocks.slice(0, headingIndex)),
+    result: resultOf(heading?.[1] !== undefined, blocks.slice(headingIndex + 1)),
+  };
+}
+
+/**
+ * Recover the entries held in one collapsed block: assistant messages and tool
+ * calls, in the order the export wrote them. Consecutive tool entries belong to
+ * the assistant message above them — they were its parallel calls — which is
+ * what lets the rebuild reproduce one step per model call.
+ *
+ * The export escapes `<details>`/`<summary>` inside assistant text as HTML
+ * entities; the entities are kept verbatim. Unescaping them would restore
+ * literal tags that a Markdown renderer would then treat as markup, changing the
+ * rendering of text the author wrote as text.
  *
  * @param tokens - the tokens between `details-open` and `details-close`.
- * @returns one text per assistant entry, in order, blanks already removed.
+ * @returns one entry per assistant message or tool call, blanks already removed.
  */
-function assistantTextsInDetails(tokens) {
-  const texts = [];
-  /** @type {{ assistant: boolean, lines: string[] } | undefined} */
+function entriesInDetails(tokens) {
+  const entries = [];
+  /** @type {{ assistant: boolean, name: string, lines: string[], blocks: object[] } | undefined} */
   let entry;
   const settle = () => {
-    if (entry?.assistant === true) {
+    if (entry === undefined) return;
+    if (entry.assistant) {
       const text = trimBlankEdgeLines(entry.lines.join('\n'));
-      if (text !== '') texts.push(text);
+      if (text !== '') entries.push({ kind: 'assistant', text });
+    } else {
+      entries.push(toolEntryOf(entry.name, entry.blocks));
     }
     entry = undefined;
   };
   for (const token of tokens) {
     if (token.kind === 'details-open' || token.kind === 'details-close') continue;
     if (token.kind === 'fence') {
-      if (entry !== undefined) entry.lines.push(...token.lines);
+      // A fence belongs to whichever entry is open; before any header it is
+      // stray body text with nothing recoverable in it.
+      if (entry?.assistant === true) entry.lines.push(...token.lines);
+      else if (entry !== undefined) entry.blocks.push({ kind: 'fence', token });
       continue;
     }
     const header = ENTRY_HEADER.exec(token.line);
     if (header !== null) {
       settle();
-      entry = { assistant: header[1] === 'Assistant', lines: [] };
+      entry = header[1] === 'Assistant'
+        ? { assistant: true, name: '', lines: [], blocks: [] }
+        : { assistant: false, name: TOOL_HEADER_NAME.exec(header[1])?.[1] ?? header[1], lines: [], blocks: [] };
       continue;
     }
-    if (entry !== undefined) entry.lines.push(token.line);
+    if (entry === undefined) continue;
+    if (entry.assistant) entry.lines.push(token.line);
+    else entry.blocks.push({ kind: 'line', line: token.line });
   }
   settle();
-  return texts;
+  return entries;
 }
 
 /**
@@ -227,8 +354,8 @@ function segmentsOf(tokens) {
       const text = trimBlankEdgeLines(buffer.flatMap((token) => token.lines ?? [token.line]).join('\n'));
       if (text !== '') segments.push({ kind: 'assistant', text });
     } else if (mode === 'details') {
-      const texts = assistantTextsInDetails(buffer);
-      if (texts.length > 0) segments.push({ kind: 'intermediate', texts });
+      const entries = entriesInDetails(buffer);
+      if (entries.length > 0) segments.push({ kind: 'intermediate', entries });
     }
     mode = undefined;
     buffer = [];
@@ -274,8 +401,13 @@ function stripDocumentHead(tokens) {
 
 /**
  * Parse one Session Markdown document into turns. Each user segment opens a
- * turn; the assistant text that follows it, including collapsed intermediate
- * text, belongs to that turn.
+ * turn; everything the assistant did after it belongs to that turn.
+ *
+ * A turn is a list of steps, one per assistant message the export wrote. Tool
+ * entries attach to the assistant message above them: they were that message's
+ * calls, so they share its step. An entry run that opens with a tool call (an
+ * assistant message whose text was blank exports no `**Assistant**` header)
+ * starts a step of its own with no text.
  *
  * @param markdown - the document text.
  * @returns the title and the turn list, each turn carrying `null` for a user
@@ -285,26 +417,41 @@ export function parseSessionMarkdown(markdown) {
   if (typeof markdown !== 'string') throw new ImportError('bad-request', 'import body must be Markdown text');
   const { title, tokens } = stripDocumentHead(tokenize(markdown));
   const turns = [];
-  /** @type {{ user: string | null, parts: string[] } | undefined} */
+  /** @type {{ user: string | null, steps: { text: string, calls: object[] }[] } | undefined} */
   let current;
+  const openTurn = (user) => {
+    current = { user, steps: [] };
+    turns.push(current);
+  };
+  const openStep = (text) => {
+    current.steps.push({ text, calls: [] });
+  };
   for (const segment of segmentsOf(tokens)) {
     if (segment.kind === 'user') {
-      current = { user: segment.text, parts: [] };
-      turns.push(current);
+      openTurn(segment.text);
       continue;
     }
-    if (current === undefined) {
-      current = { user: null, parts: [] };
-      turns.push(current);
+    if (current === undefined) openTurn(null);
+    if (segment.kind === 'assistant') {
+      openStep(segment.text);
+      continue;
     }
-    if (segment.kind === 'assistant') current.parts.push(segment.text);
-    else current.parts.push(...segment.texts);
+    for (const entry of segment.entries) {
+      if (entry.kind === 'assistant') {
+        openStep(entry.text);
+        continue;
+      }
+      if (current.steps.length === 0) openStep('');
+      current.steps[current.steps.length - 1].calls.push({
+        name: entry.name,
+        arguments: entry.arguments,
+        result: entry.result,
+      });
+    }
   }
   return {
     title,
-    turns: turns
-      .map((turn) => ({ user: turn.user, assistant: trimBlankEdgeLines(turn.parts.join('\n\n')) }))
-      .filter((turn) => turn.user !== null || turn.assistant !== '')
+    turns: turns.filter((turn) => turn.user !== null || turn.steps.length > 0),
   };
 }
 
@@ -318,20 +465,60 @@ function textBlocks(text) {
 }
 
 /**
- * Build the exact compact stream records an `assistant/message` carries for
- * text that arrived whole. The reader renders durable message content; the
- * stream reproduces the timed arrival, and one opening and one closing record
- * is the smallest faithful account of a block that streamed in one piece.
+ * Build the stream records an `assistant/message` carries for content that
+ * arrived whole. The reader renders durable message content; the stream
+ * reproduces the timed arrival, and one opening and one closing record is the
+ * smallest faithful account of a block that streamed in one piece.
  *
- * @param text - the message text.
- * @param time - epoch milliseconds for both records.
+ * @param content - the message's content blocks.
+ * @param time - epoch milliseconds for every record.
  * @returns the stream record list.
  */
-function textStream(text, time) {
-  return [
-    { type: 'chunk', time, chunk: { type: 'block-start', index: 0, blockType: 'text' } },
-    { type: 'chunk', time, chunk: { type: 'block-end', index: 0, block: { type: 'text', text } } },
-  ];
+function contentStream(content, time) {
+  const records = [];
+  content.forEach((block, index) => {
+    records.push({ type: 'chunk', time, chunk: { type: 'block-start', index, blockType: block.type } });
+    records.push({ type: 'chunk', time, chunk: { type: 'block-end', index, block } });
+  });
+  return records;
+}
+
+/**
+ * Build the `tool/result` event data for one reconstructed call.
+ *
+ * A result must exist for every advertised call before the step can close, so a
+ * call whose result the document never recorded still gets one. Its text is the
+ * export's own `(no result recorded)` and it is flagged as an error: the call
+ * produced no result, and reporting a success that never happened would corrupt
+ * the transcript the model reads next.
+ *
+ * @param call - the reconstructed call, carrying its minted id.
+ * @param turn - the owning turn ordinal.
+ * @param step - the owning step ordinal.
+ * @returns the `tool/result` event data.
+ */
+function toolResultData(call, turn, step) {
+  const result = call.result;
+  const text = result === undefined ? NO_RESULT : result.text;
+  const isError = result === undefined || result.isError;
+  return {
+    turn,
+    step,
+    message: {
+      role: 'tool',
+      source: { kind: 'tool', callId: call.id },
+      toolCallId: call.id,
+      content: text === '' ? [] : textBlocks(text),
+      ...(isError ? { isError: true } : {}),
+      id: randomUUID(),
+    },
+    // The reason is harness metadata, never model-visible content, so it stays
+    // beside the text instead of inside it. The name and code are the export's
+    // own wording for a failure it can only describe, not identify.
+    ...(result?.reason === undefined
+      ? {}
+      : { error: { name: 'ToolError', code: 'TOOL_ERROR', reason: result.reason } }),
+  };
 }
 
 /**
@@ -341,6 +528,12 @@ function textStream(text, time) {
  * starts at seq 0, is contiguous, and brackets every turn so a reader folds a
  * balanced transcript. Surface events carry the `append` marker the log
  * requires of anything that produces a message.
+ *
+ * One step per assistant message is not a stylistic choice: the log rejects a
+ * `tool/call` or `tool/result` whose turn/step coordinates do not match the open
+ * step, and it rejects closing a step while any advertised call is unresolved.
+ * So a step carries its assistant message, that message's calls, and one result
+ * per call, in that order.
  *
  * @param parsed - the result of {@link parseSessionMarkdown}.
  * @param options - `provider`/`model` stamped on assistant messages and the
@@ -369,32 +562,55 @@ export function buildSessionEvents(parsed, options = {}) {
   parsed.turns.forEach((turn, index) => {
     const ordinal = index + 1;
     push('turn/start', { turn: ordinal });
-    push('step/start', { turn: ordinal, step: 1 });
-    if (turn.user !== null) {
-      push(
-        'user/message',
-        { content: textBlocks(turn.user), source: { kind: 'user' }, role: 'user', id: randomUUID() },
-        'append',
-      );
-    }
-    if (turn.assistant !== '') {
-      push(
-        'assistant/message',
-        {
-          turn: ordinal,
-          step: 1,
-          message: {
-            role: 'assistant',
-            content: textBlocks(turn.assistant),
-            source: { kind: 'model', provider, model },
-            id: randomUUID(),
+    // A turn with only a user message still needs one step to hold it.
+    const steps = turn.steps.length === 0 ? [{ text: '', calls: [] }] : turn.steps;
+    steps.forEach((step, stepIndex) => {
+      const stepOrdinal = stepIndex + 1;
+      push('step/start', { turn: ordinal, step: stepOrdinal });
+      if (stepIndex === 0 && turn.user !== null) {
+        push(
+          'user/message',
+          { content: textBlocks(turn.user), source: { kind: 'user' }, role: 'user', id: randomUUID() },
+          'append',
+        );
+      }
+      // The block and the `tool/call` event must carry the same id and the same
+      // argument string: the log checks both when it pairs them.
+      const calls = step.calls.map((call) => ({ ...call, id: randomUUID() }));
+      const content = [];
+      if (step.text !== '') content.push({ type: 'text', text: step.text });
+      for (const call of calls) {
+        content.push({ type: 'tool-call', id: call.id, name: call.name, arguments: call.arguments });
+      }
+      if (content.length > 0) {
+        push(
+          'assistant/message',
+          {
+            turn: ordinal,
+            step: stepOrdinal,
+            message: {
+              role: 'assistant',
+              content,
+              source: { kind: 'model', provider, model },
+              id: randomUUID(),
+            },
+            stream: contentStream(content, clock),
           },
-          stream: textStream(turn.assistant, clock),
-        },
-        'append',
-      );
-    }
-    push('step/end', { turn: ordinal, step: 1 });
+          'append',
+        );
+      }
+      for (const call of calls) {
+        push('tool/call', {
+          turn: ordinal,
+          step: stepOrdinal,
+          callId: call.id,
+          name: call.name,
+          arguments: call.arguments,
+        });
+      }
+      for (const call of calls) push('tool/result', toolResultData(call, ordinal, stepOrdinal), 'append');
+      push('step/end', { turn: ordinal, step: stepOrdinal });
+    });
     push('turn/end', { turn: ordinal, reason: { kind: 'completed' } });
   });
   return events;
@@ -574,6 +790,7 @@ async function importTranscript(persistence, request) {
     sessionId: id,
     turns: events.filter((event) => event.type === 'turn/start').length,
     messages: events.filter((event) => event.type === 'assistant/message').length,
+    toolCalls: events.filter((event) => event.type === 'tool/call').length,
     title: parsed.title ?? null,
     workspace: request.workspace === undefined ? null : { id: request.workspace.id, title: request.workspace.title },
     ...(attachFailed === undefined ? {} : { attachFailed: true }),

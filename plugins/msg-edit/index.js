@@ -139,6 +139,20 @@ function assistantIndex(events, surface) {
 
 /**
  * Resolve one message identity to the live assistant message it names.
+ *
+ * A message marked `interrupted` is a delivered prefix: the turn was stopped, or
+ * the provider stream failed after it had already sent text (a content filter, a
+ * dropped connection, a truncated response). The Harness settles that prefix as
+ * a durable `assistant/message` with `interrupted: true`, and the Chat view
+ * renders it with the same action row as any other reply — so it must be
+ * addressable here too. Refusing it made the pencil appear and every save fail
+ * with "this reply cannot be edited", which is exactly the reply a human most
+ * wants to repair: the text that got cut off.
+ *
+ * Nothing about the durable record changes: the original prefix stays in the
+ * log, and the edit is an appended decision like any other, so the honest
+ * history remains recoverable by disabling the plugin.
+ *
  * @param {Map<string, object>} index - identity to event.
  * @param {string} messageId - the requested identity.
  * @returns {object} the target event.
@@ -148,11 +162,6 @@ function resolveTarget(index, messageId) {
   const event = index.get(messageId);
   if (event === undefined) {
     throw new EditError('not-found', `no model message "${messageId}" is on the surface`);
-  }
-  if (event.data?.interrupted === true) {
-    // An interrupted prefix is a partial the user stopped. It is still model
-    // output, but rewriting it would misrepresent what the model sent.
-    throw new EditError('not-editable', 'an interrupted message cannot be edited');
   }
   return event;
 }

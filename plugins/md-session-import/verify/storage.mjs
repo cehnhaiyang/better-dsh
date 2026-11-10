@@ -102,6 +102,7 @@ if (response.status !== 200) {
   process.exit(1);
 }
 check('two turns reported', payload.turns === 2, String(payload.turns));
+check('the tool call is reported', payload.toolCalls === 1, String(payload.toolCalls));
 check('title reported', payload.title === 'Integration Title');
 
 // Read it back through the persistence service, exactly as a session list does.
@@ -116,16 +117,23 @@ check('stored header carries no agentPreset', stored?.header.agentPreset === und
 const readHandle = await persistence.open(payload.sessionId, 'read');
 const read = await readHandle.read(0, undefined);
 await readHandle.close();
-check('read returns the full log', read.events.length === payload.turns * 6 + 1, `got ${read.events.length}`);
+check('read returns the full log', read.events.length === payload.turns * 6 + 1 + 5, `got ${read.events.length}`);
 check('read events start at seq 0 and are contiguous', read.events.every((event, index) => event.seq === index));
 check('every stored event passes the real validator', read.events.every((event) => adoptSessionEvent(event) === event));
-check('no tool events were stored', !read.events.some((e) => e.type === 'tool/call' || e.type === 'tool/result'));
+check('the tool call was stored', read.events.filter((e) => e.type === 'tool/call').length === 1);
+check('the tool result was stored', read.events.filter((e) => e.type === 'tool/result').length === 1);
+check('the tool call keeps its arguments', read.events.find((e) => e.type === 'tool/call')?.data.arguments.includes('x.md'));
+check('the assistant message advertises the call',
+  read.events.some((e) => e.type === 'assistant/message' && e.data.message.content.some((block) => block.type === 'tool-call')));
+check('the result pairs with the call',
+  read.events.find((e) => e.type === 'tool/result')?.data.message.toolCallId === read.events.find((e) => e.type === 'tool/call')?.data.callId);
 
 // Re-export the stored log through the real formatter.
 const reformatted = formatSessionMarkdown(read.events);
 check('re-export keeps the title', reformatted.startsWith('# Integration Title'), reformatted.split('\n')[0]);
 check('re-export keeps both prompts', (reformatted.match(/^> /gmu) ?? []).length === 2);
-check('re-export drops the tool block', !reformatted.includes('read') || !reformatted.includes('file body'));
+check('re-export keeps the tool block', reformatted.includes('**Tool: `read`**') && reformatted.includes('file body'));
+check('re-export keeps the arguments', reformatted.includes('x.md'));
 
 // The critical ownership check: the import must have released the write handle,
 // or a resume would fail with an ownership error and the Session would be

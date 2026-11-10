@@ -162,6 +162,46 @@ check('route path', IMPORT_PATH === '/api/session.import');
 }
 //#endregion
 
+//#region Tool work reaches storage
+{
+  const { calls, service } = recordingPersistence();
+  const route = mount(service);
+  const markdown = [
+    '> use the tool',
+    '',
+    '<details><summary>1 previous message</summary>',
+    '',
+    '**Tool: `read_file`**',
+    '',
+    '```json',
+    '{ "path": "a.md" }',
+    '```',
+    '',
+    '**Result**',
+    '',
+    '```',
+    'body',
+    '```',
+    '',
+    '</details>',
+    '',
+    'done',
+    '',
+  ].join('\n');
+  const response = await post(route, { markdown });
+  const payload = await response.json();
+  check('tools: 200', response.status === 200, String(response.status));
+  check('tools: one call reported', payload.toolCalls === 1, JSON.stringify(payload));
+  const stored = calls.find((c) => c.op === 'append')?.events ?? [];
+  check('tools: the call reaches storage', stored.some((e) => e.type === 'tool/call' && e.data.name === 'read_file'));
+  check('tools: the result reaches storage', stored.some((e) => e.type === 'tool/result' && e.data.message.content[0]?.text === 'body'));
+  check('tools: the call and the result pair up',
+    stored.find((e) => e.type === 'tool/result')?.data.message.toolCallId === stored.find((e) => e.type === 'tool/call')?.data.callId);
+  stored.forEach((event) => adoptSessionEvent(event));
+  check('tools: every appended event passes the real validator', true);
+}
+//#endregion
+
 //#region Failure paths
 {
   const route = mount(undefined);

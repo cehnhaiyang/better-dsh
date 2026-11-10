@@ -126,10 +126,24 @@ a `tool-call` block would orphan its result and the provider would reject the
 next request, so an edit is scoped to the prose a human can see. A message with
 no text block is not editable for the same reason.
 
+**A truncated reply is a target, not an exception.** When a model call fails
+after it has already streamed text — a content filter, a dropped connection, a
+cut-off response — the Harness settles that delivered prefix as a durable
+`assistant/message` carrying `interrupted: true`. The Chat view renders it with
+the same action row as any other reply, so the pencil appears on it. Refusing
+the save there ("this reply cannot be edited") was a bug: the row was offered
+and then always rejected, and the reply a human most wants to repair is exactly
+the one that got cut off. The edit stays honest in the only sense the design
+promises — the durable prefix is still in the log, untouched, and the decision
+is an appended record that disabling the plugin drops.
+
 ## Known limitations
 
-- **Interrupted messages cannot be edited.** A prefix the user stopped is still
-  model output, but rewriting it would misrepresent what the model sent.
+- **A step that settled no message has nothing to edit.** A call that failed
+  before any text was delivered records an `assistant/attempt`, not an
+  `assistant/message`, so there is no identity to address and no model-visible
+  history to rewrite; the Chat view shows such a step without an action row.
+  This is the Harness's own boundary, not a decision of this plugin.
 - **Only model output.** User messages are not targets; `/rewind` already owns
   withdrawing a human prompt and refilling the composer.
 - **A later compaction wins.** If a compaction shadows an edited message, the
@@ -204,6 +218,13 @@ node verify/route.mjs
 # changed, then reverted with its records removed. 15 checks.
 node --import ./verify/register-hook.mjs verify/end-to-end.mjs
 
+# The truncated-reply regression: a call that fails after streaming text settles
+# an interrupted message, which must be editable. Offline against the REAL
+# session store and route, then a live write that reverts itself. 19 checks plus
+# the live pair — skipped with a note while the running Host still runs the
+# `index.js` it loaded at start.
+node --import ./verify/register-hook.mjs verify/interrupted.mjs
+
 # The served client chunk equals the local file. Needs the running server.
 node verify/client-graph.mjs
 ```
@@ -251,5 +272,14 @@ installed Harness, so the suites exercise the real packages.
   derived history; the identity survives; the durable log still holds the
   original; without the projection the original returns; the probe records are
   removed and the log still restores strictly.
+- **interrupted.mjs** — the regression this plugin shipped with: a reply settled
+  with `interrupted: true` (a call that failed after streaming text) is accepted
+  and rewritten, keeps its identity, keeps its tool calls, and leaves the durable
+  prefix untouched; a second edit supersedes the first; a reply with no text block
+  is still refused with 409, and an unknown identity is still 404; the physical
+  round-trip keeps the decision and the no-projection fold returns the prefix.
+  Then the same edit is sent to the running server through the real signed
+  browser-session cookie, read back, reverted, and its records removed so the log
+  still restores strictly.
 - **client-graph.mjs** — the running Host serves this plugin's client chunk
   byte-for-byte, with only its own source-map reference appended.

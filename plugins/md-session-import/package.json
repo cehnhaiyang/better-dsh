@@ -1,8 +1,8 @@
 {
   "name": "dsh-md-session-import",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Import a Session Markdown transcript as a new Session",
+  "description": "Import a Session Markdown transcript as a new Session, tool calls and results included",
   "type": "module",
   "exports": {
     ".": "./index.js",
