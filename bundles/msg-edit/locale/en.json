@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Edit model output",
+    "description": "Edit or delete the model's own output in place, in both the model context and the transcript."
+  }
+}
