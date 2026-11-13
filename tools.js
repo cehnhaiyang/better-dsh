@@ -624,25 +624,24 @@ function defineJs(tools) {
     tools.register({
         name: 'js',
         description:
-            'Run JavaScript tasks in the project, selected by `action`:'
-            + ' check = type-check with `tsc --noEmit --pretty false` at the project root;'
-            + ' node = run .js scripts given by `paths` (comma-separated, relative to the project root; a directory'
-            + ' contributes every .js file beneath it, skipping node_modules and dot-directories), stopping at the first failure;'
-            + ' test = run `npm run test` in the `test` subdirectory (takes no path);'
-            + ' build = run `npm run build` at the project root (takes no path).'
-            + ' Build targets are defined only by the build script in the root package.json.',
+            'Run one JavaScript task in the project, chosen by `action`; no flags or extra arguments reach the command.'
+            + ' check = `tsc --noEmit --pretty false` at the project root;'
+            + ' node = run the .js scripts under `paths`, in order, stopping at the first failure;'
+            + ' test = `npm run test` in the `test/` subdirectory;'
+            + ' build = `npm run build` at the project root.'
+            + ' What runs is defined by package.json: a build target belongs in that script, never in this call.',
         parameters: {
             type: 'object',
             properties: {
                 action: {
                     type: 'string',
                     enum: ['check', 'node', 'test', 'build'],
-                    description: 'check: type-check the project. node: run the scripts in `paths`. test: run the test suite.'
-                        + ' build: run the root package.json build script.'
+                    description: 'Which task to run. Only `node` reads `paths`.'
                 },
                 paths: {
                     type: 'string',
-                    description: 'node: comma-separated paths relative to the project root, e.g. scripts/build.js,src'
+                    description: 'node: comma-separated paths relative to the project root, e.g. scripts/build.js,src.'
+                        + ' A directory contributes every .js file beneath it (node_modules and dot-directories skipped).'
                 }
             },
             required: ['action'],
@@ -771,15 +770,15 @@ function defineDelete(tools) {
     tools.register({
         name: 'delete',
         description:
-            'Delete files or directories in the project. `paths` is a comma-separated list of paths relative to the'
-            + ' project root; a file is removed, a directory is removed with its whole tree. Paths are deleted in'
-            + ' order, stopping at the first failure. Deletion is irreversible.',
+            'Delete files or directories in the project: a file is removed, a directory with its whole tree.'
+            + ' Paths are deleted in order and stop at the first failure. Deletion is irreversible.',
         parameters: {
             type: 'object',
             properties: {
                 paths: {
                     type: 'string',
-                    description: 'Comma-separated paths relative to the project root, e.g. tmp/a.js,dist'
+                    description: 'Comma-separated paths relative to the project root, e.g. tmp/a.js,dist.'
+                        + ' Each must exist; the project root itself is refused.'
                 }
             },
             required: ['paths'],
@@ -823,7 +822,12 @@ function defineDelete(tools) {
  *     ~/.agent-browser 的 ACL 问题，也不往会话工作区里拉屎；
  *   - AGENT_BROWSER_NAMESPACE：按会话工作区散列出的命名空间，让不同项目各自拥有
  *     独立的守护进程与 Chrome 实例（详见 namespaceFor）；
- *   - AGENT_BROWSER_MAX_OUTPUT：页面文本上限，防止整页 dump 打爆上下文。
+ *   - AGENT_BROWSER_MAX_OUTPUT：页面文本上限，防止整页 dump 打爆上下文；
+ *   - AGENT_BROWSER_HEADED：有头启动，模型看到的是真实窗口而不是无头实例。
+ *     之所以走环境变量而不是给 open 加 `--headed`：拉起 Chrome 的可能是任意一条命令
+ *     （守护进程被回收后的第一条 snapshot 也会拉起它），环境变量对所有路径一视同仁。
+ *     附带好处：有头浏览器不受守护进程默认一小时空闲超时的约束，无头会话空闲一小时
+ *     会被回收，下一条命令拿到的就是一个空白浏览器——看起来正像「页面自己刷新了」。
  * @param {object} tools - dsh-tools 注册表。
  */
 function defineBrowser(tools) {
@@ -899,9 +903,7 @@ function defineBrowser(tools) {
         switch (args.action) {
             case 'open': {
                 const url = need('url', args.url)
-                const argv = ['open', url]
-                if (args.headed === true) argv.push('--headed')
-                return { argv, display: `open ${url}` }
+                return { argv: ['open', url], display: `open ${url}` }
             }
             case 'snapshot': {
                 const argv = ['snapshot', '-i', '-c']
@@ -1045,6 +1047,10 @@ function defineBrowser(tools) {
                         // 按工作区隔离：不设它，所有项目共用 default 会话与同一个 Chrome。
                         AGENT_BROWSER_NAMESPACE: namespaceFor(root),
                         AGENT_BROWSER_MAX_OUTPUT: PAGE_MAX_OUTPUT,
+                        // 有头：CLI 的 --help 原文是「--headed  Show browser window (not headless)
+                        // (or AGENT_BROWSER_HEADED env)」。走环境变量而不是给 open 加 --headed：
+                        // 任何一条命令需要拉起 Chrome 时都带上它，模型不必记着带参数。
+                        AGENT_BROWSER_HEADED: '1',
                     },
                 })
             } catch (error) {
@@ -1101,33 +1107,37 @@ function defineBrowser(tools) {
     tools.register({
         name: 'browser',
         description:
-            'Drive a real headless Chrome to open and test web pages. Actions: open (url, optional headed),'
-            + ' snapshot (accessibility tree with @eN refs; re-snapshot after every page change), click (target = @eN or CSS),'
-            + ' fill (target, text), press (key), wait (target = selector or ms, or text), get (what = title|url|text|html|value|attr, target),'
-            + ' eval (script run in the page), screenshot (optional path inside the project, optional full), close.'
-            + ' The browser stays running between calls; always close when done.',
+            'Drive a real Chrome window (not headless); one action per call: open (url), snapshot (optional target'
+            + ' to scope it; re-snapshot after every page change), click (target), fill (target, text), press (key),'
+            + ' wait (text, else target = selector or ms), get (what, plus target unless title or url), eval (script),'
+            + ' screenshot (optional path, optional full), close. The browser persists across calls; close it when done.',
         parameters: {
             type: 'object',
             properties: {
                 action: {
                     type: 'string',
                     enum: ['open', 'snapshot', 'click', 'fill', 'press', 'wait', 'get', 'eval', 'screenshot', 'close'],
-                    description: 'Which browser action to perform.'
+                    description: 'Action to perform.'
                 },
-                url: { type: 'string', description: 'open: page URL (https:// is prepended when omitted).' },
-                target: { type: 'string', description: 'Element reference from snapshot (@e1) or a CSS selector.' },
-                text: { type: 'string', description: 'fill: text to type. wait: text to wait for.' },
+                url: { type: 'string', description: 'open: page URL; https:// is prepended when omitted.' },
+                target: {
+                    type: 'string',
+                    description: 'Element reference from snapshot (@e1) or a CSS selector; for wait, also milliseconds.'
+                },
+                text: { type: 'string', description: 'fill: text to type. wait: text to wait for; takes precedence over target.' },
                 key: { type: 'string', description: 'press: key name, e.g. Enter, Tab, Control+a.' },
                 what: {
                     type: 'string',
                     enum: ['title', 'url', 'text', 'html', 'value', 'attr'],
-                    description: 'get: what to read.'
+                    description: 'get: field to read; title and url need no target.'
                 },
                 script: { type: 'string', description: 'eval: JavaScript expression evaluated in the page.' },
-                path: { type: 'string', description: 'screenshot: output path relative to the project root.' },
+                path: {
+                    type: 'string',
+                    description: 'screenshot: output path relative to the project root; defaults to .browser/shot-<time>.png.'
+                },
                 full: { type: 'boolean', description: 'screenshot: capture the full page instead of the viewport.' },
-                headed: { type: 'boolean', description: 'open: show a visible browser window instead of headless.' },
-                timeout: { type: 'number', description: 'Timeout in ms (5000-300000).' }
+                timeout: { type: 'number', description: 'Timeout in ms, clamped to 5000-300000; default 120000.' }
             },
             required: ['action'],
             additionalProperties: false
