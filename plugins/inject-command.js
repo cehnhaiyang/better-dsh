@@ -45,7 +45,7 @@ const SECTION_TITLE = '# Injected files'
  */
 const SECTION_LEAD = [
   'The files below were injected into this prompt by the user (via the `/inject` command), not read by you.',
-  'This section is rebuilt on **every** request by re-reading each file from disk, so it is never a stale snapshot: what you see here is always the current content, and any edit you make shows up here on the next request without further action.',
+  'This section is rebuilt on **every** request by re-reading each file from disk: what you see here is always the current content, and any edit you make shows up here on the next request without further action.',
   'Each file is introduced by its path relative to the project root.',
   '',
   'Do not read these files again with your own tools. Their content is already in your context, so re-reading them would only duplicate text you already have — and you do not need to read a file before editing it either; edit it directly.',

@@ -41,6 +41,11 @@
 //        裸说明符只有落在 linked root 里才会被解析器接管），理由见第 4.9 节。
 //      - `md-session-import/`：md 转录稿 → 新会话的双面插件。宿主半边只用 node: 内建，
 //        因此挂载方式与其它单行插件一致，不需要 link:，理由见第 4.10 节。
+//      - `rewind/`：会话回退双面插件（把会话退到更早的消息，可选一并还原工作区文件）。
+//        原先是 npm 包 dsh-rewind-plugin（靠 dsh.bundle.patch 插进 bundle 层），现改为
+//        本地手写资源：宿主半边按上游模块边界拆成 lib/ 下六个 ESM 文件，客户端半边是
+//        单文件加载器交接格式。宿主半边 import 了 @deepseek-ai 裸说明符，因此与
+//        msg-edit 一样是 link: 依赖，理由见第 4.11 节。
 //      - `~/.dsh/tools.js`：自定义工具集的唯一实现（js / delete / browser）。工具
 //        **不是**全局挂载的：预设用占位名 `better-dsh:tools` + `config: { tools: [...] }`
 //        声明自己要用哪几个，脚本在生成预设声明时把占位名改写成本机的 file:// 绝对
@@ -1291,6 +1296,17 @@ const MSG_EDIT_HOST = path.join(MSG_EDIT_DIR, 'index.js')
 const MD_IMPORT_DIR = path.join(PLUGINS_DIR, 'md-session-import')
 const MD_IMPORT_HOST = path.join(MD_IMPORT_DIR, 'index.js')
 
+// rewind：会话回退（把会话退到更早的消息，可选一并还原工作区文件）。
+// 入口在 lib/ 下，与 prompt-forge 同构；宿主半边 import 了 @deepseek-ai/dsh-llm、
+// dsh-home-paths 与 schemastery，因此它和 msg-edit 一样必须是 link: 依赖。
+const REWIND_DIR = path.join(PLUGINS_DIR, 'rewind')
+const REWIND_HOST = path.join(REWIND_DIR, 'lib', 'index.js')
+const REWIND_CLIENT = path.join(REWIND_DIR, 'lib', 'client.js')
+// 宿主半边拆成了多个 ESM 模块，任何一个缺失都是 import 期 ERR_MODULE_NOT_FOUND：
+// fiber 停在未激活且不报错，整个回退功能静默消失。
+const REWIND_MODULES = ['locales.js', 'marker.js', 'rewind.js', 'snapshot.js', 'snapshot-cleanup.js']
+const PROFILE_PKG_FILE = path.join(WEB_PROFILE_DIR, 'package.json')
+
 /**
  * 校验一个「宿主半边 + 客户端半边」双面包的声明是否真的成立。
  *
@@ -1383,6 +1399,83 @@ if (promptForgeProblems.length > 0) {
   process.exitCode = 1
 } else {
   console.log(`[plugins] prompt-forge 双面插件就位: ${PROMPT_FORGE_DIR}`)
+}
+
+/**
+ * 校验 rewind 的双面声明、宿主模块完整性与 link: 依赖。
+ *
+ * 比 msg-edit 多验两件事，因为 rewind 的宿主半边**真的会用到**那几个裸说明符：
+ *   · lib/ 下六个模块一个都不能少（宿主 index.js import 其余五个）；
+ *   · profile 里必须有 `dsh-rewind: link:<插件目录>` 且 node_modules 里有对应的
+ *     junction —— 裸 @deepseek-ai 说明符只对「linked root 内、且自身 package.json
+ *     声明了该 peer」的模块做拦截（dsh-app-boot: findInterceptionLayer / routeLinked）。
+ *     缺了这一环，加载期是 ERR_MODULE_NOT_FOUND，fiber 静默停在未激活。
+ * @returns {string[]} 问题列表（空数组表示全部通过）。
+ */
+function verifyRewindBundle() {
+  const problems = verifyClientBundle(REWIND_DIR)
+  if (!fs.existsSync(REWIND_HOST)) problems.push(`缺少 ${REWIND_HOST}（rewind 的宿主半边）`)
+  if (!fs.existsSync(REWIND_CLIENT)) problems.push(`缺少 ${REWIND_CLIENT}（rewind 的客户端半边）`)
+  for (const name of REWIND_MODULES) {
+    const file = path.join(REWIND_DIR, 'lib', name)
+    if (!fs.existsSync(file)) problems.push(`缺少 ${file}（宿主半边 import 它，缺失会让整个插件静默不激活）`)
+  }
+  if (fs.existsSync(REWIND_HOST)) {
+    const host = fs.readFileSync(REWIND_HOST, 'utf8')
+    for (const symbol of ['apply', 'inject', 'name']) {
+      if (!new RegExp(`^\\s+${symbol},?$`, 'm').test(host.slice(host.lastIndexOf('\nexport {')))) {
+        problems.push(`${REWIND_HOST} 的导出块缺少 ${symbol}`)
+      }
+    }
+  }
+  let profileManifest
+  try {
+    profileManifest = JSON.parse(fs.readFileSync(PROFILE_PKG_FILE, 'utf8'))
+  } catch (error) {
+    problems.push(`${PROFILE_PKG_FILE} 无法解析: ${error.message}`)
+    profileManifest = undefined
+  }
+  if (profileManifest !== undefined) {
+    const spec = profileManifest?.dependencies?.['dsh-rewind']
+    if (typeof spec !== 'string' || !spec.startsWith('link:')) {
+      problems.push(`${PROFILE_PKG_FILE} 缺少 dependencies["dsh-rewind"]: "link:${REWIND_DIR}"（宿主半边的 @deepseek-ai 裸说明符靠它解析）`)
+    }
+    const junction = path.join(WEB_PROFILE_DIR, 'node_modules', 'dsh-rewind')
+    if (!fs.existsSync(junction)) problems.push(`缺少 ${junction}（linked root 是从 node_modules 下的符号链接发现的，不是从 package.json）`)
+    // 旧的 npm 包必须彻底退场：它同时声明 dsh.bundle，留在 bundles 里就会和这一份抢同一套界面。
+    if (profileManifest?.dsh?.profile?.bundles?.includes('dsh-rewind-plugin')) {
+      problems.push(`${PROFILE_PKG_FILE} 的 dsh.profile.bundles 仍含 dsh-rewind-plugin（会与本地插件重复挂载）`)
+    }
+  }
+  return problems
+}
+
+/**
+ * 确保 rewind 在 profile 的 node_modules 下有一条 junction。
+ *
+ * linked root 是从 `profiles/<name>/node_modules` 下的**符号链接**发现的
+ * （dsh-app-boot: linkedProfileRoots 遍历该目录找 symlink），不是从 package.json 的
+ * link: 声明发现的。所以那行依赖只是给人看的，真正起作用的是这条 junction：
+ * 它一缺，宿主半边的 @deepseek-ai 裸说明符就没有拦截层，加载期 ERR_MODULE_NOT_FOUND，
+ * fiber 静默停在未激活。pnpm 重装 node_modules 会把它冲掉，因此这里在挂载前补齐。
+ * @returns {string} 本次动作（已存在 / 已创建），供日志使用。
+ */
+function ensureRewindLink() {
+  const linkPath = path.join(WEB_PROFILE_DIR, 'node_modules', 'dsh-rewind')
+  if (fs.existsSync(linkPath)) return '已存在'
+  fs.mkdirSync(path.dirname(linkPath), { recursive: true })
+  fs.symlinkSync(REWIND_DIR, linkPath, process.platform === 'win32' ? 'junction' : 'dir')
+  return '已创建'
+}
+
+const rewindLinkAction = ensureRewindLink()
+const rewindProblems = verifyRewindBundle()
+if (rewindProblems.length > 0) {
+  for (const problem of rewindProblems) console.error(`  [rewind] ${problem}`)
+  console.error('  [rewind] 双面声明不完整：回退入口不会出现。请从仓库恢复 plugins/rewind/。')
+  process.exitCode = 1
+} else {
+  console.log(`[plugins] rewind 双面插件就位: ${REWIND_DIR}（link 挂载点${rewindLinkAction}）`)
 }
 
 /**
@@ -1940,6 +2033,7 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
   const absPromptForge = pathToFileURL(PROMPT_FORGE_HOST).href
   const absMsgEdit = pathToFileURL(MSG_EDIT_HOST).href
   const absMdImport = pathToFileURL(MD_IMPORT_HOST).href
+  const absRewind = pathToFileURL(REWIND_HOST).href
 
   // 1. host 层不启用 compaction-basic，并摘除该层残留的启用行。
   //    dsh-web-app bundle 明确把该 host 行置为 disabled，压缩后端整体位于
@@ -2085,6 +2179,21 @@ if (fs.existsSync(CORDIS_PATCH_FILE)) {
     patchContent = spliceBeforeManaged(`- insert:\n    - id: md-session-import\n      name: ${absMdImport}`)
   } else {
     patchContent = patchContent.replace(/(- id: md-session-import\n      name:\s*)['"]?[^'"\n]*['"]?/, `$1${absMdImport}`)
+  }
+
+  // 4.11 挂载 rewind 双面插件（会话回退：退到更早的消息，可选还原工作区文件）。
+  //      原先它是 npm 包 dsh-rewind-plugin，靠 dsh.bundle.patch 把自己插进 bundle 层；
+  //      现在改为本地手写插件，挂载方式与 msg-edit 完全一致：
+  //        · 行名 file:// 指向 lib/index.js，locatePkgJson 对 path-like 行名走
+  //          nearestPackage，向上找到 rewind/package.json 拿到 dsh.client 与
+  //          exports["./client"]；
+  //        · 同时是 profile 的 link: 依赖（宿主半边 import 了 @deepseek-ai/dsh-llm、
+  //          dsh-home-paths 与 schemastery，裸说明符靠 linked root 拦截解析）。
+  //      幂等判据用条目 id `rewind`。
+  if (!patchContent.includes('- id: rewind\n')) {
+    patchContent = spliceBeforeManaged(`- insert:\n    - id: rewind\n      name: ${absRewind}`)
+  } else {
+    patchContent = patchContent.replace(/(- id: rewind\n      name:\s*)['"]?[^'"\n]*['"]?/, `$1${absRewind}`)
   }
 
   // 注意：自定义工具集**不**在这里挂载。tools.js 只提供实现，一个预设能用哪几个

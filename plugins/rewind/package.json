@@ -1,0 +1,33 @@
+{
+  "name": "dsh-rewind",
+  "version": "0.21.0",
+  "private": true,
+  "description": "对话回退：把会话退回到更早的消息，可选一并还原工作区文件",
+  "type": "module",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib",
+    "locale",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-home-paths": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/schemastery": "^3.19.0"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-commands",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  }
+}
